@@ -1,16 +1,10 @@
+/* The PiNDI agent web interface's colours (agent/pindi-web.py), dark only. */
 :root {
-  --bg: #f4f5f7; --card: #fff; --text: #1d2330; --muted: #667085; --line: #e3e6eb; --hover: #f0f3f8;
-  --accent: #2563eb; --accent-text: #fff; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --idle: #98a2b3;
-  --ok-bg: #dcfce7; --warn-bg: #fef3c7; --bad-bg: #fee2e2;
-  color-scheme: light;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f1218; --card: #181c24; --text: #e6e8ec; --muted: #8b93a3; --line: #2a303b; --hover: #202632;
-    --accent: #3b82f6; --ok: #22c55e; --warn: #f59e0b; --bad: #ef4444; --idle: #5b6474;
-    --ok-bg: #12301f; --warn-bg: #33270e; --bad-bg: #3a1717;
-    color-scheme: dark;
-  }
+  --bg: #0b0f14; --card: #141b23; --text: #e6edf3; --muted: #8b98a5; --line: #253140; --hover: #2a3644;
+  --field: #0d1319; --accent: #2bb3a3; --button: #1d6f8f; --button-text: #fff; --danger: #8e2c27;
+  --ok: #3fb950; --warn: #d29922; --bad: #e5534b; --idle: #5b6878;
+  --ok-bg: #12261a; --warn-bg: #2a2210; --bad-bg: #2a1414;
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -27,7 +21,10 @@ code { font-size: 12px; }
 /* layout */
 header.top { display: flex; align-items: center; gap: 24px; padding: 0 20px; height: 52px; background: var(--card);
   border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
-.brand { font-weight: 650; }
+/* As the agent's header h1: "Pi" in the text colour, "NDI" in the accent, the rest small and muted. */
+.brand { font-size: 20px; font-weight: 700; letter-spacing: .5px; white-space: nowrap; }
+.brand span { color: var(--accent); }
+.brand small { font-size: 14px; font-weight: 400; color: var(--muted); margin-left: 8px; letter-spacing: 0; }
 header nav { display: flex; gap: 4px; flex: 1; }
 header nav a { padding: 6px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; }
 header nav a.active { background: var(--hover); color: var(--text); font-weight: 600; }
@@ -50,11 +47,13 @@ main { padding: 20px; max-width: 1600px; margin: 0 auto; }
 label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
 label input:not([type=checkbox]) { display: block; width: 100%; margin-top: 4px; }
 label.check { display: inline-flex; gap: 6px; align-items: center; margin: 0; color: var(--text); font-size: 13px; }
-input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+input { font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+input:focus { outline: 2px solid var(--button); border-color: var(--button); }
 input[type=file] { padding: 4px; }
-button { font: inherit; border: 0; border-radius: 6px; padding: 7px 14px; background: var(--accent); color: var(--accent-text); cursor: pointer; }
+button { font: inherit; border: 0; border-radius: 6px; padding: 7px 14px; background: var(--button); color: var(--button-text); cursor: pointer; }
+button:hover:not(:disabled) { filter: brightness(1.15); }
 button.secondary { background: var(--hover); color: var(--text); border: 1px solid var(--line); }
-button.danger { background: var(--bad); }
+button.danger { background: var(--danger); }
 button.link { background: none; color: var(--accent); padding: 0; }
 button.small { padding: 3px 8px; font-size: 12px; }
 button:disabled { opacity: .5; cursor: default; }

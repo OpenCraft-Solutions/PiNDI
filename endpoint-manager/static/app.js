@@ -6,8 +6,8 @@ const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const COLORS = ['#2563eb', '#16a34a', '#d97706', '#db2777', '#7c3aed', '#0891b2', '#65a30d', '#dc2626',
-  '#4f46e5', '#ea580c', '#0d9488', '#9333ea'];
+const COLORS = ['#2bb3a3', '#3fb950', '#d29922', '#f778ba', '#a371f7', '#58a6ff', '#9bd36b', '#e5534b',
+  '#79c0ff', '#f0883e', '#56d4dd', '#d2a8ff'];
 
 let session = null;
 let devices = [];
