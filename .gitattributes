@@ -1,0 +1,7 @@
+# Normalise line endings in the repository; components add their own rules
+# (agent/.gitattributes keeps LF for everything that runs on the Pi).
+* text=auto
+*.sh text eol=lf
+*.jpg binary
+*.png binary
+*.tar.gz binary
