@@ -2969,7 +2969,9 @@ static int local_play(struct output *o, const char *path, uint64_t *switch_seen,
                 audio_play(o, &a);
                 audio_rd += n;
             }
-            if (got && now - o->au.last_frame > 3000 && now - start > 3000 && o->au.pcm) {
+            /* last_frame can be a millisecond after now (audio_play reads the clock itself), so no
+             * now - last_frame here: it would wrap and close the audio after any frame. */
+            if (got && o->au.last_frame + 3000 < now && now - start > 3000 && o->au.pcm) {
                 audio_close(o);
                 audio_info(o, "no audio in this stream");
             }
@@ -3605,7 +3607,8 @@ static void *receiver(void *arg)
             if (!recv)
                 continue;
         }
-        if (audio_on && got_frame && now - o->au.last_frame > 3000 && now - recv_start > 3000) {
+        /* As in the local feed: last_frame can be a millisecond after now, so not now - last_frame. */
+        if (audio_on && got_frame && o->au.last_frame + 3000 < now && now - recv_start > 3000) {
             audio_close(o); /* stream without audio, or it stopped */
             audio_info(o, "no audio in this stream");
         }
