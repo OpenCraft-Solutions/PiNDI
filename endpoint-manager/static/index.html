@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiNDI Manager</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form id="login-form" class="card">
+    <h1 class="brand">Pi<span>NDI</span> <small>Manager</small></h1>
+    <label>User <input name="user" autocomplete="username" value="pindi" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required autofocus></label>
+    <button>Sign in</button>
+    <p class="error" id="login-error"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="top">
+    <span class="brand">Pi<span>NDI</span> <small>Manager</small></span>
+    <nav>
+      <a href="#monitor" data-page="monitor">Monitoring</a>
+      <a href="#matrix" data-page="matrix">Video matrix</a>
+      <a href="#admin" data-page="admin">Admin</a>
+    </nav>
+    <span class="who"><span id="updated" class="muted"></span><button id="logout" class="link">Sign out</button></span>
+  </header>
+  <div id="banner" class="banner" hidden>You're still using the default password. <a href="#admin">Change it under Admin → Manager.</a></div>
+
+  <main>
+    <section id="page-monitor" class="page">
+      <div id="tiles" class="tiles"></div>
+      <div id="empty-hint" class="card hint" hidden>No devices yet. Add them under <a href="#admin">Admin</a>.</div>
+      <div class="card">
+        <div class="card-head"><h2>Last hour</h2><div id="legend" class="legend"></div></div>
+        <div id="charts" class="charts"></div>
+      </div>
+      <div class="card"><h2>Devices</h2><div class="scroll"><table id="dev-table"></table></div></div>
+      <div class="split">
+        <div class="card"><h2>Display outputs</h2><div class="scroll"><table id="out-table"></table></div></div>
+        <div class="card"><h2>Outgoing streams</h2><div class="scroll"><table id="in-table"></table></div></div>
+      </div>
+    </section>
+
+    <section id="page-matrix" class="page">
+      <div class="card">
+        <div class="card-head">
+          <h2>Video matrix</h2>
+          <div class="controls">
+            <input id="matrix-filter" type="search" placeholder="Filter sources">
+            <label class="check"><input id="lock-ip" type="checkbox" checked> Lock to the sender's IP</label>
+            <label class="check"><input id="show-thumbs" type="checkbox"> Previews</label>
+          </div>
+        </div>
+        <p class="muted small">Rows are every NDI source your PiNDI devices can see; columns are PiNDI display outputs.
+          Click a crosspoint to switch that output live. <span class="dot live"></span> showing
+          <span class="dot routed"></span> routed, waiting for the source</p>
+        <div class="matrix-wrap"><table id="matrix" class="matrix"></table></div>
+      </div>
+    </section>
+
+    <section id="page-admin" class="page">
+      <div class="card">
+        <div class="card-head">
+          <h2>Devices</h2>
+          <div class="controls">
+            <span id="sel-count" class="muted">0 selected</span>
+            <button data-bulk="identify" class="secondary">Identify</button>
+            <button data-bulk="restart" class="secondary">Restart video</button>
+            <button data-bulk="reboot" class="danger">Reboot</button>
+            <button data-bulk="shutdown" class="danger">Shut down</button>
+            <button id="remove" class="secondary">Remove</button>
+          </div>
+        </div>
+        <div class="scroll"><table id="admin-table"></table></div>
+        <form id="update-form" class="row update">
+          <label>Software update <input id="update-file" type="file" accept=".tar.gz,.tgz,application/gzip" required></label>
+          <label class="check"><input id="update-downgrade" type="checkbox"> Allow an older version</label>
+          <label>Device user <input id="update-user" value="pindi" autocomplete="off"></label>
+          <label>Device password <input id="update-password" type="password" value="pindi" autocomplete="off"></label>
+          <button>Install on selected</button>
+          <span class="muted small">A signed package from <code>agent/make-update.sh</code>. Each device reboots when done.
+            The device login is only used for agents older than 1.3.0, which take updates through their web page.</span>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Find Raspberry Pis</h2>
+          <form id="scan-form" class="controls">
+            <input id="scan-network" aria-label="Network to scan" placeholder="192.168.1.0/24" size="18">
+            <button id="scan-button">Scan</button>
+            <label class="check"><input id="scan-others" type="checkbox"> Other SSH hosts</label>
+          </form>
+        </div>
+        <p class="muted small" id="scan-status">Finds PiNDI devices, and Raspberry Pis without PiNDI to install it on.</p>
+        <div class="scroll"><table id="scan-table"></table></div>
+        <form id="install-form" class="row update">
+          <label>Device user <input id="disc-user" value="pindi" autocomplete="off"></label>
+          <label>Device password <input id="disc-password" type="password" value="pindi" autocomplete="off"></label>
+          <label class="check"><input id="disc-skip-upgrade" type="checkbox"> Skip the OS upgrade</label>
+          <label class="check"><input id="disc-license" type="checkbox"> I accept the
+            <a href="https://ndi.video/sdk/" target="_blank" rel="noopener">NDI SDK license</a></label>
+          <button type="button" id="add-selected" class="secondary">Add selected PiNDI</button>
+          <button type="button" id="install-selected">Install PiNDI on selected</button>
+          <span class="muted small" id="sdk-hint"></span>
+        </form>
+      </div>
+
+      <div class="split">
+        <form id="add-form" class="card">
+          <h2>Add a device</h2>
+          <label>Address <input name="address" placeholder="192.168.1.50" required></label>
+          <div class="row">
+            <label>Device user <input name="user" value="pindi" autocomplete="off"></label>
+            <label>Device password <input name="password" type="password" value="pindi" autocomplete="off"></label>
+          </div>
+          <details>
+            <summary>Use an API token instead (agents older than 1.3.0)</summary>
+            <label>API token <input name="token" autocomplete="off" placeholder="Device settings → HTTP API"></label>
+          </details>
+          <p class="muted small">The device login is only used once, to fetch the device's API token. The certificate
+            the device presents now is remembered and checked from then on.</p>
+          <button>Add device</button>
+          <p class="error" id="add-error"></p>
+        </form>
+
+        <form id="password-form" class="card">
+          <h2>Manager</h2>
+          <p class="muted small" id="manager-info"></p>
+          <label>Current password <input name="current" type="password" autocomplete="current-password" required></label>
+          <label>New password <input name="new" type="password" autocomplete="new-password" minlength="4" required></label>
+          <label>New password again <input name="confirm" type="password" autocomplete="new-password" required></label>
+          <button>Change password</button>
+          <p class="error" id="password-error"></p>
+        </form>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="log-dialog">
+  <h2 id="log-title">Update log</h2>
+  <pre id="log-text" class="log"></pre>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

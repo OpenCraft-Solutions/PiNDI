@@ -1,0 +1,3 @@
+# Only needed to install PiNDI on new Raspberry Pis over SSH (Admin -> Find Raspberry Pis -> Install).
+# Everything else uses the Python standard library.
+paramiko>=3.4

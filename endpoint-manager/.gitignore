@@ -1,0 +1,3 @@
+# Device API tokens and the manager's password hash
+data/
+__pycache__/
