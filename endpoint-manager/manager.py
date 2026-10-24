@@ -287,6 +287,31 @@ def is_old_agent(err):
     return err.reset or "missing or wrong API token" in str(err) or "unknown endpoint" in str(err)
 
 
+def metrics_from_text(health, network):
+    """device.metrics for agents before 1.3.0, read from their text: health is like "CPU 63 °C · load 0.4
+    (4 cores) · memory 43% used · storage 11% used · up 3 d 2 h", network like "3.6 Mbit/s in, 0.1 Mbit/s out
+    (1000 Mbit/s link)". None for what isn't there."""
+    def num(pattern, text):
+        m = re.search(pattern, text)
+        return float(m.group(1)) if m else None
+
+    def bps(direction):
+        m = re.search(r"([\d.]+) (k|M)bit/s %s" % direction, network)
+        return round(float(m.group(1)) * (1e6 if m.group(2) == "M" else 1e3)) if m else None
+
+    up = None
+    m = re.search(r"up (?:(\d+) d)? ?(?:(\d+) h)? ?(?:(\d+) min)?", health)
+    if m and any(m.groups()):
+        d, h, mins = (int(g or 0) for g in m.groups())
+        up = d * 86400 + h * 3600 + mins * 60
+    cores = num(r"\((\d+) cores?\)", health)
+    link = num(r"\((\d+) Mbit/s link\)", network)
+    return {"cpu_temp": num(r"CPU ([\d.]+) °C", health), "load": num(r"load ([\d.]+)", health),
+            "cores": int(cores) if cores else None, "memory_pct": num(r"memory ([\d.]+)% used", health),
+            "storage_pct": num(r"storage ([\d.]+)% used", health), "uptime": up, "throttled": None,
+            "rx_bps": bps("in"), "tx_bps": bps("out"), "link_mbps": int(link) if link else 0}
+
+
 # ---------------------------------------------------------------- fleet
 
 class Fleet:
@@ -342,7 +367,10 @@ class Fleet:
 
     def _record(self, dev_id, st):
         """A status just read (lock held): the live state and a point for the graphs."""
-        m = (st.get("device") or {}).get("metrics") or {}
+        info = st.get("device") or {}
+        if "metrics" not in info:  # agent before 1.3.0: the same numbers, as text
+            info["metrics"] = metrics_from_text(info.get("health", ""), info.get("network", ""))
+        m = info["metrics"]
         point = {"t": int(time.time())}
         for k in ("cpu_temp", "load", "memory_pct", "rx_bps", "tx_bps"):
             point[k] = m.get(k)
