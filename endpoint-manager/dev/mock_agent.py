@@ -32,7 +32,7 @@ class Device:
         self.serial = "1000%04d" % (8000 + n)
         self.name = "Mock-%d" % n
         self.token = "mock-token-%d" % n
-        self.version = "1.3.0"
+        self.version = "1.4.0"
         self.down_until = 0
         self.update = {"state": "", "log": "", "done_at": 0}
         self.temp, self.load, self.mem, self.rx, self.tx = 48.0 + n, 0.5, 30.0, 8e6, 1e6
@@ -70,7 +70,7 @@ class Device:
                          "stream": o["stream"], "source_ip": o["source_ip"], "backup": "",
                          "display": {"link": "connected", "mode": "1920x1080@60"}})
         up = int(time.time() - self.started)
-        return {"api_version": 2,
+        return {"api_version": 3,
                 "device": {"name": self.name, "ndi_name": self.name.upper(), "serial": self.serial,
                            "model": "Raspberry Pi 4 Model B" if self.n % 2 else "Raspberry Pi 5", "version": self.version,
                            "ip": "127.0.0.1", "health": "CPU %.0f °C · load %.1f (4 cores)" % (self.temp, self.load),
@@ -160,11 +160,14 @@ def handler_for(dev):
             if path == "/api/v1/reboot":
                 dev.down_until, dev.started = time.time() + 15, time.time() + 15
                 return self.send(200, {"ok": True})
+            if path == "/api/v1/shutdown":  # off until the mock is restarted
+                dev.down_until = float("inf")
+                return self.send(200, {"ok": True})
             if path == "/api/v1/update":
                 if not raw.startswith(b"\x1f\x8b"):
                     return self.send(400, {"ok": False, "message": "That is not a valid update package."})
                 with dev.lock:
-                    new = "1.3.%d" % (int(dev.version.split(".")[-1]) + 1)
+                    new = "1.4.%d" % (int(dev.version.split(".")[-1]) + 1)
                     dev.update = {"state": "running", "new": new, "done_at": time.time() + 10,
                                   "log": "PiNDI update %s -> %s, %s\nInstalling...\n" % (dev.version, new, time.ctime())}
                 return self.send(200, {"ok": True, "message": "Installing PiNDI %s." % new})

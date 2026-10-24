@@ -20,6 +20,7 @@ The API every PiNDI device serves, and that the endpoint manager is built agains
 | --- | --- | --- |
 | 1 | ≤ 1.2 | status, output source, identify, restart |
 | 2 | 1.3.0 | `api_version`, `device.metrics`, `device.update`; reboot, update, update log, thumbnails, token from a sign-in |
+| 3 | 1.4.0 | shutdown |
 
 ## Requests
 
@@ -37,7 +38,7 @@ in 10 minutes). The token is the device's single API token, the same one shown i
 
 ```jsonc
 {
- "api_version": 2,
+ "api_version": 3,
  "device": {
   "name": "Lobby left", "ndi_name": "LOBBY-LEFT", "serial": "10000000abcd1234", "model": "Raspberry Pi 4 Model B",
   "version": "1.3.0", "ip": "192.168.1.50",
@@ -100,6 +101,11 @@ Restarts the video and outgoing streams (`pindi` and `pindi-sender` services).
 ### `POST /api/v1/reboot`
 
 Reboots the device about a second after answering `200 {"ok": true}`.
+
+### `POST /api/v1/shutdown`
+
+Shuts the device down about a second after answering `200 {"ok": true}` (API version 3). Nothing on the
+network can start it again: it stays off until its power is unplugged and plugged back in.
 
 ### `POST /api/v1/update`
 

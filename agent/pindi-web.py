@@ -1691,6 +1691,7 @@ def dashboard(session):
         '<dt>Switch</dt><dd><code>POST /api/v1/outputs/1/source</code> with <code>{"stream": "CAM 2", '
         '"source_ip": ""}</code></dd><dt>Identify</dt><dd><code>POST /api/v1/identify</code> with '
         '<code>{"output": 1}</code> (0 = all)</dd><dt>Restart</dt><dd><code>POST /api/v1/restart</code></dd>'
+        '<dt>Shut down</dt><dd><code>POST /api/v1/shutdown</code> (it stays off until its power is cycled)</dd>'
         '</dl><form method="post" action="/api-token" data-confirm="Generate a new API token? The current one '
         'stops working.">%s<button class="secondary">New token</button></form>%s</section>' %
         (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
@@ -2118,7 +2119,8 @@ def write_switch(n, stream, source_ip, backup):
 API_TOKEN_FILE = "/etc/pindi/api-token"
 # Raised when the API gains something clients may check for (all still under /api/v1/, nothing removed):
 # 2 = metrics and update state in the status, reboot, update, update log, thumbnails, token from a sign-in.
-API_VERSION = 2
+# 3 = shutdown.
+API_VERSION = 3
 
 
 def api_token(create=True):
@@ -2195,6 +2197,10 @@ def api_post(path, data):
     if path == "/api/v1/reboot":
         log("api: reboot requested")
         later(1, run, "systemctl", "reboot")
+        return 200, {"ok": True}
+    if path == "/api/v1/shutdown":
+        log("api: shutdown requested")
+        later(1, run, "systemctl", "poweroff")
         return 200, {"ok": True}
     if path == "/api/v1/update":
         kind, msg = act_update(data)

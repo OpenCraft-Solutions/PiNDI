@@ -8,7 +8,8 @@ A web GUI for many PiNDI devices ([agent/](../agent/)) at once:
 - **Video matrix:** every NDI source your PiNDI devices can see (rows) against every PiNDI display output
   (columns). Click a crosspoint to switch that output live. Optional previews show what each output shows.
 - **Admin:** find Raspberry Pis on the network and install PiNDI on them; select devices, then identify,
-  restart video, reboot, install a software update or remove them; trust a device's new certificate; change
+  restart video, reboot, shut down (agent 1.4.0 or newer; a Pi that is shut down stays off until its power is
+  cycled), install a software update or remove them; trust a device's new certificate; change
   the manager's password.
 
 Python 3.8 or newer. Everything uses the standard library except installing PiNDI on new Pis over SSH, which

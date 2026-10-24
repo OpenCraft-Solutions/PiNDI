@@ -472,7 +472,8 @@ class Fleet:
 
 
 BULK = {"reboot": ("POST", "/api/v1/reboot", None), "restart": ("POST", "/api/v1/restart", None),
-        "identify": ("POST", "/api/v1/identify", {"output": 0})}
+        "identify": ("POST", "/api/v1/identify", {"output": 0}), "shutdown": ("POST", "/api/v1/shutdown", None)}
+BULK_API = {"shutdown": 3}  # the api_version an action needs, where above 1
 
 
 def web_update(fleet, dev_id, package, downgrade, login):
@@ -497,6 +498,8 @@ def run_bulk(fleet, action, ids, package=None, downgrade=False, login=None):
                                package, ctype="application/octet-stream", timeout=UPDATE_TIMEOUT)
             elif package is not None:
                 r = web_update(fleet, dev_id, package, downgrade, login)
+            elif fleet.api_version(dev_id) < BULK_API.get(action, 1):
+                raise DeviceError("needs PiNDI 1.4.0 or newer on the device: update it first")
             else:
                 method, path, body = BULK[action]
                 r = fleet.call(dev_id, method, path, body)

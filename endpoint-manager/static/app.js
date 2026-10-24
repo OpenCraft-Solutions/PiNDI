@@ -328,6 +328,8 @@ async function bulk(action) {
   const ids = [...selected];
   if (!ids.length) return toast('Select devices first.', true);
   if (action === 'reboot' && !confirm(`Reboot ${ids.length} device(s)? Their outputs go dark for about 20 seconds.`)) return;
+  if (action === 'shutdown' && !confirm(`Shut down ${ids.length} device(s)? They can't be started again from here: ` +
+    'each stays off until its power is unplugged and plugged back in.')) return;
   try {
     await api('POST', '/api/bulk', { action, ids });
     toast(`${action} sent to ${ids.length} device(s).`);
