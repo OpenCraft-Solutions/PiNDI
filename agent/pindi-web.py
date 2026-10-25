@@ -11,7 +11,8 @@ Small standard-library HTTPS server (port 443, self-signed or uploaded certifica
   - login with the Pi's own user accounts (PAM, members of the sudo group)
   - per display output (detected by the player): enable/disable, NDI stream
     (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
-  - "Configure Outgoing Streams": detected USB capture devices, off until enabled
+  - "Configure Outgoing Streams": detected USB capture devices and HDMI bridges on the camera connectors
+    (set up there too, in config.txt), off until enabled
   - network: DHCP or static IP, with automatic rollback unless confirmed
   - Wi-Fi: off by default (hardware switched off in config.txt for a faster boot); on: one network, DHCP
   - change the login password, reboot
@@ -1084,8 +1085,124 @@ def capture_modes(dev):
     return [("%s %dx%d@%g" % m, "%s %dx%d @ %g fps" % (names[m[0]], m[1], m[2], m[3])) for m in modes]
 
 
+CSI_RECEIVERS = ("rp1-cfe-csi2_ch0", "unicam-image")  # a camera connector's video node (Pi 5, Pi 3/4)
+
+
+def _read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def csi_bridge(sysdir):
+    """The TC358743 (its I2C name) wired to the camera connector of this receiver video node, "" if none
+    answered at boot: the bridge's device-tree endpoint points at the receiver's."""
+    node = os.path.join(sysdir, "device", "of_node")
+    mine = {_read_bytes(os.path.join(node, p, "endpoint", "phandle")) for p in ("port", "port@0")} - {b""}
+    base = "/sys/bus/i2c/drivers/tc358743"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return ""
+    for name in names:
+        if _read_bytes(os.path.join(base, name, "of_node", "port", "endpoint", "remote-endpoint")) in mine:
+            return name
+    return ""
+
+
+def csi_connector(sysdir):
+    """CAM0 or CAM1, from the receiver's address (Pi 5: RP1 CSI-2 0 at 1f00110000; Pi 3/4: CSI-2 0 at
+    3f800000 / fe800000, which only Compute Modules wire to a connector)."""
+    dev = os.path.basename(os.path.realpath(os.path.join(sysdir, "device")))
+    return "CAM0" if dev.startswith(("1f00110000.", "3f800000.", "fe800000.")) else "CAM1"
+
+
+CSI_BEGIN, CSI_END = "# --- PiNDI CSI-2 begin ---", "# --- PiNDI CSI-2 end ---"
+CSI_LANES = [("", "Nothing, or a camera"), ("2", "TC358743 HDMI bridge, 2 lanes (up to 1080p30)"),
+             ("4", "TC358743 HDMI bridge, 4 lanes (up to 1080p60)")]
+
+
+def camera_connectors():
+    """[(key, label, lane choices)]: this model's camera connectors that can take an HDMI bridge."""
+    model = read_text("/proc/device-tree/model").strip("\x00\n ")
+    if re.match(r"Raspberry Pi (400|500)", model):
+        return []
+    if re.match(r"Raspberry Pi 5 ", model) or "Compute Module 5" in model:
+        return [("CAM0", "CAM/DISP 0", ("2", "4")), ("CAM1", "CAM/DISP 1", ("2", "4"))]
+    if "Compute Module" in model:
+        return [("CAM0", "CAM0", ("2",)), ("CAM1", "CAM1", ("2", "4"))]
+    if re.match(r"Raspberry Pi [34] ", model):
+        return [("CAM1", "Camera connector", ("2",))]
+    return []
+
+
+def csi_overlays(env):
+    """config.txt lines for the HDMI bridges set up in env (PINDI_CSI_CAM0/1 = lanes). install.sh writes the
+    same lines when it rebuilds PiNDI's block."""
+    out = []
+    for cam in ("CAM0", "CAM1"):
+        lanes = env.get("PINDI_CSI_" + cam, "")
+        if lanes in ("2", "4"):
+            out.append("dtoverlay=tc358743" + (",cam0" if cam == "CAM0" else "") + (",4lane" if lanes == "4" else ""))
+    return out
+
+
+def set_csi_overlays(env):
+    """Write them into PiNDI's block of config.txt (under [all]); True if that changed it. They take effect at the
+    next boot."""
+    text = read_text(CONFIG_TXT)
+    block = "\n".join([CSI_BEGIN] + csi_overlays(env) + [CSI_END]) + "\n"
+    old = re.compile(r"^%s\n.*?^%s\n" % (re.escape(CSI_BEGIN), re.escape(CSI_END)), re.M | re.S)
+    end = re.compile(r"^# --- PiNDI end ---$", re.M)
+    if old.search(text):
+        new = old.sub(lambda m: block, text, count=1)
+    elif end.search(text):
+        new = end.sub(lambda m: block + m.group(0), text, count=1)
+    else:
+        new = text.rstrip("\n") + "\n[all]\n" + block
+    if new != text:
+        write_atomic(CONFIG_TXT, new, None)
+    return new != text
+
+
+def csi_running():
+    """{connector: lanes of the HDMI bridge found there (0: none answered)} for the receivers running now."""
+    out = {}
+    base = "/sys/class/video4linux"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        names = []
+    for name in names:
+        sysdir = os.path.join(base, name)
+        if read_text(os.path.join(sysdir, "name")).strip() in CSI_RECEIVERS:
+            bridge = csi_bridge(sysdir)
+            lanes = _read_bytes("/sys/bus/i2c/drivers/tc358743/%s/of_node/port/endpoint/data-lanes" % bridge)
+            out[csi_connector(sysdir)] = len(lanes) // 4 if bridge else 0
+    return out
+
+
+def csi_status(key, want):
+    """What the connector does now compared with its setting: (text, restart needed)."""
+    have = csi_running().get(key)
+    try:
+        since_boot = os.path.getmtime(CONFIG_TXT) > time.time() - float(read_text("/proc/uptime").split()[0])
+    except (OSError, ValueError, IndexError):
+        since_boot = False
+    if not want:
+        return ("", bool(have)) if not have else ("An HDMI bridge is still active until the device restarts.", True)
+    if have == int(want):
+        return ("HDMI bridge found: it is listed below as an input.", False)
+    if since_boot or (have and have != int(want)):
+        return ("Restart the device to apply this.", True)
+    return ("No HDMI bridge answered here: check the ribbon cable (contacts facing the right way) and that the "
+            "board is a TC358743.", False)
+
+
 def detected_inputs():
-    """USB video capture devices currently plugged in."""
+    """USB video capture devices currently plugged in, and HDMI bridges on the camera connectors."""
     found = []
     base = "/sys/class/video4linux"
     try:
@@ -1094,6 +1211,13 @@ def detected_inputs():
         names = []
     for name in names:
         sysdir = os.path.join(base, name)
+        if read_text(os.path.join(sysdir, "name")).strip() in CSI_RECEIVERS:
+            if csi_bridge(sysdir):
+                dev = "/dev/" + name
+                cam = csi_connector(sysdir)
+                found.append({"dev": dev, "label": "HDMI bridge (TC358743) on %s" % cam, "modes": [], "csi": cam,
+                              "id": _stable_path(dev, by_port=True)})
+            continue
         driver = os.path.basename(os.path.realpath(os.path.join(sysdir, "device", "driver")))
         if driver != "uvcvideo" or read_text(os.path.join(sysdir, "index")).strip() not in ("", "0"):
             continue  # not a USB capture device, or its metadata node
@@ -1106,12 +1230,13 @@ def detected_inputs():
         if sep and a.strip() == b.strip():
             label = a.strip()  # UVC names are often "NAME: NAME"
         usb = os.path.realpath(os.path.join(sysdir, "device", ".."))
-        found.append({"dev": dev, "label": label, "modes": modes,
+        found.append({"dev": dev, "label": label, "modes": modes, "csi": "",
                       "model": read_text(os.path.join(usb, "idVendor")).strip() + ":" +
                                read_text(os.path.join(usb, "idProduct")).strip()})
-    models = [d["model"] for d in found]
+    models = [d["model"] for d in found if "model" in d]
     for d in found:
-        d["id"] = _stable_path(d["dev"], by_port=models.count(d.pop("model")) > 1)
+        if "model" in d:
+            d["id"] = _stable_path(d["dev"], by_port=models.count(d.pop("model")) > 1)
     return found
 
 
@@ -1140,7 +1265,11 @@ def inputs():
                         range=s.get("RANGE", "full")))
     for dev, slot in by_dev.items():
         s = conf[slot]
-        out.append({"dev": "", "id": dev, "label": os.path.basename(dev), "modes": [], "slot": slot,
+        cam = ""
+        if ".csi-video-" in dev:  # an HDMI bridge that didn't answer (or its connector isn't set up)
+            cam = "CAM0" if any(a in dev for a in ("1f00110000.", "3f800000.", "fe800000.")) else "CAM1"
+        out.append({"dev": "", "id": dev, "csi": cam, "modes": [], "slot": slot,
+                    "label": "HDMI bridge (TC358743) on %s" % cam if cam else os.path.basename(dev),
                     "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
                     "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto"),
                     "audio_sync": s.get("AUDIO_SYNC", "on"), "codec": s.get("CODEC", "speedhq"),
@@ -1611,6 +1740,23 @@ def dashboard(session):
         k = "in%d." % slot
         remove = ('<button class="secondary" name="remove" value="1">Forget this device</button>'
                   if not i["present"] else "")
+        if i.get("csi"):  # the HDMI source sets the mode; the bridge's sound isn't wired to the Pi
+            fields = ('<div><label>Picture</label><p class="hint">Whatever the HDMI source sends (shown in the '
+                      'status). The source is offered only the modes this connector&#39;s CSI-2 lanes can carry: up '
+                      'to 1080p60 with 4 lanes, 1080p30 with 2. No sound: the bridge&#39;s audio is not connected to '
+                      'the Pi.</p><input type="hidden" name="audio" value="off"></div>%s' % codec_field(i))
+        else:
+            fields = (
+                '<div><label>Capture mode</label><select name="mode">%s</select></div>%s'
+                '<div><label>Audio</label><select name="audio">%s</select></div>'
+                '<div><label>Audio timing</label><select name="audio_sync">%s</select><span class="hint block">'
+                'Capture cards\' audio clocks run a little fast or slow, which receivers eventually catch up on '
+                'by dropping audio.</span></div>'
+                '<div><label>Picture levels</label><select name="range">%s</select><span class="hint block">Change '
+                'only if shadows look grey and washed out.</span></div>' %
+                (options(cap_choices, i["mode"]), codec_field(i),
+                 options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]),
+                 options(AUDIO_SYNCS, i["audio_sync"]), options(RANGES, i["range"])))
         cards.append(
             '<div class="sub"><h3>%s <span class="badge%s">%s</span></h3>'
             '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>'
@@ -1618,24 +1764,37 @@ def dashboard(session):
             '<input type="hidden" name="slot" value="%d">'
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input over NDI</label>'
             '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
-            'placeholder="%s" maxlength="100"></div><div><label>Capture mode</label><select name="mode">%s</select>'
-            '</div>%s<div><label>Audio</label><select name="audio">%s</select></div>'
-            '<div><label>Audio timing</label><select name="audio_sync">%s</select><span class="hint block">'
-            'Capture cards\' audio clocks run a little fast or slow, which receivers eventually catch up on '
-            'by dropping audio.</span></div>'
-            '<div><label>Picture levels</label><select name="range">%s</select><span class="hint block">Change '
-            'only if shadows look grey and washed out.</span></div></div>'
+            'placeholder="%s" maxlength="100"></div>%s</div>'
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
              esc(state), live, hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
-             options(cap_choices, i["mode"]), codec_field(i),
-             options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]),
-             options(AUDIO_SYNCS, i["audio_sync"]),
-             options(RANGES, i["range"]), remove))
+             fields, remove))
     body = "".join(cards) if cards else (
         '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
+
+    # Camera connectors: HDMI-to-CSI-2 bridges (set up in config.txt, so at the next boot)
+    conns = camera_connectors()
+    if conns:
+        env = read_env()
+        selects, restart = [], False
+        for key, label, lanes in conns:
+            want = env.get("PINDI_CSI_" + key, "")
+            note, pending = csi_status(key, want)
+            restart |= pending
+            selects.append('<div><label>%s</label><select name="%s">%s</select>%s</div>' % (
+                esc(label), key.lower(), options([c for c in CSI_LANES if not c[0] or c[0] in lanes], want),
+                '<span class="hint block%s">%s</span>' % (" warn" if pending else "", esc(note)) if note else ""))
+        body = (
+            '<div class="sub"><h3>Camera connectors</h3><p class="hint">An HDMI-to-CSI-2 bridge on a camera '
+            'connector (Toshiba TC358743 boards, e.g. C779 or C790) works as an input like a USB capture card, '
+            'listed below once it is set up here and the device has restarted. 4 lanes need a board and ribbon '
+            'cable with all four.</p><form method="post" action="/csi">%s<div class="row">%s</div>'
+            '<button>Save</button></form>%s</div>' % (
+                hidden, "".join(selects),
+                '<form method="post" action="/reboot" data-confirm="Reboot the device now?">%s<button '
+                'class="secondary">Reboot now</button></form>' % hidden if restart else "")) + body
     parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
                  '<p class="hint">Nothing is sent until you enable it here. The stream appears on the network as '
                  '"%s (name)".</p>%s</section>' % (esc(ndi_host_name()), body))
@@ -1966,6 +2125,9 @@ def act_outgoing(form):
     else:
         name = form.get("name", "").strip()
         mode = form.get("mode", "")
+        if inp.get("csi"):  # an HDMI bridge: the source sets the mode, and it has no sound for the Pi
+            form = dict(form, audio="off", range="full", audio_sync="on")
+            mode = ""
         if not valid_name(name) or len(name) > 100:
             return ("err", "Invalid NDI stream name.")
         if mode and mode not in dict(inp["modes"]) and mode != inp["mode"]:
@@ -1992,6 +2154,22 @@ def act_outgoing(form):
     log("outgoing: slot %d %s" % (slot, msg))
     later(0.5, run, "systemctl", "restart", "pindi-sender.service")
     return ("ok", msg)
+
+
+def act_csi(form):
+    updates = {}
+    for key, label, lanes in camera_connectors():
+        v = form.get(key.lower(), "")
+        if v and v not in lanes:
+            return ("err", "%s cannot take that setting." % label)
+        updates["PINDI_CSI_" + key] = v
+    if not updates:
+        return ("err", "This device has no camera connector.")
+    write_env(updates)
+    changed = set_csi_overlays(read_env())
+    log("camera connectors: %s" % (", ".join(csi_overlays(read_env())) or "nothing"))
+    return ("ok", "Camera connectors saved. Restart the device (Reboot now) to apply them." if changed else
+            "Camera connectors saved (nothing changed).")
 
 
 def act_network(form):
@@ -2977,7 +3155,7 @@ def _network_revert(s):
 
 ACTIONS = {
     "/output": lambda s, f: act_output(f), "/outgoing": lambda s, f: act_outgoing(f),
-    "/network": lambda s, f: act_network(f), "/wifi": lambda s, f: act_wifi(f),
+    "/csi": lambda s, f: act_csi(f), "/network": lambda s, f: act_network(f), "/wifi": lambda s, f: act_wifi(f),
     "/network/confirm": lambda s, f: _network_confirm(s), "/network/revert": lambda s, f: _network_revert(s),
     "/password": act_password, "/device": lambda s, f: act_device(f), "/restore": lambda s, f: act_restore(f),
     "/reset": lambda s, f: act_reset(), "/identify": lambda s, f: act_identify(f),

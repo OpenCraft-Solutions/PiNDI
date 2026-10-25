@@ -5,7 +5,8 @@ PiNDI turns a Raspberry Pi into an NDI display decoder and encoder:
 - **Decoder:** each HDMI output shows an NDI stream full screen, with sound on
   HDMI or the headphone jack.
 - **Encoder:** USB HDMI capture devices (and webcams) are sent out as NDI
-  streams, with their audio.
+  streams, with their audio, and so are HDMI-to-CSI-2 bridges (TC358743) on a
+  camera connector.
 - **Web interface:** everything is set up from a browser, with a token HTTP API
   for control systems.
 
@@ -171,11 +172,24 @@ the HDMI source is unplugged), receivers get black instead of a frozen frame.
 When a switcher (vMix, TriCaster, ...) has the stream on program, the web
 interface shows it **ON AIR** (or "on preview").
 
-Inputs are USB (UVC) capture devices: MJPEG, YUYV or UYVY. HDMI-to-CSI boards
-(TC358743) are not supported yet: they need the board's overlay, an EDID and the
-source's timings set up, which PiNDI doesn't do. On a Pi 5 (two 4-lane camera
-ports) they could take 1080p60 without any MJPEG decoding; a Pi 3/4 camera port
-has 2 lanes, enough for about 1080p30.
+Inputs are USB (UVC) capture devices (MJPEG, YUYV or UYVY) and HDMI-to-CSI-2
+bridges on a camera connector.
+
+**HDMI-to-CSI-2 bridges** (Toshiba TC358743 boards, e.g. C779 or C790): choose
+what is on each connector under **Camera connectors** in Configure Outgoing
+Streams, then restart. PiNDI writes the overlay into `config.txt`
+(`PINDI_CSI_CAM0` / `PINDI_CSI_CAM1` in `/etc/default/pindi`, kept when
+`install.sh` runs again) and the bridge appears as an input. There is no
+capture mode to choose: the bridge takes whatever the HDMI source sends, raw
+UYVY, with no MJPEG decoding. PiNDI gives the source an EDID (a display called
+"PiNDI") offering only what the connector's CSI-2 lanes can carry, reads the
+source's timings and sets up the whole pipeline, again whenever the source
+changes mode or is plugged in. With **4 lanes** (both connectors of a Pi 5, CAM1
+of a Compute Module; the board and ribbon cable need all four) that is up to
+1080p60; with **2 lanes** (a Pi 3/4) up to 1080p30 and 720p60. A source that
+insists on more says so in the status. The bridge's sound is not wired to the
+Pi, so these inputs have no audio. Measured on a Pi 5: a 1080p60 PC desktop is
+sent at 60 fps using about one CPU core.
 
 MJPEG from capture cards is decoded on two CPU cores (three with NDI|HX), so
 1080p60 cards deliver their full frame rate. An output showing one of the
