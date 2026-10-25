@@ -383,6 +383,17 @@ WIFI="dtoverlay=disable-wifi"
 if [ -L /etc/systemd/system/sys-subsystem-net-devices-wlan0.device.wants/wpa_supplicant@wlan0.service ]; then
     WIFI="#dtoverlay=disable-wifi"
 fi
+# HDMI-to-CSI-2 bridges on the camera connectors (web UI "Camera connectors", which writes the same lines:
+# csi_overlays in pindi-web.py).
+CSI=""
+for cam in CAM0 CAM1; do
+    lanes=$(sed -n -E "s/^PINDI_CSI_$cam=\"?([24])\"?\$/\1/p" /etc/default/pindi 2>/dev/null | tail -n 1)
+    [ -n "$lanes" ] || continue
+    line="dtoverlay=tc358743"
+    [ "$cam" = CAM0 ] && line="$line,cam0"
+    [ "$lanes" = 4 ] && line="$line,4lane"
+    CSI="$CSI$line"$'\n'
+done
 sed -i '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' "$CFG"
 sed -i -E 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' "$CFG"
 cat >> "$CFG" <<EOF
@@ -406,6 +417,8 @@ dtoverlay=disable-bt
 $WIFI-pi5
 dtoverlay=disable-bt-pi5
 [all]
+# --- PiNDI CSI-2 begin ---
+${CSI}# --- PiNDI CSI-2 end ---
 # --- PiNDI end ---
 EOF
 

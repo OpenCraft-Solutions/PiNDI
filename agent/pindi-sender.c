@@ -1,9 +1,11 @@
 /*
- * pindi-sender - PiNDI outgoing NDI streams from USB (UVC) HDMI capture devices.
+ * pindi-sender - PiNDI outgoing NDI streams from USB (UVC) HDMI capture devices and CSI-2 HDMI
+ * bridges (TC358743 on a camera connector).
  *
  * Nothing is sent unless configured (web UI "Configure Outgoing Streams"):
  *   PINDI_IN<n>_ENABLED=1
- *   PINDI_IN<n>_DEVICE=/dev/v4l/by-id/...      stable device path
+ *   PINDI_IN<n>_DEVICE=/dev/v4l/by-id/...      stable device path (a CSI-2 bridge: its receiver's video node,
+ *                                              e.g. /dev/v4l/by-path/platform-1f00110000.csi-video-index0)
  *   PINDI_IN<n>_NAME=IN_<serial>               NDI stream name (default IN_<serial>[_n])
  *   PINDI_IN<n>_MODE="MJPG 1920x1080@30"       optional, else the best mode up to 1080p30
  *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default), or off
@@ -37,9 +39,13 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <linux/media-bus-format.h>
+#include <linux/media.h>
+#include <linux/v4l2-subdev.h>
 #include <linux/videodev2.h>
 #include <turbojpeg.h>
 #include <alsa/asoundlib.h>
@@ -237,7 +243,7 @@ static bool local_wanted(struct local_feed *lf)
 
 /* ------------------------------------------------------------------ capture modes */
 
-struct mode { uint32_t fourcc; int w, h; double fps; uint32_t num, den; };
+struct mode { uint32_t fourcc; int w, h; double fps; uint32_t num, den; int bpl; /* bytes per raw line */ };
 
 static bool fourcc_ok(uint32_t f)
 {
@@ -271,7 +277,7 @@ static bool choose_mode(int fd, const char *want, struct mode *out)
                 if (fi.type != V4L2_FRMIVAL_TYPE_DISCRETE || !fi.discrete.numerator)
                     break;
                 double fps = (double)fi.discrete.denominator / fi.discrete.numerator;
-                struct mode m = { f, w, h, fps, fi.discrete.numerator, fi.discrete.denominator };
+                struct mode m = { f, w, h, fps, fi.discrete.numerator, fi.discrete.denominator, 0 };
                 if (wf[0]) {
                     char fc[5];
                     memcpy(fc, &f, 4);
@@ -304,6 +310,354 @@ static bool choose_mode(int fd, const char *want, struct mode *out)
     return found;
 }
 
+/* ------------------------------------------------------------------ CSI-2 HDMI bridges (TC358743) */
+
+/* An HDMI-to-CSI-2 bridge on a camera connector has no capture modes to choose from: it delivers
+ * whatever the HDMI source sends (raw UYVY here). So it is set up from the source: an EDID that
+ * offers only modes its CSI-2 lanes can carry, the source's timings, then the same format on every
+ * link from the bridge to the receiver's video node (rp1-cfe on the Pi 5, unicam on the Pi 3/4).
+ * Without a media controller (unicam's default) the video node itself takes the bridge's ioctls. */
+
+/* PiNDI's EDIDs (display "PiNDI", checked with edid-decode), with stereo LPCM audio. 4 lanes:
+ * 1080p60 (preferred), 1080p50/30/25/24, 720p60/50, SD. 2 lanes: 1080p30 (preferred), 1080p25/24,
+ * 720p60/50, SD - nothing over 74.25 MHz, which needs a third lane. */
+static const uint8_t edid_4lane[256] = {
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x41, 0xc4, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x24, 0x01, 0x03, 0x80, 0x30, 0x1b, 0x78, 0x0e, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26,
+    0x0f, 0x50, 0x54, 0x21, 0x08, 0x00, 0x81, 0xc0, 0xd1, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
+    0x45, 0x00, 0xe0, 0x0e, 0x11, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x18, 0x3d, 0x0f,
+    0x44, 0x0f, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x50,
+    0x69, 0x4e, 0x44, 0x49, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x73,
+    0x02, 0x03, 0x20, 0xc1, 0x4a, 0x10, 0x1f, 0x22, 0x21, 0x20, 0x04, 0x13, 0x01, 0x02, 0x11, 0x23,
+    0x09, 0x07, 0x07, 0x83, 0x01, 0x00, 0x00, 0x65, 0x03, 0x0c, 0x00, 0x10, 0x00, 0xe2, 0x00, 0x4a,
+    [255] = 0xa5,
+};
+static const uint8_t edid_2lane[256] = {
+    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x41, 0xc4, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x24, 0x01, 0x03, 0x80, 0x30, 0x1b, 0x78, 0x0e, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26,
+    0x0f, 0x50, 0x54, 0x21, 0x08, 0x00, 0x81, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x1d, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
+    0x45, 0x00, 0xe0, 0x0e, 0x11, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x18, 0x3d, 0x0f,
+    0x44, 0x08, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x50,
+    0x69, 0x4e, 0x44, 0x49, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x26,
+    0x02, 0x03, 0x1e, 0xc1, 0x48, 0x22, 0x21, 0x20, 0x04, 0x13, 0x01, 0x02, 0x11, 0x23, 0x09, 0x07,
+    0x07, 0x83, 0x01, 0x00, 0x00, 0x65, 0x03, 0x0c, 0x00, 0x10, 0x00, 0xe2, 0x00, 0x4a,
+    [255] = 0xd8,
+};
+
+#define CSI_ENTS 32
+#define CSI_LINKS 128
+
+struct csi {
+    int sd;           /* the bridge's subdev node, or the video node (no media controller); -1 = none */
+    bool own_sd;      /* sd was opened here */
+    int lanes;        /* CSI-2 data lanes the board is wired for (device tree) */
+    uint64_t link_hz; /* CSI-2 link frequency (device tree) */
+    char why[192];    /* why there is no picture */
+};
+
+struct csi_graph {
+    int nent, nlink;
+    struct media_entity_desc ent[CSI_ENTS];
+    struct media_link_desc link[CSI_LINKS];
+};
+
+/* A camera connector's receiver (rp1-cfe, unicam): its bus info ("platform:1f00110000.csi") in bus. */
+static bool csi_receiver(int fd, char *bus, size_t n)
+{
+    struct v4l2_capability cap = { 0 };
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap))
+        return false;
+    snprintf(bus, n, "%s", (const char *)cap.bus_info);
+    return !strcmp((const char *)cap.driver, "rp1-cfe") || !strcmp((const char *)cap.driver, "unicam");
+}
+
+/* A device-tree property of big-endian cells: how many, the first n in v. */
+static int dt_cells(const char *path, uint32_t *v, int n)
+{
+    uint8_t b[64];
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    size_t len = fread(b, 1, sizeof b, f);
+    fclose(f);
+    for (int i = 0; i < n && (size_t)i * 4 + 4 <= len; i++)
+        v[i] = (uint32_t)b[i * 4] << 24 | (uint32_t)b[i * 4 + 1] << 16 | (uint32_t)b[i * 4 + 2] << 8 | b[i * 4 + 3];
+    return (int)(len / 4);
+}
+
+/* Lanes and link frequency from the bridge's device-tree endpoint (dir: its of_node). */
+static void csi_dt(struct csi *c, const char *dir)
+{
+    char p[PATH_MAX + 64];
+    uint32_t v[2] = { 0 };
+    snprintf(p, sizeof p, "%s/port/endpoint/data-lanes", dir);
+    int lanes = dt_cells(p, v, 1);
+    snprintf(p, sizeof p, "%s/port/endpoint/link-frequencies", dir);
+    if (dt_cells(p, v, 2) >= 2)
+        c->link_hz = (uint64_t)v[0] << 32 | v[1];
+    if (lanes > 0)
+        c->lanes = lanes;
+}
+
+/* /dev node of a character device number, opened. */
+static int open_devnum(uint32_t major, uint32_t minor)
+{
+    char p[96], line[128], node[160] = "";
+    snprintf(p, sizeof p, "/sys/dev/char/%u:%u/uevent", major, minor);
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "DEVNAME=", 8)) {
+            line[strcspn(line, "\n")] = 0;
+            snprintf(node, sizeof node, "/dev/%s", line + 8);
+        }
+    fclose(f);
+    return *node ? open(node, O_RDWR | O_NONBLOCK | O_CLOEXEC) : -1;
+}
+
+/* The media device of the receiver with this bus info, with all its entities and links (each link
+ * once: the media API lists them from their source side). */
+static int csi_graph_load(const char *bus, struct csi_graph *g)
+{
+    for (int i = 0; i < 16; i++) {
+        char p[32];
+        snprintf(p, sizeof p, "/dev/media%d", i);
+        int mfd = open(p, O_RDWR | O_CLOEXEC);
+        if (mfd < 0)
+            continue;
+        struct media_device_info info = { 0 };
+        if (xioctl(mfd, MEDIA_IOC_DEVICE_INFO, &info) || strcmp(info.bus_info, bus)) {
+            close(mfd);
+            continue;
+        }
+        g->nent = g->nlink = 0;
+        uint32_t id = 0;
+        for (;;) {
+            struct media_entity_desc e = { .id = id | MEDIA_ENT_ID_FLAG_NEXT };
+            if (g->nent >= CSI_ENTS || xioctl(mfd, MEDIA_IOC_ENUM_ENTITIES, &e))
+                break;
+            id = e.id;
+            g->ent[g->nent++] = e;
+            struct media_pad_desc pads[16];
+            struct media_link_desc links[16];
+            struct media_links_enum le = { .entity = e.id, .pads = pads, .links = links };
+            if (e.pads > 16 || e.links > 16 || xioctl(mfd, MEDIA_IOC_ENUM_LINKS, &le))
+                continue;
+            for (int k = 0; k < e.links && g->nlink < CSI_LINKS; k++)
+                g->link[g->nlink++] = links[k];
+        }
+        return mfd;
+    }
+    return -1;
+}
+
+static const struct media_entity_desc *csi_ent(const struct csi_graph *g, uint32_t id)
+{
+    for (int i = 0; i < g->nent; i++)
+        if (g->ent[i].id == id)
+            return &g->ent[i];
+    return NULL;
+}
+
+/* Entity from feeds entity to (through links, enabled or not). */
+static bool csi_feeds(const struct csi_graph *g, uint32_t from, uint32_t to, int depth)
+{
+    if (from == to)
+        return true;
+    for (int k = 0; depth < 8 && k < g->nlink; k++)
+        if (g->link[k].sink.entity == to && csi_feeds(g, from, g->link[k].source.entity, depth + 1))
+            return true;
+    return false;
+}
+
+static int subdev_fmt(int fd, uint32_t pad, int w, int h)
+{
+    struct v4l2_subdev_format f = { .which = V4L2_SUBDEV_FORMAT_ACTIVE, .pad = pad };
+    f.format.width = (uint32_t)w;
+    f.format.height = (uint32_t)h;
+    f.format.code = MEDIA_BUS_FMT_UYVY8_1X16;
+    f.format.field = V4L2_FIELD_NONE;
+    f.format.colorspace = V4L2_COLORSPACE_SRGB;
+    return xioctl(fd, VIDIOC_SUBDEV_S_FMT, &f);
+}
+
+/* From the video node back to the bridge: enable each link on the way (the Pi 5's CSI-2 subdev also
+ * feeds its ISP front end, which PiNDI doesn't use) and give both pads of every hop the format. */
+static const char *csi_route(int mfd, const struct csi_graph *g, uint32_t video, uint32_t bridge, int w, int h)
+{
+    uint32_t ent = video;
+    for (int hop = 0; hop < 8 && ent != bridge; hop++) {
+        const struct media_link_desc *l = NULL;
+        for (int k = 0; k < g->nlink && !l; k++)
+            if (g->link[k].sink.entity == ent && csi_feeds(g, bridge, g->link[k].source.entity, 0))
+                l = &g->link[k];
+        if (!l)
+            return "the camera connector's video node has no path to the HDMI bridge";
+        if (!(l->flags & MEDIA_LNK_FL_ENABLED)) {
+            struct media_link_desc s = *l;
+            s.flags |= MEDIA_LNK_FL_ENABLED;
+            if (xioctl(mfd, MEDIA_IOC_SETUP_LINK, &s))
+                return "cannot connect the HDMI bridge to the camera connector's video node";
+        }
+        const struct media_entity_desc *src = csi_ent(g, l->source.entity), *snk = csi_ent(g, l->sink.entity);
+        int sfd = src && src->dev.major ? open_devnum(src->dev.major, src->dev.minor) : -1;
+        if (sfd >= 0) {
+            subdev_fmt(sfd, l->source.index, w, h);
+            close(sfd);
+        }
+        if (ent != video && snk && snk->dev.major && (sfd = open_devnum(snk->dev.major, snk->dev.minor)) >= 0) {
+            subdev_fmt(sfd, l->sink.index, w, h);
+            close(sfd);
+        }
+        ent = l->source.entity;
+    }
+    return ent == bridge ? NULL : "the camera connector's video node has no path to the HDMI bridge";
+}
+
+/* The EDID for the lanes, unless the bridge has it already (a new one makes the source look again). */
+static void csi_edid(int n, const struct csi *c)
+{
+    const uint8_t *want = c->lanes >= 3 ? edid_4lane : edid_2lane;
+    uint8_t have[256];
+    struct v4l2_edid e = { .blocks = 2, .edid = have };
+    if (!xioctl(c->sd, VIDIOC_G_EDID, &e) && e.blocks == 2 && !memcmp(have, want, sizeof have))
+        return;
+    memcpy(have, want, sizeof have); /* S_EDID writes the array back: it can't be the read-only one */
+    struct v4l2_edid s = { .blocks = 2, .edid = have };
+    if (xioctl(c->sd, VIDIOC_S_EDID, &s))
+        LOG("input %d: cannot give the HDMI bridge its EDID: %s", n, strerror(errno));
+    else
+        LOG("input %d: HDMI bridge: %d CSI-2 lanes, the source is offered up to %s", n, c->lanes,
+            c->lanes >= 3 ? "1080p60" : "1080p30");
+}
+
+/* Set up the bridge behind the receiver's video node fd from the HDMI source, and the video node
+ * for its picture (UYVY) in m. NULL when it is ready, else why there is no picture (c->why). */
+static const char *csi_setup(int n, int fd, const char *bus, struct csi *c, struct mode *m)
+{
+    struct csi_graph *g = calloc(1, sizeof *g);
+    int mfd = g ? csi_graph_load(bus, g) : -1;
+    const struct media_entity_desc *bridge = NULL, *video = NULL;
+    struct stat st;
+    bool have_st = !fstat(fd, &st);
+    for (int i = 0; mfd >= 0 && i < g->nent; i++) {
+        if (!strncmp(g->ent[i].name, "tc358743", 8))
+            bridge = &g->ent[i];
+        if (have_st && g->ent[i].dev.major == major(st.st_rdev) && g->ent[i].dev.minor == minor(st.st_rdev))
+            video = &g->ent[i];
+    }
+    const char *why = NULL;
+    c->lanes = 2;
+    c->link_hz = 486000000; /* the overlays' default: 972 Mbit/s a lane */
+    if (!bridge) {
+        why = "no HDMI bridge on this camera connector (is it set up under Camera connectors?)";
+        goto done;
+    }
+    char dir[PATH_MAX];
+    if (bridge->dev.major) { /* media controller: the bridge has its own node */
+        c->sd = open_devnum(bridge->dev.major, bridge->dev.minor);
+        c->own_sd = c->sd >= 0;
+        snprintf(dir, sizeof dir, "/sys/dev/char/%u:%u/device/of_node", bridge->dev.major, bridge->dev.minor);
+    } else { /* the receiver passes everything on to it */
+        c->sd = fd;
+        snprintf(dir, sizeof dir, "/sys/bus/i2c/drivers/tc358743/%s/of_node", strchr(bridge->name, ' ') ?
+                 strchr(bridge->name, ' ') + 1 : "");
+    }
+    if (c->sd < 0) {
+        why = "cannot open the HDMI bridge";
+        goto done;
+    }
+    csi_dt(c, dir);
+    struct v4l2_event_subscription sub = { .type = V4L2_EVENT_SOURCE_CHANGE };
+    xioctl(c->sd, VIDIOC_SUBSCRIBE_EVENT, &sub); /* before the timings are read: no change is missed */
+    csi_edid(n, c);
+
+    struct v4l2_dv_timings t = { 0 };
+    if (xioctl(c->sd, VIDIOC_QUERY_DV_TIMINGS, &t)) {
+        why = errno == ENOLINK ? "no HDMI signal" : errno == ENOLCK ? "HDMI signal not stable yet" :
+              errno == ERANGE ? "the HDMI source's mode is not supported" : "cannot read the HDMI signal";
+        goto done;
+    }
+    const struct v4l2_bt_timings *bt = &t.bt;
+    uint64_t htot = V4L2_DV_BT_FRAME_WIDTH(bt), vtot = V4L2_DV_BT_FRAME_HEIGHT(bt);
+    double fps = htot && vtot ? (double)bt->pixelclock / ((double)htot * vtot) : 0;
+    if (bt->interlaced) {
+        snprintf(c->why, sizeof c->why, "the HDMI source sends %ux%ui, interlaced: set it to a progressive mode",
+                 bt->width, bt->height);
+        why = c->why;
+        goto done;
+    }
+    /* As the TC358743 driver counts: active pixels, 16 bits each (UYVY), per lane twice the link frequency. */
+    uint64_t lane_bps = c->link_hz * 2;
+    int need = (int)(((uint64_t)((double)bt->width * bt->height * fps * 16) + lane_bps - 1) / lane_bps);
+    if (need > c->lanes) {
+        snprintf(c->why, sizeof c->why, "%ux%up%.4g from the HDMI source needs %d CSI-2 lanes, this connector has "
+                 "%d: set the source to 1080p30 or lower", bt->width, bt->height, fps, need, c->lanes);
+        why = c->why;
+        goto done;
+    }
+    if (xioctl(c->sd, VIDIOC_S_DV_TIMINGS, &t)) {
+        why = "the HDMI bridge refused the source's timings";
+        goto done;
+    }
+    int w = (int)bt->width, h = (int)bt->height;
+    if (c->own_sd) {
+        if (subdev_fmt(c->sd, 0, w, h)) {
+            why = "the HDMI bridge cannot send UYVY";
+            goto done;
+        }
+        if (video && (why = csi_route(mfd, g, video->id, bridge->id, w, h)))
+            goto done;
+    }
+    struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+    f.fmt.pix.width = (uint32_t)w;
+    f.fmt.pix.height = (uint32_t)h;
+    f.fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
+    f.fmt.pix.field = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_S_FMT, &f) || f.fmt.pix.pixelformat != V4L2_PIX_FMT_UYVY || (int)f.fmt.pix.width != w ||
+        (int)f.fmt.pix.height != h) {
+        why = "the camera connector cannot capture the HDMI picture";
+        goto done;
+    }
+    /* 59.94 and the like as 1001ths, the rest in thousandths. */
+    double k = fps * 1.001;
+    bool ntsc = fabs(k - lround(k)) < 0.005 && fabs(fps - lround(fps)) > 0.01;
+    *m = (struct mode){ .fourcc = V4L2_PIX_FMT_UYVY, .w = w, .h = h, .fps = fps, .num = ntsc ? 1001 : 1000,
+                        .den = (uint32_t)(ntsc ? lround(k) * 1000 : lround(fps * 1000)),
+                        .bpl = (int)f.fmt.pix.bytesperline };
+done:
+    if (mfd >= 0)
+        close(mfd);
+    free(g);
+    return why;
+}
+
+/* A source change (other mode, unplugged) was signalled: the bridge must be set up again. */
+static bool csi_changed(struct csi *c)
+{
+    bool changed = false;
+    struct v4l2_event ev;
+    while (!xioctl(c->sd, VIDIOC_DQEVENT, &ev))
+        changed |= ev.type == V4L2_EVENT_SOURCE_CHANGE;
+    return changed;
+}
+
+static void csi_close(struct csi *c, int fd)
+{
+    if (c->sd >= 0 && c->sd != fd) {
+        struct v4l2_event_subscription sub = { .type = V4L2_EVENT_ALL };
+        xioctl(c->sd, VIDIOC_UNSUBSCRIBE_EVENT, &sub);
+        if (c->own_sd)
+            close(c->sd);
+    }
+    c->sd = -1;
+}
+
 /* ------------------------------------------------------------------ input thread */
 
 struct input {
@@ -323,6 +677,7 @@ struct input {
     int lf_fd;
     uint8_t *lf_frames;    /* its frame slots (remapped when the capture mode changes) */
     size_t lf_frames_len;
+    char csi_why[192];     /* CSI-2 bridge: why there was no picture at the last try (logged on change) */
 };
 
 /* Create in<n>.local, or resize its frame slots for a new capture mode. */
@@ -947,18 +1302,18 @@ static void worker_frame(struct worker *wk)
                 f.line_stride_in_bytes = pl->out_stride;
             }
         }
-    } else if (wk->len < (size_t)m->w * m->h * 2) {
+    } else if (wk->len < (size_t)m->bpl * (m->h - 1) + (size_t)m->w * 2) {
         ok = false; /* a short (damaged) raw frame: its rows would be read past the end of the data */
     } else {
         bool uyvy = m->fourcc == V4L2_PIX_FMT_UYVY;
         if (local)
             for (int row = 0; row < m->h; row++)
-                packed_to_422p(wk->src + (size_t)row * m->w * 2, base + (size_t)row * m->w,
+                packed_to_422p(wk->src + (size_t)row * m->bpl, base + (size_t)row * m->w,
                                base + ysz + (size_t)row * m->w / 2, base + ysz * 3 / 2 + (size_t)row * m->w / 2,
                                m->w, uyvy);
         if (to_ndi)
             for (int row = 0; row < m->h; row++) {
-                const uint8_t *src = wk->src + (size_t)row * m->w * 2;
+                const uint8_t *src = wk->src + (size_t)row * m->bpl;
                 uint8_t *dst = out + (size_t)row * pl->out_stride;
                 if (uyvy)
                     memcpy(dst, src, (size_t)m->w * 2);
@@ -1074,31 +1429,50 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     bool streaming = false;
     uint64_t seq = 1; /* next frame number to hand out */
+    struct csi csi = { .sd = -1 };
+    char bus[64];
 
-    if (!choose_mode(fd, in->mode_s, &m)) {
-        status(in, "no usable video format", NULL, 0, 0, 0);
-        goto out;
+    if (csi_receiver(fd, bus, sizeof bus)) {
+        const char *why = csi_setup(in->n, fd, bus, &csi, &m);
+        if (strcmp(why ? why : "", in->csi_why)) { /* each change once, not every retry */
+            if (why)
+                LOG("input %d: %s", in->n, why);
+            snprintf(in->csi_why, sizeof in->csi_why, "%s", why ? why : "");
+        }
+        if (why) {
+            status(in, why, NULL, 0, 0, 0);
+            goto out;
+        }
+        snprintf(mode_desc, sizeof mode_desc, "HDMI %dx%dp%.4g", m.w, m.h, (double)m.den / m.num);
+    } else {
+        if (!choose_mode(fd, in->mode_s, &m)) {
+            status(in, "no usable video format", NULL, 0, 0, 0);
+            goto out;
+        }
+        struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+        fmt.fmt.pix.width = m.w;
+        fmt.fmt.pix.height = m.h;
+        fmt.fmt.pix.pixelformat = m.fourcc;
+        fmt.fmt.pix.field = V4L2_FIELD_NONE;
+        if (xioctl(fd, VIDIOC_S_FMT, &fmt)) {
+            status(in, "cannot set format", NULL, 0, 0, 0);
+            goto out;
+        }
+        m.w = fmt.fmt.pix.width;
+        m.h = fmt.fmt.pix.height;
+        m.bpl = fmt.fmt.pix.bytesperline;
+        struct v4l2_streamparm parm = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+        parm.parm.capture.timeperframe.numerator = m.num;
+        parm.parm.capture.timeperframe.denominator = m.den;
+        if (!xioctl(fd, VIDIOC_S_PARM, &parm) && parm.parm.capture.timeperframe.numerator) {
+            m.num = parm.parm.capture.timeperframe.numerator;
+            m.den = parm.parm.capture.timeperframe.denominator;
+        }
+        snprintf(mode_desc, sizeof mode_desc, "%.4s %dx%d@%.4g", (const char *)&m.fourcc, m.w, m.h,
+                 (double)m.den / m.num);
     }
-    struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
-    fmt.fmt.pix.width = m.w;
-    fmt.fmt.pix.height = m.h;
-    fmt.fmt.pix.pixelformat = m.fourcc;
-    fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    if (xioctl(fd, VIDIOC_S_FMT, &fmt)) {
-        status(in, "cannot set format", NULL, 0, 0, 0);
-        goto out;
-    }
-    m.w = fmt.fmt.pix.width;
-    m.h = fmt.fmt.pix.height;
-    struct v4l2_streamparm parm = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
-    parm.parm.capture.timeperframe.numerator = m.num;
-    parm.parm.capture.timeperframe.denominator = m.den;
-    if (!xioctl(fd, VIDIOC_S_PARM, &parm) && parm.parm.capture.timeperframe.numerator) {
-        m.num = parm.parm.capture.timeperframe.numerator;
-        m.den = parm.parm.capture.timeperframe.denominator;
-    }
-    snprintf(mode_desc, sizeof mode_desc, "%.4s %dx%d@%.4g", (const char *)&m.fourcc, m.w, m.h,
-             (double)m.den / m.num);
+    if (m.bpl < m.w * 2)
+        m.bpl = m.w * 2;
     if (in->w != m.w || in->h != m.h) {
         free(in->black); /* the black frame is made at the new size when needed */
         in->black = NULL;
@@ -1169,8 +1543,15 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     while (running) {
         if (in->lf)
             STORE(in->lf->writer_ms, now_ms());
-        struct pollfd p = { .fd = fd, .events = POLLIN };
-        int r = poll(&p, 1, 1000);
+        /* A CSI-2 bridge also signals source changes (POLLPRI), on its own node or on the video node. */
+        struct pollfd p[2] = { { .fd = fd, .events = POLLIN | (csi.sd == fd ? POLLPRI : 0) },
+                               { .fd = csi.sd, .events = POLLPRI } };
+        int np = csi.sd >= 0 && csi.sd != fd ? 2 : 1;
+        int r = poll(p, np, 1000);
+        if (r > 0 && csi.sd >= 0 && (p[np - 1].revents & POLLPRI) && csi_changed(&csi)) {
+            LOG("input %d: the HDMI source changed", in->n);
+            break; /* set up again for the new mode */
+        }
         if (r == 0) {
             status(in, "no signal", mode_desc, 0, 0, 0);
             pipeline_drain(&pl, seq);
@@ -1182,8 +1563,10 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
                 break; /* re-open the device */
             continue;
         }
-        if (r < 0 || (p.revents & (POLLERR | POLLHUP)))
+        if (r < 0 || (p[0].revents & (POLLERR | POLLHUP)))
             break;
+        if (!(p[0].revents & POLLIN))
+            continue;
         struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP };
         if (xioctl(fd, VIDIOC_DQBUF, &b)) {
             if (errno == EAGAIN)
@@ -1305,8 +1688,9 @@ out:
     for (int i = 0; i < ncap; i++)
         if (cap[i].start)
             munmap(cap[i].start, cap[i].len);
+    csi_close(&csi, fd);
     close(fd);
-    if (running)
+    if (running && streaming) /* else the reason it didn't start stays in the status */
         status(in, "device lost, retrying", mode_desc, 0, 0, 0);
 }
 
@@ -1319,8 +1703,8 @@ static int audio_card_for(const char *video_dev)
     if (!realpath(video_dev, real) || strncmp(real, "/dev/", 5))
         return -2;
     snprintf(sys, sizeof sys, "/sys/class/video4linux/%s/device", real + 5);
-    if (!realpath(sys, usb))
-        return -1;
+    if (!realpath(sys, usb) || !strstr(usb, "/usb"))
+        return -1; /* not on USB (a CSI-2 bridge): a sound card next to it would be some other device */
     char *slash = strrchr(usb, '/'); /* .../1-1.4/1-1.4:1.0 -> .../1-1.4 (the USB device) */
     if (!slash)
         return -1;
