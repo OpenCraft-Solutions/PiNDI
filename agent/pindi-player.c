@@ -2734,18 +2734,24 @@ static int switch_poll(struct output *o, uint64_t *seen)
     return strcmp(old_ip, o->source_ip) ? 2 : 1;
 }
 
-/* The output's main stream among the visible sources (preferring one that has not just failed). */
+/* The output's main stream among the visible sources: first one that has not just failed, then an address
+ * other than left_url (the one the stream was just found to have moved away from); else the first listed. */
 static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source_t *srcs, uint32_t count,
-                                           const char *failed_src)
+                                           const char *failed_src, const char *left_url)
 {
     const NDIlib_source_t *pick = NULL;
+    int best = -1;
     for (uint32_t i = 0; i < count; i++) {
         if (!srcs[i].p_ndi_name || !name_matches(srcs[i].p_ndi_name, o->target, o->alt))
             continue;
         if (*o->source_ip && !url_has_ip(srcs[i].p_url_address, o->source_ip))
             continue;
-        if (!pick || !strcmp(pick->p_ndi_name, failed_src))
+        int score = (strcmp(srcs[i].p_ndi_name, failed_src) ? 2 : 0) +
+                    (!*left_url || !srcs[i].p_url_address || strcmp(srcs[i].p_url_address, left_url) ? 1 : 0);
+        if (score > best) {
+            best = score;
             pick = &srcs[i];
+        }
     }
     return pick;
 }
@@ -3006,7 +3012,9 @@ static void *codec_probe_thread(void *arg)
     };
     NDIlib_recv_instance_t r = ndi->recv_create_v3(&rc);
     const char *codec = NULL;
-    uint64_t until = now_ms() + 5000;
+    /* Its own connection waits for the sender's next keyframe: an HX sender (e.g. NDI Bridge re-encoding)
+     * can take several seconds. */
+    uint64_t until = now_ms() + 12000;
     while (r && running && !codec && now_ms() < until) {
         NDIlib_video_frame_v2_t v;
         if (ndi->recv_capture_v3(r, &v, NULL, NULL, 500) == NDIlib_frame_type_video) {
@@ -3026,10 +3034,10 @@ static void *codec_probe_thread(void *arg)
         LOG("ndi: output %d: %s sends %s", p->o->n, p->name, codec);
     }
     pthread_mutex_lock(&p->o->lock);
-    if (codec && *codec) {
-        p->o->probe_codec = codec;
+    if (codec) /* a picture came: the source is checked, even if its format told nothing (no retries) */
         snprintf(p->o->probe_src, sizeof p->o->probe_src, "%s", p->name);
-    }
+    if (codec && *codec)
+        p->o->probe_codec = codec;
     p->o->probing = false;
     pthread_mutex_unlock(&p->o->lock);
     free(p);
@@ -3050,6 +3058,7 @@ static bool codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidt
         o->probing = true;
         o->probe_ms = now;
         o->probe_codec = NULL;
+        o->probe_src[0] = 0; /* only a check that sees a picture marks the source as known (retries) */
     }
     pthread_mutex_unlock(&o->lock);
     if (running_now || too_soon)
@@ -3122,6 +3131,9 @@ static void *receiver(void *arg)
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
+    /* The address stream left_src was last found to have moved away from (for 2 min). */
+    char left_url[128] = "", left_src[256] = "";
+    uint64_t left_at = 0;
     bool got_frame = false, on_backup = false;
     uint64_t search_since = 0, primary_check = 0, splash_at = 0;
     /* NDI|HX H.264 through the hardware decoder (see hwdec_*): the receiver then gets compressed frames. */
@@ -3250,7 +3262,7 @@ static void *receiver(void *arg)
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
             if (o->n == 1)
                 sources_publish(srcs, count);
-            bool found = find_primary(o, srcs, count, "") != NULL;
+            bool found = find_primary(o, srcs, count, "", "") != NULL;
             for (uint32_t i = 0; i < count && !found && *o->backup; i++)
                 found = srcs[i].p_ndi_name && name_matches(srcs[i].p_ndi_name, o->backup, "");
             if (found) {
@@ -3348,16 +3360,34 @@ static void *receiver(void *arg)
                 sources_publish(srcs, count);
             last_sources = now;
             /* The sender restarted and our stream now has another address (its inputs can come back on
-             * each other's ports): the receiver would reconnect to the old one, i.e. to another stream. */
-            for (uint32_t i = 0; i < count; i++)
-                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address &&
-                    *cur_url && strcmp(srcs[i].p_url_address, cur_url)) {
-                    LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url,
-                        srcs[i].p_url_address);
-                    ndi->recv_destroy(recv);
-                    recv = NULL;
-                    break;
-                }
+             * each other's ports): the receiver would reconnect to the old one, i.e. to another stream.
+             * Discovery can list a restarted sender at its old and new address for a while, and pictures
+             * arriving don't prove which stream they are (the NDI library only echoes the name asked for).
+             * So it moves at once, as before, but doesn't go back to the address it just left while the new
+             * one delivers pictures, nor in the first 15 s after the move (an HX sender can take 6-7 s to send
+             * the new connection its first frame): else it hopped between the two, reconnecting every couple
+             * of seconds. A new address with no picture after that may be left again, and so may one that
+             * discovery no longer lists for our stream. The history is this stream's only (left_src). */
+            if (left_at && (now - left_at > 120000 || strcmp(left_src, cur_src)))
+                left_url[0] = 0;
+            bool listed = false;
+            for (uint32_t i = 0; i < count && !listed; i++)
+                listed = srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address &&
+                         !strcmp(srcs[i].p_url_address, cur_url);
+            bool keep = listed && ((got_frame && now - last_frame <= 5000) || (left_at && now - left_at < 15000));
+            const char *moved = NULL;
+            for (uint32_t i = 0; i < count && !moved; i++)
+                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address && *cur_url &&
+                    strcmp(srcs[i].p_url_address, cur_url) && !(keep && !strcmp(srcs[i].p_url_address, left_url)))
+                    moved = srcs[i].p_url_address;
+            if (moved) {
+                LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url, moved);
+                snprintf(left_url, sizeof left_url, "%s", cur_url);
+                snprintf(left_src, sizeof left_src, "%s", cur_src);
+                left_at = now;
+                ndi->recv_destroy(recv);
+                recv = NULL;
+            }
             if (!recv) {
                 audio_close(o);
                 splash_at = now + 6000; /* keep the picture until the stream's first frame */
@@ -3419,7 +3449,9 @@ static void *receiver(void *arg)
                     LOG("ndi:   ... and %u more", count - 20);
             }
             last_count = count;
-            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src);
+            /* The move history only counts for the stream it is about (the target may have changed since). */
+            bool same = *left_url && now - left_at <= 120000 && name_matches(left_src, o->target, o->alt);
+            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src, same ? left_url : "");
             bool backup = false;
             /* The main stream gets 3 s to appear before the backup is used. */
             if (!pick && *o->backup && now - search_since >= 3000) {
@@ -3491,7 +3523,7 @@ static void *receiver(void *arg)
             primary_check = now;
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
-            if (find_primary(o, srcs, count, "")) {
+            if (find_primary(o, srcs, count, "", "")) {
                 LOG("ndi: output %d: main stream %s is back, leaving the backup", o->n, o->target);
                 ndi->recv_destroy(recv);
                 recv = NULL;
@@ -3632,6 +3664,15 @@ static void *receiver(void *arg)
         }
         if (recheck && (hx_mode || (conns > 0 && codec_probe_start(o, bandwidth, cur_src, cur_url, 60000))))
             recheck = false;
+        /* A check that saw no picture is tried again (every 20 s at most): else an HX stream stays on the
+         * NDI library's software decoding for good, a few fps on a Pi 3. */
+        if (hx_decode && !hx_mode && got_frame) {
+            pthread_mutex_lock(&o->lock);
+            bool unknown = !o->probing && strcmp(o->probe_src, cur_src);
+            pthread_mutex_unlock(&o->lock);
+            if (unknown)
+                codec_probe_start(o, bandwidth, cur_src, cur_url, 20000);
+        }
         prev_conns = conns;
 
         if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {

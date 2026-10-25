@@ -373,7 +373,13 @@ step "Optimising boot ($BOOT)"
 # HX displays and two HX inputs) fails with "Not enough GPU mem". The initramfs is skipped only when booting from the SD
 # card, whose driver and ext4 are built into the kernel; USB/NVMe boot keeps it.
 CFG="$BOOT/config.txt"
-[ -f "$CFG.pindi-orig" ] || cp "$CFG" "$CFG.pindi-orig"
+[ -f "$CFG.pindi-orig" ] || [ ! -s "$CFG" ] || cp "$CFG" "$CFG.pindi-orig"
+# An empty config.txt (the FAT boot partition damaged by a power cut while it was being written) boots without
+# the display driver: start again from the original, which PiNDI's block is added to as usual.
+if [ ! -s "$CFG" ] && [ -s "$CFG.pindi-orig" ]; then
+    echo "config.txt is empty: starting again from $CFG.pindi-orig"
+    cp "$CFG.pindi-orig" "$CFG"
+fi
 INITRAMFS=1
 case "$(findmnt -no SOURCE /)" in
     /dev/mmcblk*) INITRAMFS=0 ;;
@@ -394,9 +400,13 @@ for cam in CAM0 CAM1; do
     [ "$lanes" = 4 ] && line="$line,4lane"
     CSI="$CSI$line"$'\n'
 done
-sed -i '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' "$CFG"
-sed -i -E 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' "$CFG"
-cat >> "$CFG" <<EOF
+# Written next to it, flushed to the card, then renamed over it (as cmdline.txt below): never edited in place, so
+# a power cut leaves the old file or the new one, not a half-written or empty one.
+NEWCFG="$CFG.pindi-new"
+sed -E -e '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' \
+    -e 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' \
+    "$CFG" > "$NEWCFG"
+cat >> "$NEWCFG" <<EOF
 # --- PiNDI begin ---
 [all]
 disable_splash=1
@@ -421,6 +431,9 @@ dtoverlay=disable-bt-pi5
 ${CSI}# --- PiNDI CSI-2 end ---
 # --- PiNDI end ---
 EOF
+sync "$NEWCFG"
+mv -f "$NEWCFG" "$CFG"
+sync
 
 # cmdline.txt: quiet boot, kernel messages off the screen, no serial console.
 CMDLINE="$BOOT/cmdline.txt"

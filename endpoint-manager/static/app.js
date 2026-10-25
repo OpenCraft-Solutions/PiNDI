@@ -238,7 +238,8 @@ function renderMatrix() {
     outs.map(({ d, o }) => cell(d, o, null, !o.stream, !o.stream && playing(o))).join('') + '</tr>';
   html += '<tr class="default"><th class="src">None (splash screen)<span class="sub">a stream nothing sends</span></th>' +
     outs.map(({ d, o }) => { const r = isNone(o); return cell(d, o, NONE, r, r && d.online); }).join('') + '</tr>';
-  const host = s => { const m = /^(.*) \((.*)\)$/.exec(s.name); return m ? m[1] : s.name; };
+  // "HOST (STREAM)": the host ends at the first " (" (a bridge's stream names have brackets of their own).
+  const host = s => { const m = /^(.*?) \((.*)\)$/.exec(s.name); return m ? m[1] : s.name; };
   html += srcs.map(s => `<tr><th class="src">${esc(s.stream)}${s.pindi ? '<span class="tag">PiNDI</span>' : ''}` +
     `<span class="sub">${esc(host(s))} · ${esc(s.ip)}</span></th>` +
     outs.map(({ d, o }) => {
