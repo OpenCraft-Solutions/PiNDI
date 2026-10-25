@@ -3363,14 +3363,16 @@ static void *receiver(void *arg)
              * Discovery can list a restarted sender at its old and new address for a while, and pictures
              * arriving don't prove which stream they are (the NDI library only echoes the name asked for).
              * So it moves at once, as before, but doesn't go back to the address it just left while the new
-             * one delivers pictures: else it hopped between the two, reconnecting every couple of seconds. */
-            bool delivering = got_frame && now - last_frame <= 5000;
+             * one delivers pictures, nor in the first 15 s after the move (an HX sender can take 6-7 s to send
+             * the new connection its first frame): else it hopped between the two, reconnecting every couple
+             * of seconds. A new address with no picture after that may be left again. */
+            bool keep = (got_frame && now - last_frame <= 5000) || (left_at && now - left_at < 15000);
             if (left_at && now - left_at > 120000)
                 left_url[0] = 0;
             const char *moved = NULL;
             for (uint32_t i = 0; i < count && !moved; i++)
                 if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address && *cur_url &&
-                    strcmp(srcs[i].p_url_address, cur_url) && !(delivering && !strcmp(srcs[i].p_url_address, left_url)))
+                    strcmp(srcs[i].p_url_address, cur_url) && !(keep && !strcmp(srcs[i].p_url_address, left_url)))
                     moved = srcs[i].p_url_address;
             if (moved) {
                 LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url, moved);
