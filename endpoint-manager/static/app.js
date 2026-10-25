@@ -182,6 +182,11 @@ function niceStep(raw) {
 // A device sees its own outgoing streams at a loopback address: that is its network address for everyone else.
 const loopback = ip => /^(127\.|::1$|localhost$)/i.test(ip || '');
 
+// "None": the output waits for a stream called "none" on the device itself, which nothing sends, so it shows
+// its splash screen. Always locked to 127.0.0.1, so no stream of that name elsewhere is picked up.
+const NONE = { name: 'None', stream: 'none', ip: '127.0.0.1' };
+const isNone = o => (o.stream || '').toLowerCase() === NONE.stream && o.source_ip === NONE.ip;
+
 function sources() {
   // Every source any online device sees, once per name and sender address.
   const map = new Map();
@@ -231,6 +236,8 @@ function renderMatrix() {
   };
   html += '<tr class="default"><th class="src">Own stream (OUT_&lt;serial&gt;)<span class="sub">the device default</span></th>' +
     outs.map(({ d, o }) => cell(d, o, null, !o.stream, !o.stream && playing(o))).join('') + '</tr>';
+  html += '<tr class="default"><th class="src">None (splash screen)<span class="sub">a stream nothing sends</span></th>' +
+    outs.map(({ d, o }) => { const r = isNone(o); return cell(d, o, NONE, r, r && d.online); }).join('') + '</tr>';
   const host = s => { const m = /^(.*) \((.*)\)$/.exec(s.name); return m ? m[1] : s.name; };
   html += srcs.map(s => `<tr><th class="src">${esc(s.stream)}${s.pindi ? '<span class="tag">PiNDI</span>' : ''}` +
     `<span class="sub">${esc(host(s))} · ${esc(s.ip)}</span></th>` +
@@ -252,7 +259,7 @@ async function route(btn) {
   try {
     await api('POST', '/api/route', {
       id: btn.dataset.dev, output: Number(btn.dataset.out), stream: btn.dataset.stream,
-      source_ip: $('#lock-ip').checked ? btn.dataset.ip : '',
+      source_ip: btn.dataset.ip === NONE.ip || $('#lock-ip').checked ? btn.dataset.ip : '',
     });
     await refresh();
   } catch (e) {
