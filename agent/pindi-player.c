@@ -2734,20 +2734,24 @@ static int switch_poll(struct output *o, uint64_t *seen)
     return strcmp(old_ip, o->source_ip) ? 2 : 1;
 }
 
-/* The output's main stream among the visible sources (preferring one that has not just failed, and an
- * address other than left_url, the one the stream was just found to have moved away from). */
+/* The output's main stream among the visible sources: first one that has not just failed, then an address
+ * other than left_url (the one the stream was just found to have moved away from); else the first listed. */
 static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source_t *srcs, uint32_t count,
                                            const char *failed_src, const char *left_url)
 {
     const NDIlib_source_t *pick = NULL;
+    int best = -1;
     for (uint32_t i = 0; i < count; i++) {
         if (!srcs[i].p_ndi_name || !name_matches(srcs[i].p_ndi_name, o->target, o->alt))
             continue;
         if (*o->source_ip && !url_has_ip(srcs[i].p_url_address, o->source_ip))
             continue;
-        if (!pick || !strcmp(pick->p_ndi_name, failed_src) ||
-            (*left_url && pick->p_url_address && !strcmp(pick->p_url_address, left_url)))
+        int score = (strcmp(srcs[i].p_ndi_name, failed_src) ? 2 : 0) +
+                    (!*left_url || !srcs[i].p_url_address || strcmp(srcs[i].p_url_address, left_url) ? 1 : 0);
+        if (score > best) {
+            best = score;
             pick = &srcs[i];
+        }
     }
     return pick;
 }
@@ -3030,10 +3034,10 @@ static void *codec_probe_thread(void *arg)
         LOG("ndi: output %d: %s sends %s", p->o->n, p->name, codec);
     }
     pthread_mutex_lock(&p->o->lock);
-    if (codec && *codec) {
-        p->o->probe_codec = codec;
+    if (codec) /* a picture came: the source is checked, even if its format told nothing (no retries) */
         snprintf(p->o->probe_src, sizeof p->o->probe_src, "%s", p->name);
-    }
+    if (codec && *codec)
+        p->o->probe_codec = codec;
     p->o->probing = false;
     pthread_mutex_unlock(&p->o->lock);
     free(p);
