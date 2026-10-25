@@ -9,7 +9,8 @@ The API every PiNDI device serves, and that the endpoint manager is built agains
   replaced at once, because it crossed the network unencrypted.
 - **Certificates** are self-signed unless one was uploaded. Pin the device's certificate or public key; don't
   just switch checks off. The manager pins the certificate's SHA-256 fingerprint. A device makes a new
-  self-signed certificate when its host name or addresses change.
+  self-signed certificate only when it gets a host name or address its current one doesn't cover (not at
+  every boot), and keeps its key, so a client that pins the public key keeps trusting it.
 - **Authentication:** `Authorization: Bearer <token>` or `X-API-Key: <token>`. Tokens in the URL aren't
   accepted. Wrong tokens are answered after a second and never lock anyone out.
 - **Bodies** are JSON or form data (except the update package, below). Answers are JSON.

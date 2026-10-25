@@ -2861,27 +2861,32 @@ def tls_permissions():
 
 
 def ensure_cert():
-    """Broker: the device's own certificate, made again whenever its host name or addresses change (so it
-    keeps matching the address in the browser). An uploaded certificate is left alone."""
+    """Broker: the device's own certificate, made again when the device gets a host name or address it doesn't
+    cover (so it keeps matching the address in the browser), with the same key. An address that is only missing
+    is no reason: at boot the broker starts before the network has one, and Wi-Fi can be out of range. An
+    uploaded certificate is left alone."""
     have = os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY)
     if have and not os.path.exists(TLS_SELF):
         tls_permissions()
         return
     names = tls_names()
-    if have and read_text(TLS_SELF).split() == names:
+    if have and set(names) <= set(read_text(TLS_SELF).split()):
         tls_permissions()
         return
     os.makedirs(TLS_DIR, mode=0o750, exist_ok=True)
     fd, key = tempfile.mkstemp(prefix=".key.", dir=TLS_DIR)
     os.close(fd)
     cert = key + ".crt"
+    # The key stays: clients that pin it (rather than the whole certificate) keep trusting the device.
+    keyargs = ["-key", TLS_KEY] if have else ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                                             "-keyout", key]
     try:
-        r = run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
-                "-days", "3650", "-subj", "/CN=%s" % socket.gethostname(),
-                "-addext", "subjectAltName=" + ",".join(names), "-keyout", key, "-out", cert)
+        r = run("openssl", "req", "-new", "-x509", *keyargs, "-days", "3650", "-subj", "/CN=%s" % socket.gethostname(),
+                "-addext", "subjectAltName=" + ",".join(names), "-out", cert)
         if r.returncode:
             raise RuntimeError("cannot create the TLS certificate: %s" % r.stderr.strip())
-        os.replace(key, TLS_KEY)
+        if not have:
+            os.replace(key, TLS_KEY)
         os.replace(cert, TLS_CERT)
     finally:
         for f in (key, cert):

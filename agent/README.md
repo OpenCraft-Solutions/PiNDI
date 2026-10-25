@@ -86,7 +86,9 @@ Open `https://<IP shown on the splash>/` and sign in with the Pi's own user (a
 member of the `sudo` group, e.g. the user from step 1). If you signed in with a
 well-known default password, the page reminds you to change it.
 
-The device makes its own certificate, so the browser warns the first time. To
+The device makes its own certificate, so the browser warns the first time. It
+keeps that certificate across restarts; it makes a new one (with the same key,
+so key pins keep working) only when it gets a new host name or address. To
 be sure it's this device, compare the browser's certificate fingerprint with the
 one under **Device settings → HTTPS certificate**, then accept it. To avoid the warning altogether, upload a
 certificate from your organisation's certificate authority there. `http://`
