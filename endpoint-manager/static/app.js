@@ -179,13 +179,17 @@ function niceStep(raw) {
 
 // ------------------------------------------------------------------ video matrix
 
+// A device sees its own outgoing streams at a loopback address: that is its network address for everyone else.
+const loopback = ip => /^(127\.|::1$|localhost$)/i.test(ip || '');
+
 function sources() {
   // Every source any online device sees, once per name and sender address.
   const map = new Map();
   for (const d of devices.filter(d => d.online)) {
     for (const s of d.status.sources || []) {
-      const key = s.name + '\t' + s.ip;
-      if (!map.has(key)) map.set(key, { ...s, pindi: false });
+      const ip = loopback(s.ip) && d.status.device.ip ? d.status.device.ip : s.ip;
+      const key = s.name + '\t' + ip;
+      if (!map.has(key)) map.set(key, { ...s, ip, pindi: false });
     }
   }
   for (const d of devices.filter(d => d.online)) {
