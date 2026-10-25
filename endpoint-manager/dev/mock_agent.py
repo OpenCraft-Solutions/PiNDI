@@ -84,7 +84,7 @@ class Device:
                 "inputs": [{"slot": 1, "device": "/dev/v4l/by-id/usb-MOCK", "present": True, "enabled": True,
                             "name": "IN_%s" % self.serial, "state": "ON AIR", "mode": "MJPG 1920x1080@30",
                             "fps": "30.0", "audio": "48 kHz stereo", "on_air": True}],
-                "sources": [{"name": s[0], "stream": re.match(r"^.* \((.*)\)$", s[0]).group(1), "ip": s[1]}
+                "sources": [{"name": s[0], "stream": re.match(r"^.*? \((.*)\)$", s[0]).group(1), "ip": s[1]}
                             for s in all_sources]}
 
 

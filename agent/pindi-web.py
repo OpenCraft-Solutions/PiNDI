@@ -1291,7 +1291,9 @@ def visible_sources():
         name, _, url = line.partition("\t")
         if name:
             host = url.rpartition(":")[0] if ":" in url else url
-            m = re.match(r"^(.*) \((.*)\)$", name)
+            # "HOST (STREAM)": the host ends at the first " (" - a stream name may have brackets of its own,
+            # e.g. a bridge's "HYPERION-BRIDGE (PINDI-4B-1 (Firestick))" (the player splits it the same way).
+            m = re.match(r"^(.*?) \((.*)\)$", name)
             out.append({"name": name, "stream": m.group(2) if m else name, "ip": host})
     return out
 
