@@ -1456,9 +1456,9 @@ function sync(){var s=document.getElementById('mode-static');if(!s)return;
 document.getElementById('static-fields').style.display=s.checked?'block':'none';}
 document.addEventListener('change',function(e){if(e.target.name==='mode')sync();});
 document.addEventListener('click',function(e){var b=e.target.closest('[data-stream]');if(!b)return;
-var n=b.dataset.out;document.getElementById('stream-'+n).value=b.dataset.stream;
+var n=b.dataset.out,s=document.getElementById('stream-'+n);s.value=b.dataset.stream;
 document.getElementById('source_ip-'+n).value=b.dataset.ip;
-document.getElementById('out'+n).scrollIntoView({behavior:'smooth'});});
+if(s.form.requestSubmit)s.form.requestSubmit();else s.form.submit();});
 function poll(){fetch('/api/status',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null})
 .then(function(d){if(!d)return;document.querySelectorAll('[data-k]').forEach(function(el){
 var k=el.dataset.k;if(!(k in d))return;var v=d[k];el.textContent=v||'-';
