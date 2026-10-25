@@ -3131,7 +3131,8 @@ static void *receiver(void *arg)
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
-    char left_url[128] = ""; /* the address the stream was last found to have moved away from (for 2 min) */
+    /* The address stream left_src was last found to have moved away from (for 2 min). */
+    char left_url[128] = "", left_src[256] = "";
     uint64_t left_at = 0;
     bool got_frame = false, on_backup = false;
     uint64_t search_since = 0, primary_check = 0, splash_at = 0;
@@ -3365,10 +3366,15 @@ static void *receiver(void *arg)
              * So it moves at once, as before, but doesn't go back to the address it just left while the new
              * one delivers pictures, nor in the first 15 s after the move (an HX sender can take 6-7 s to send
              * the new connection its first frame): else it hopped between the two, reconnecting every couple
-             * of seconds. A new address with no picture after that may be left again. */
-            bool keep = (got_frame && now - last_frame <= 5000) || (left_at && now - left_at < 15000);
-            if (left_at && now - left_at > 120000)
+             * of seconds. A new address with no picture after that may be left again, and so may one that
+             * discovery no longer lists for our stream. The history is this stream's only (left_src). */
+            if (left_at && (now - left_at > 120000 || strcmp(left_src, cur_src)))
                 left_url[0] = 0;
+            bool listed = false;
+            for (uint32_t i = 0; i < count && !listed; i++)
+                listed = srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address &&
+                         !strcmp(srcs[i].p_url_address, cur_url);
+            bool keep = listed && ((got_frame && now - last_frame <= 5000) || (left_at && now - left_at < 15000));
             const char *moved = NULL;
             for (uint32_t i = 0; i < count && !moved; i++)
                 if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address && *cur_url &&
@@ -3377,6 +3383,7 @@ static void *receiver(void *arg)
             if (moved) {
                 LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url, moved);
                 snprintf(left_url, sizeof left_url, "%s", cur_url);
+                snprintf(left_src, sizeof left_src, "%s", cur_src);
                 left_at = now;
                 ndi->recv_destroy(recv);
                 recv = NULL;
@@ -3442,7 +3449,9 @@ static void *receiver(void *arg)
                     LOG("ndi:   ... and %u more", count - 20);
             }
             last_count = count;
-            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src, left_url);
+            /* The move history only counts for the stream it is about (the target may have changed since). */
+            bool same = *left_url && now - left_at <= 120000 && name_matches(left_src, o->target, o->alt);
+            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src, same ? left_url : "");
             bool backup = false;
             /* The main stream gets 3 s to appear before the backup is used. */
             if (!pick && *o->backup && now - search_since >= 3000) {
