@@ -3350,16 +3350,23 @@ static void *receiver(void *arg)
                 sources_publish(srcs, count);
             last_sources = now;
             /* The sender restarted and our stream now has another address (its inputs can come back on
-             * each other's ports): the receiver would reconnect to the old one, i.e. to another stream. */
+             * each other's ports): the receiver would reconnect to the old one, i.e. to another stream.
+             * Discovery can list a restarted sender at its old and new address for a while: while ours is
+             * still listed and pictures arrive, stay (else it hopped between the two, reconnecting each time). */
+            const char *moved = NULL;
+            bool listed = false;
             for (uint32_t i = 0; i < count; i++)
-                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address &&
-                    *cur_url && strcmp(srcs[i].p_url_address, cur_url)) {
-                    LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url,
-                        srcs[i].p_url_address);
-                    ndi->recv_destroy(recv);
-                    recv = NULL;
-                    break;
+                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address && *cur_url) {
+                    if (!strcmp(srcs[i].p_url_address, cur_url))
+                        listed = true;
+                    else if (!moved)
+                        moved = srcs[i].p_url_address;
                 }
+            if (moved && (!listed || !got_frame || now - last_frame > 5000)) {
+                LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url, moved);
+                ndi->recv_destroy(recv);
+                recv = NULL;
+            }
             if (!recv) {
                 audio_close(o);
                 splash_at = now + 6000; /* keep the picture until the stream's first frame */
