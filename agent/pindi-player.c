@@ -3006,7 +3006,9 @@ static void *codec_probe_thread(void *arg)
     };
     NDIlib_recv_instance_t r = ndi->recv_create_v3(&rc);
     const char *codec = NULL;
-    uint64_t until = now_ms() + 5000;
+    /* Its own connection waits for the sender's next keyframe: an HX sender (e.g. NDI Bridge re-encoding)
+     * can take several seconds. */
+    uint64_t until = now_ms() + 12000;
     while (r && running && !codec && now_ms() < until) {
         NDIlib_video_frame_v2_t v;
         if (ndi->recv_capture_v3(r, &v, NULL, NULL, 500) == NDIlib_frame_type_video) {
@@ -3632,6 +3634,15 @@ static void *receiver(void *arg)
         }
         if (recheck && (hx_mode || (conns > 0 && codec_probe_start(o, bandwidth, cur_src, cur_url, 60000))))
             recheck = false;
+        /* A check that saw no picture is tried again (every 20 s at most): else an HX stream stays on the
+         * NDI library's software decoding for good, a few fps on a Pi 3. */
+        if (hx_decode && !hx_mode && got_frame) {
+            pthread_mutex_lock(&o->lock);
+            bool unknown = !o->probing && strcmp(o->probe_src, cur_src);
+            pthread_mutex_unlock(&o->lock);
+            if (unknown)
+                codec_probe_start(o, bandwidth, cur_src, cur_url, 20000);
+        }
         prev_conns = conns;
 
         if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
