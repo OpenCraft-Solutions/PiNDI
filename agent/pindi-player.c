@@ -2734,9 +2734,10 @@ static int switch_poll(struct output *o, uint64_t *seen)
     return strcmp(old_ip, o->source_ip) ? 2 : 1;
 }
 
-/* The output's main stream among the visible sources (preferring one that has not just failed). */
+/* The output's main stream among the visible sources (preferring one that has not just failed, and an
+ * address other than left_url, the one the stream was just found to have moved away from). */
 static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source_t *srcs, uint32_t count,
-                                           const char *failed_src)
+                                           const char *failed_src, const char *left_url)
 {
     const NDIlib_source_t *pick = NULL;
     for (uint32_t i = 0; i < count; i++) {
@@ -2744,7 +2745,8 @@ static const NDIlib_source_t *find_primary(struct output *o, const NDIlib_source
             continue;
         if (*o->source_ip && !url_has_ip(srcs[i].p_url_address, o->source_ip))
             continue;
-        if (!pick || !strcmp(pick->p_ndi_name, failed_src))
+        if (!pick || !strcmp(pick->p_ndi_name, failed_src) ||
+            (*left_url && pick->p_url_address && !strcmp(pick->p_url_address, left_url)))
             pick = &srcs[i];
     }
     return pick;
@@ -3052,6 +3054,7 @@ static bool codec_probe_start(struct output *o, NDIlib_recv_bandwidth_e bandwidt
         o->probing = true;
         o->probe_ms = now;
         o->probe_codec = NULL;
+        o->probe_src[0] = 0; /* only a check that sees a picture marks the source as known (retries) */
     }
     pthread_mutex_unlock(&o->lock);
     if (running_now || too_soon)
@@ -3124,6 +3127,8 @@ static void *receiver(void *arg)
     uint64_t last_stats = 0, last_sources = 0;
     uint32_t last_count = UINT32_MAX;
     char cur_src[256] = "", cur_url[128] = "", failed_src[256] = "", last_src[256] = "";
+    char left_url[128] = ""; /* the address the stream was last found to have moved away from (for 2 min) */
+    uint64_t left_at = 0;
     bool got_frame = false, on_backup = false;
     uint64_t search_since = 0, primary_check = 0, splash_at = 0;
     /* NDI|HX H.264 through the hardware decoder (see hwdec_*): the receiver then gets compressed frames. */
@@ -3252,7 +3257,7 @@ static void *receiver(void *arg)
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
             if (o->n == 1)
                 sources_publish(srcs, count);
-            bool found = find_primary(o, srcs, count, "") != NULL;
+            bool found = find_primary(o, srcs, count, "", "") != NULL;
             for (uint32_t i = 0; i < count && !found && *o->backup; i++)
                 found = srcs[i].p_ndi_name && name_matches(srcs[i].p_ndi_name, o->backup, "");
             if (found) {
@@ -3351,19 +3356,22 @@ static void *receiver(void *arg)
             last_sources = now;
             /* The sender restarted and our stream now has another address (its inputs can come back on
              * each other's ports): the receiver would reconnect to the old one, i.e. to another stream.
-             * Discovery can list a restarted sender at its old and new address for a while: while ours is
-             * still listed and pictures arrive, stay (else it hopped between the two, reconnecting each time). */
+             * Discovery can list a restarted sender at its old and new address for a while, and pictures
+             * arriving don't prove which stream they are (the NDI library only echoes the name asked for).
+             * So it moves at once, as before, but doesn't go back to the address it just left while the new
+             * one delivers pictures: else it hopped between the two, reconnecting every couple of seconds. */
+            bool delivering = got_frame && now - last_frame <= 5000;
+            if (left_at && now - left_at > 120000)
+                left_url[0] = 0;
             const char *moved = NULL;
-            bool listed = false;
-            for (uint32_t i = 0; i < count; i++)
-                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address && *cur_url) {
-                    if (!strcmp(srcs[i].p_url_address, cur_url))
-                        listed = true;
-                    else if (!moved)
-                        moved = srcs[i].p_url_address;
-                }
-            if (moved && (!listed || !got_frame || now - last_frame > 5000)) {
+            for (uint32_t i = 0; i < count && !moved; i++)
+                if (srcs[i].p_ndi_name && !strcmp(srcs[i].p_ndi_name, cur_src) && srcs[i].p_url_address && *cur_url &&
+                    strcmp(srcs[i].p_url_address, cur_url) && !(delivering && !strcmp(srcs[i].p_url_address, left_url)))
+                    moved = srcs[i].p_url_address;
+            if (moved) {
                 LOG("ndi: output %d: %s moved from %s to %s, reconnecting", o->n, cur_src, cur_url, moved);
+                snprintf(left_url, sizeof left_url, "%s", cur_url);
+                left_at = now;
                 ndi->recv_destroy(recv);
                 recv = NULL;
             }
@@ -3428,7 +3436,7 @@ static void *receiver(void *arg)
                     LOG("ndi:   ... and %u more", count - 20);
             }
             last_count = count;
-            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src);
+            const NDIlib_source_t *pick = find_primary(o, srcs, count, failed_src, left_url);
             bool backup = false;
             /* The main stream gets 3 s to appear before the backup is used. */
             if (!pick && *o->backup && now - search_since >= 3000) {
@@ -3500,7 +3508,7 @@ static void *receiver(void *arg)
             primary_check = now;
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
-            if (find_primary(o, srcs, count, "")) {
+            if (find_primary(o, srcs, count, "", "")) {
                 LOG("ndi: output %d: main stream %s is back, leaving the backup", o->n, o->target);
                 ndi->recv_destroy(recv);
                 recv = NULL;
