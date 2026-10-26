@@ -518,9 +518,11 @@ def guard_check(boot=False, act=True):
                 restored.append((path, kind, "unreadable", False))
                 continue
             # Pending until read back intact (a failed read-back may still have written it).
-            pending[path] = "1" if boot and kind == "boot" else "0"
+            # A reboot is owed for a boot file put back at boot - or still owed from an earlier attempt there.
+            owed = kind == "boot" and (boot or pending.get(path) == "1")
+            pending[path] = "1" if owed else "0"
             _guard_pending(pending)
-            if boot and kind == "boot":
+            if owed:
                 reboot_for.add(path)
             try:
                 write_bytes(path, copy, None if kind == "boot" else 0o644)
