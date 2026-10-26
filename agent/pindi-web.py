@@ -267,6 +267,9 @@ GUARD_DIR = "/var/lib/pindi/guard"
 GUARD_LOCK = "/run/pindi-guard.lock"
 GUARD_STATUS = "/var/lib/pindi/guard.status"  # readable by the front end: the last restores, for the System card
 GUARD_REBOOTS = GUARD_DIR + "/reboots"  # times of the reboots after a restore (at most 2 an hour: no loop)
+# Files put back whose read-back has not succeeded yet, with "1" when a reboot is owed for them: the restart or
+# reboot follows once a later check reads them back intact.
+GUARD_PENDING = GUARD_DIR + "/pending"
 _guard_held = threading.local()
 
 
@@ -459,14 +462,33 @@ def _guard_status(lines):
         log("guard: cannot record the restore: %s" % e)
 
 
+def _guard_pending(update=None):
+    """The pending restores {path: "1" if a reboot is owed else "0"}; with update, replaced by it first."""
+    if update is not None:
+        try:
+            write_atomic(GUARD_PENDING, "".join("%s\t%s\n" % kv for kv in sorted(update.items())), 0o600)
+        except OSError as e:
+            log("guard: cannot record the pending restores: %s" % e)
+        return update
+    try:
+        with open(GUARD_PENDING, "rb") as f:
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return {}
+    return dict(l.split("\t", 1) for l in lines if l.count("\t") == 1)
+
+
 def guard_check(boot=False, act=True):
     """Compare each file as stored on the card with its verified copy and put back a damaged or foreign one;
     then restart the player and sender (settings), or reboot (a boot file, at boot) - unless act is False
     (install.sh, before it edits the files). Files without a copy get one if they check out (the first run
     after an install). A file that can't be checked or put back (e.g. a read-only partition) is recorded, and
-    the others are still checked."""
+    the others are still checked. One put back without a successful read-back stays pending: its restart or
+    reboot follows when a later check reads it back intact."""
     restored = []
+    reboot_for = set()  # boot files whose repair the firmware has not read yet
     with guard_lock():
+        pending = _guard_pending()
         for path, kind in guard_files():
             try:
                 copy = _guard_load(path)
@@ -483,6 +505,11 @@ def guard_check(boot=False, act=True):
                         guard_save(path)  # no copy yet (the first check after an install)
                     continue
                 if live == copy:
+                    if path in pending:  # put back earlier, but its read-back failed: verified now
+                        restored.append((path, kind, "put back earlier, verified now", True))
+                        # Owed when put back at boot (no reboot followed); at boot the firmware has read it now.
+                        if kind == "boot" and pending[path] == "1" and not boot:
+                            reboot_for.add(path)
                     continue
                 why = ("damaged" if live is None or not guard_valid(path, live) else
                        "changed by something other than PiNDI")
@@ -490,6 +517,11 @@ def guard_check(boot=False, act=True):
                 log("guard: cannot check %s: %s" % (path, e))
                 restored.append((path, kind, "unreadable", False))
                 continue
+            # Pending until read back intact (a failed read-back may still have written it).
+            pending[path] = "1" if boot and kind == "boot" else "0"
+            _guard_pending(pending)
+            if boot and kind == "boot":
+                reboot_for.add(path)
             try:
                 write_bytes(path, copy, None if kind == "boot" else 0o644)
                 ok = read_card(path) == copy
@@ -499,6 +531,10 @@ def guard_check(boot=False, act=True):
             log("guard: %s was %s: %s" % (path, why, "put back its verified copy" if ok else
                                           "putting back its copy failed"))
             restored.append((path, kind, why, ok))
+        # The restart/reboot below is for those read back intact: no longer pending (the rest stay).
+        done = {p for p, _, _, ok in restored if ok}
+        if done & set(pending):
+            _guard_pending({p: v for p, v in pending.items() if p not in done})
     if not restored:
         return restored
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -509,7 +545,7 @@ def guard_check(boot=False, act=True):
     if any(k == "settings" and ok for _, k, _, ok in restored):
         # At boot too: the player starts before this check (as early as possible, for the splash screen).
         run("systemctl", "--no-block", "restart", "pindi.service", "pindi-sender.service")
-    if boot and any(k == "boot" and ok for _, k, _, ok in restored):
+    if any(k == "boot" and ok and p in reboot_for for p, k, _, ok in restored):
         now = time.time()
         recent = []  # a damaged history must not stop the reboot: unreadable entries are skipped
         try:
