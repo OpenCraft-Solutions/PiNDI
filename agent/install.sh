@@ -39,14 +39,18 @@ step() { echo; echo "==> $*"; }
 PREV=/var/lib/pindi/previous.new
 rm -rf "$PREV"
 install -d -m 700 "$PREV"
-put() { # put SRC DEST MODE
-    local dest=$2
+keep() { # keep DEST: if the installation fails, it comes back as it is now (or is removed if it doesn't exist)
+    local dest=$1
     if [ -e "$dest" ] && [ ! -e "$PREV$dest" ]; then
         install -d "$PREV$(dirname "$dest")"
         cp -a "$dest" "$PREV$dest"
     elif [ ! -e "$dest" ]; then
         echo "$dest" >> "$PREV/.added"
     fi
+}
+put() { # put SRC DEST MODE
+    local dest=$2
+    keep "$dest"
     install -m "$3" "$1" "$dest.pindi-new"
     mv -f "$dest.pindi-new" "$dest"
 }
@@ -61,6 +65,7 @@ rollback() {
         while IFS= read -r f; do rm -f "$f"; done < "$PREV/.added"
     fi
     systemctl daemon-reload || true
+    sync
 }
 trap rollback ERR
 
@@ -266,6 +271,9 @@ for g in pindi-media video systemd-journal; do
     if getent group "$g" >/dev/null; then usermod -aG "$g" pindi-web; fi
 done
 install -d /usr/local/lib/pindi
+# Whether the installed version has the configuration guard (see "Optimising boot" below).
+GUARDED=0
+if grep -q -e "--guard" /usr/local/lib/pindi/pindi-web.py 2>/dev/null; then GUARDED=1; fi
 put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
 cat > /etc/pam.d/pindi-web <<'EOF'
 # PiNDI web interface: same password check as a normal login / SSH.
@@ -373,16 +381,29 @@ step "Optimising boot ($BOOT)"
 exec 9>>/run/pindi-guard.lock
 # Not got within a minute: stop (and roll back) rather than write unlocked.
 flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
-# Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
-# edited and adopted as the new copy below (nothing is restarted; a first install has no copies yet).
-PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore
+CFG="$BOOT/config.txt"
+CMDLINE="$BOOT/cmdline.txt"
+# If the installation fails below, the boot files, the settings and their copies come back as they are now.
+GUARD=/var/lib/pindi/guard
+for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
+    keep "$f"
+    keep "$GUARD/$(echo "${f#/}" | tr / _).copy"
+done
+if [ "$GUARDED" -eq 1 ]; then
+    # Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
+    # edited and adopted as the new copy below (nothing is restarted).
+    PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore
+else
+    # Installed over a version without the guard (a first install, or an update after a downgrade): copies left
+    # from before the downgrade miss the changes made since, so the current files are the starting point.
+    rm -f "$GUARD"/*.copy
+fi
 
 # config.txt: no rainbow, no delays, no Wi-Fi (unless on in the web UI)/Bluetooth (the overlays are named
 # differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which
 # holds every hardware H.264 decoder and encoder: with 76 a fourth one (e.g. two
 # HX displays and two HX inputs) fails with "Not enough GPU mem". The initramfs is skipped only when booting from the SD
 # card, whose driver and ext4 are built into the kernel; USB/NVMe boot keeps it.
-CFG="$BOOT/config.txt"
 [ -f "$CFG.pindi-orig" ] || [ ! -s "$CFG" ] || cp "$CFG" "$CFG.pindi-orig"
 # An empty config.txt (the FAT boot partition damaged by a power cut while it was being written) boots without
 # the display driver: start again from the original, which PiNDI's block is added to as usual.
@@ -447,13 +468,15 @@ mv -f "$NEWCFG" "$CFG"
 sync
 
 # cmdline.txt: quiet boot, kernel messages off the screen, no serial console.
-CMDLINE="$BOOT/cmdline.txt"
 [ -f "$CMDLINE.pindi-orig" ] || ! grep -q "root=" "$CMDLINE" || cp "$CMDLINE" "$CMDLINE.pindi-orig"
 # A damaged one (no root= - the device would not boot): start again from the original.
 if ! grep -q "root=" "$CMDLINE" && grep -q "root=" "$CMDLINE.pindi-orig" 2>/dev/null; then
     echo "cmdline.txt is damaged: starting again from $CMDLINE.pindi-orig"
     cp "$CMDLINE.pindi-orig" "$CMDLINE"
 fi
+# Still none (missing, and no original or verified copy to start from): writing one would not boot.
+grep -q "root=" "$CMDLINE" 2>/dev/null || {
+    echo "cmdline.txt is missing or damaged (no root=) and can't be recovered: stopping" >&2; false; }
 set -f
 NEW=""
 for tok in $(tr -d '\r\n' < "$CMDLINE"); do
@@ -474,13 +497,13 @@ sync
 # Verified copies of the boot files and the settings, kept on the root file system: the configuration guard
 # puts a damaged or foreign file back from them (pindi-guard.service at boot, the broker while running). The
 # boot files must read back from the card exactly as written; the settings were not edited here (above, they
-# were put back from their copy if they were damaged).
-if PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save "$CFG=$TMP/config.txt.written" \
-        "$CMDLINE=$TMP/cmdline.txt.written" /etc/default/pindi; then
-    echo "Configuration copies saved and verified"
-else
-    echo "Warning: a configuration copy could not be saved or verified (the files are kept as they are)"
-fi
+# were put back from their copy if they were damaged). If not, the device may not boot: stop, and the files
+# and copies from before come back.
+PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save "$CFG=$TMP/config.txt.written" \
+    "$CMDLINE=$TMP/cmdline.txt.written" /etc/default/pindi || {
+    echo "The boot files or settings did not read back from the card as written (is it failing?): stopping" >&2
+    false; }
+echo "Configuration copies saved and verified"
 flock -u 9
 
 # Services not needed on a wired NDI display. apt's daily timers would download and upgrade at random
