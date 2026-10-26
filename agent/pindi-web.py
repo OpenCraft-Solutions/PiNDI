@@ -467,13 +467,15 @@ def guard_check(boot=False, act=True):
                 copy = _guard_load(path)
                 live = read_card(path)
                 if copy is None:
-                    if live is not None and guard_valid(path, live):
-                        guard_save(path)
-                    elif os.path.exists(_guard_copy(path)):
-                        # A copy that is itself damaged, and nothing usable to put back: reported (install.sh
-                        # stops; the System card shows it). Without any copy yet, the file is left as it is.
-                        log("guard: %s is damaged and has no usable verified copy" % path)
-                        restored.append((path, kind, "damaged, with no verified copy", False))
+                    if os.path.exists(_guard_copy(path)):
+                        # The copy itself is damaged: the file is not trusted in its place (it may be damaged too,
+                        # yet look complete). Reported (install.sh stops; the System card shows it) until it is
+                        # checked and kept by hand with --guard save.
+                        log("guard: the verified copy of %s is damaged: check the file, then keep it with "
+                            "'pindi-web.py --guard save %s'" % (path, path))
+                        restored.append((path, kind, "its verified copy is damaged", False))
+                    elif live is not None and guard_valid(path, live):
+                        guard_save(path)  # no copy yet (the first check after an install)
                     continue
                 if live == copy:
                     continue
