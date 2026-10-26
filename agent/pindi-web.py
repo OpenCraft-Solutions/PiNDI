@@ -393,8 +393,13 @@ def _guard_load(path):
 
 def guard_base(path):
     """The text a PiNDI edit of path starts from: its verified copy if there is one (never a damaged or foreign
-    file), else the file."""
+    file), else the file (no copy yet). A damaged copy stops the edit: the file may be damaged too, and would
+    become the new copy (see guard_check)."""
     copy = _guard_load(path)
+    if copy is None and os.path.exists(_guard_copy(path)):
+        raise GuardError("The verified copy of %s is damaged, so it can't be changed safely. Check the file, then "
+                         "keep it over SSH with: sudo python3 /usr/local/lib/pindi/pindi-web.py --guard save %s"
+                         % (path, path))
     return (copy if copy is not None else read_card(path) or b"").decode("utf-8", "replace")
 
 
