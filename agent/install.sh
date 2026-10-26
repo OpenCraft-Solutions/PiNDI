@@ -392,7 +392,9 @@ done
 if [ "$GUARDED" -eq 1 ]; then
     # Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
     # edited and adopted as the new copy below (nothing is restarted).
-    PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore
+    PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore || {
+        echo "A damaged boot file or settings could not be put back from its copy (is the card failing?): stopping" >&2
+        false; }
 else
     # Installed over a version without the guard (a first install, or an update after a downgrade): copies left
     # from before the downgrade miss the changes made since, so the current files are the starting point.

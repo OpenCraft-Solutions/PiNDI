@@ -434,13 +434,22 @@ def guard_save(path, expected=None):
         return _guard_load(path) == data
 
 
+def guard_history():
+    """The status file's lines (as text even if damaged: it must not stop a recovery or the System card)."""
+    try:
+        with open(GUARD_STATUS, "rb") as f:
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
 def _guard_status(lines):
     """The last restores (newest first, up to 20), for the System card."""
-    old = [l for l in read_text(GUARD_STATUS).splitlines() if l.strip()]
+    old = [l for l in guard_history() if l.strip()]
     try:
         write_atomic(GUARD_STATUS, "\n".join((lines + old)[:20]) + "\n", 0o644)
-    except OSError:
-        pass
+    except (OSError, ValueError) as e:
+        log("guard: cannot record the restore: %s" % e)
 
 
 def guard_check(boot=False, act=True):
@@ -465,6 +474,7 @@ def guard_check(boot=False, act=True):
                        "changed by something other than PiNDI")
             except OSError as e:
                 log("guard: cannot check %s: %s" % (path, e))
+                restored.append((path, kind, "unreadable", False))
                 continue
             try:
                 write_bytes(path, copy, None if kind == "boot" else 0o644)
@@ -508,8 +518,9 @@ def guard_main(args):
         print("run as root (sudo)", file=sys.stderr)
         return 1
     if args[:1] in (["check"], ["restore"]):
-        guard_check(boot="--boot" in args, act=args[0] == "check")
-        return 0
+        restored = guard_check(boot="--boot" in args, act=args[0] == "check")
+        # restore: install.sh must not go on to edit a file that is still damaged.
+        return 1 if args[0] == "restore" and not all(ok for _, _, _, ok in restored) else 0
     if args[:1] == ["save"]:
         want = {}
         for a in args[1:] or [p for p, _ in guard_files()]:
@@ -2252,7 +2263,7 @@ def dashboard(session):
 
     # System
     restores = []  # what the configuration guard put back in the last 7 days (newest first)
-    for line in read_text(GUARD_STATUS).splitlines():
+    for line in guard_history():
         f = line.split("\t")
         try:
             if len(f) == 4 and time.time() - time.mktime(time.strptime(f[0], "%Y-%m-%d %H:%M:%S")) < 7 * 86400:
@@ -3620,7 +3631,10 @@ def broker_main():
             except Exception as e:
                 log("tls: %s" % e)
             try:
-                guard_check()
+                # Not while an update installs (until its reboot): an older version's installer writes the boot
+                # files without the guard's lock and copies, and they must not be put back underneath it.
+                if update_state() not in ("running", "done"):
+                    guard_check()
             except Exception as e:
                 log("guard: %s" % e)
     threading.Thread(target=watch, daemon=True).start()
