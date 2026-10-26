@@ -9,6 +9,9 @@ Before=pindi-webd.service
 
 [Service]
 Type=oneshot
+# After a downgrade to a version without the guard this unit stays behind: run only if pindi-web.py has it.
+ExecCondition=/bin/grep -q -e "--guard" /usr/local/lib/pindi/pindi-web.py
+TimeoutStartSec=120
 ExecStart=/usr/bin/python3 /usr/local/lib/pindi/pindi-web.py --guard check --boot
 
 [Install]

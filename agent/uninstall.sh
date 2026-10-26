@@ -81,8 +81,9 @@ done
 rm -f /etc/cloud/cloud-init.disabled
 
 step "Boot configuration"
+# The boot partition: recognised by its mount, not by config.txt (which may be missing or damaged).
 BOOT=/boot/firmware
-[ -f "$BOOT/config.txt" ] || BOOT=/boot
+mountpoint -q "$BOOT" || [ -f "$BOOT/config.txt" ] || BOOT=/boot
 CFG="$BOOT/config.txt"
 CMDLINE="$BOOT/cmdline.txt"
 # config.txt: drop PiNDI's block and give back the lines it commented out (other edits are kept).

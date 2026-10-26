@@ -72,8 +72,9 @@ sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
 MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
 echo "Model: $MODEL"
 
+# The boot partition: recognised by its mount, not by config.txt (which may be missing or damaged).
 BOOT=/boot/firmware
-[ -f "$BOOT/config.txt" ] || BOOT=/boot
+mountpoint -q "$BOOT" || [ -f "$BOOT/config.txt" ] || BOOT=/boot
 
 # ---------------------------------------------------------------- NDI license
 if [ "$ACCEPT_NDI" -ne 1 ]; then
@@ -370,7 +371,8 @@ step "Optimising boot ($BOOT)"
 # The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take these
 # writes for foreign ones and put the old files back: hold its lock until the new copies are saved below.
 exec 9>>/run/pindi-guard.lock
-flock -w 60 9 || echo "The configuration guard's lock is busy: going on without it"
+# Not got within a minute: stop (and roll back) rather than write unlocked.
+flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
 
 # config.txt: no rainbow, no delays, no Wi-Fi (unless on in the web UI)/Bluetooth (the overlays are named
 # differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which
