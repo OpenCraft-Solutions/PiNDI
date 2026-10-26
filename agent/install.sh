@@ -373,6 +373,9 @@ step "Optimising boot ($BOOT)"
 exec 9>>/run/pindi-guard.lock
 # Not got within a minute: stop (and roll back) rather than write unlocked.
 flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
+# Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
+# edited and adopted as the new copy below (nothing is restarted; a first install has no copies yet).
+PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore
 
 # config.txt: no rainbow, no delays, no Wi-Fi (unless on in the web UI)/Bluetooth (the overlays are named
 # differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which
@@ -439,6 +442,7 @@ ${CSI}# --- PiNDI CSI-2 end ---
 # --- PiNDI end ---
 EOF
 sync "$NEWCFG"
+cp "$NEWCFG" "$TMP/config.txt.written"  # what config.txt must read back as (its new verified copy, below)
 mv -f "$NEWCFG" "$CFG"
 sync
 
@@ -463,12 +467,16 @@ set +f
 echo "${NEW# } console=tty3 quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0" \
     > "$CMDLINE.pindi-new"
 sync "$CMDLINE.pindi-new"
+cp "$CMDLINE.pindi-new" "$TMP/cmdline.txt.written"
 mv -f "$CMDLINE.pindi-new" "$CMDLINE"
 sync
 
 # Verified copies of the boot files and the settings, kept on the root file system: the configuration guard
-# puts a damaged or foreign file back from them (pindi-guard.service at boot, the broker while running).
-if PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save; then
+# puts a damaged or foreign file back from them (pindi-guard.service at boot, the broker while running). The
+# boot files must read back from the card exactly as written; the settings were not edited here (above, they
+# were put back from their copy if they were damaged).
+if PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save "$CFG=$TMP/config.txt.written" \
+        "$CMDLINE=$TMP/cmdline.txt.written" /etc/default/pindi; then
     echo "Configuration copies saved and verified"
 else
     echo "Warning: a configuration copy could not be saved or verified (the files are kept as they are)"

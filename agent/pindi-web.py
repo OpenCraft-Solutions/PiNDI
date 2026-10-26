@@ -222,9 +222,10 @@ MODEL = read_text("/proc/device-tree/model").strip("\x00\r\n ") or "unknown"
 _ENV_LINE = re.compile(r"^([A-Z_][A-Z0-9_]*)=(.*)$")
 
 
-def read_env():
+def read_env(text=None):
+    """The settings (from the file, or from text)."""
     values = {}
-    for line in read_text(ENV_FILE).splitlines():
+    for line in (read_text(ENV_FILE) if text is None else text).splitlines():
         m = _ENV_LINE.match(line.strip())
         if not m:
             continue
@@ -246,7 +247,9 @@ def write_env(updates):
                 keep.append('%s="%s"' % (key, val.replace("\\", "\\\\").replace('"', '\\"')))
         text = "\n".join(keep) + "\n"
         write_atomic(ENV_FILE, text)
-        guard_save(ENV_FILE, text.encode("utf-8"))
+        if not guard_save(ENV_FILE, text.encode("utf-8")):
+            raise GuardError("The settings were not stored correctly on the memory card (they did not read back as "
+                             "written). Try again; if it keeps happening, replace the card.")
 
 
 # ---------------------------------------------------------------- configuration guard
@@ -265,6 +268,10 @@ GUARD_LOCK = "/run/pindi-guard.lock"
 GUARD_STATUS = "/var/lib/pindi/guard.status"  # readable by the front end: the last restores, for the System card
 GUARD_REBOOTS = GUARD_DIR + "/reboots"  # times of the reboots after a restore (at most 2 an hour: no loop)
 _guard_held = threading.local()
+
+
+class GuardError(Exception):
+    """A change that did not read back from the card as written: the action reports it instead of success."""
 
 
 @contextlib.contextmanager
@@ -386,7 +393,7 @@ def guard_base(path):
     """The text a PiNDI edit of path starts from: its verified copy if there is one (never a damaged or foreign
     file), else the file."""
     copy = _guard_load(path)
-    return copy.decode("utf-8") if copy is not None else read_text(path)
+    return (copy if copy is not None else read_card(path) or b"").decode("utf-8", "replace")
 
 
 def guard_save(path, expected=None):
@@ -436,11 +443,12 @@ def _guard_status(lines):
         pass
 
 
-def guard_check(boot=False):
+def guard_check(boot=False, act=True):
     """Compare each file as stored on the card with its verified copy and put back a damaged or foreign one;
-    then restart the player and sender (settings), or reboot (a boot file, at boot). Files without a copy get
-    one if they check out (the first run after an install). A file that can't be checked or put back (e.g. a
-    read-only partition) is recorded, and the others are still checked."""
+    then restart the player and sender (settings), or reboot (a boot file, at boot) - unless act is False
+    (install.sh, before it edits the files). Files without a copy get one if they check out (the first run
+    after an install). A file that can't be checked or put back (e.g. a read-only partition) is recorded, and
+    the others are still checked."""
     restored = []
     with guard_lock():
         for path, kind in guard_files():
@@ -472,6 +480,8 @@ def guard_check(boot=False):
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     _guard_status(["%s\t%s\t%s\t%s" % (stamp, p, w, "restored" if ok else "restore failed")
                    for p, _, w, ok in restored])
+    if not act:
+        return restored
     if any(k == "settings" and ok for _, k, _, ok in restored):
         # At boot too: the player starts before this check (as early as possible, for the splash screen).
         run("systemctl", "--no-block", "restart", "pindi.service", "pindi-sender.service")
@@ -490,17 +500,27 @@ def guard_check(boot=False):
 
 
 def guard_main(args):
-    """pindi-web.py --guard check [--boot] | save [file...]: the boot check (pindi-guard.service), and saving the
-    current files as the new copies (install.sh after it writes them; or to keep a manual edit)."""
+    """pindi-web.py --guard check [--boot] | restore | save [file[=expected]...]: the boot check
+    (pindi-guard.service); putting back damaged or foreign files without restarting anything (install.sh, before
+    it edits them, so it starts from the verified state); saving the current files as the new copies (install.sh
+    after it writes them, with the files holding exactly what it wrote; or, without, to keep a manual edit)."""
     if os.geteuid() != 0:
         print("run as root (sudo)", file=sys.stderr)
         return 1
-    if args[:1] == ["check"]:
-        guard_check(boot="--boot" in args)
+    if args[:1] in (["check"], ["restore"]):
+        guard_check(boot="--boot" in args, act=args[0] == "check")
         return 0
     if args[:1] == ["save"]:
-        paths = args[1:] or [p for p, _ in guard_files()]
-        bad = [p for p in paths if not guard_save(p)]
+        want = {}
+        for a in args[1:] or [p for p, _ in guard_files()]:
+            path, _, expected = a.partition("=")
+            try:
+                want[path] = open(expected, "rb").read() if expected else None
+            except OSError as e:
+                print("%s: %s" % (expected, e), file=sys.stderr)
+                return 1
+        paths = list(want)
+        bad = [p for p in paths if not guard_save(p, want[p])]
         for p in paths:
             print("%s: %s" % (p, "copy failed - see the log" if p in bad else "copy saved and verified"))
         # Copies in the format of the first test builds (content and checksum in two files).
@@ -726,7 +746,9 @@ def boot_config_text():
 def write_boot_config(new):
     """Write config.txt (takes effect at the next boot) and make it the verified copy. Call with guard_lock()."""
     write_atomic(CONFIG_TXT, new, None)
-    guard_save(CONFIG_TXT, new.encode("utf-8"))
+    if not guard_save(CONFIG_TXT, new.encode("utf-8")):
+        raise GuardError("config.txt was not stored correctly on the memory card (it did not read back as "
+                         "written). Try again; if it keeps happening, replace the card.")
 
 
 def set_wifi_overlay(on):
@@ -734,7 +756,7 @@ def set_wifi_overlay(on):
     with guard_lock():
         text = boot_config_text()
         new = re.sub(r"^#?(dtoverlay=disable-wifi(-pi5)?)$", ("#" if on else "") + r"\1", text, flags=re.M)
-        if new != read_text(CONFIG_TXT):
+        if new.encode("utf-8") != (read_card(CONFIG_TXT) or b""):  # bytes: the file may not even be text
             write_boot_config(new)
     return new != text
 
@@ -1453,7 +1475,7 @@ def set_csi_overlays(env):
             new = end.sub(lambda m: block + m.group(0), text, count=1)
         else:
             new = text.rstrip("\n") + "\n[all]\n" + block
-        if new != read_text(CONFIG_TXT):
+        if new.encode("utf-8") != (read_card(CONFIG_TXT) or b""):  # bytes: the file may not even be text
             write_boot_config(new)
     return new != text
 
@@ -2863,10 +2885,12 @@ def act_restore(form):
             sec["machinename"] = mine
         else:
             sec.pop("machinename", None)
-    # Replace every PINDI_ setting with the backup's.
-    current = {k: "" for k in read_env() if k.startswith("PINDI_")}
-    current.update(settings)
-    write_env(current)
+    # Replace every PINDI_ setting with the backup's: those to remove come from the same verified baseline
+    # write_env() starts from (not a possibly damaged file).
+    with guard_lock():
+        current = {k: "" for k in read_env(guard_base(ENV_FILE)) if k.startswith("PINDI_")}
+        current.update(settings)
+        write_env(current)
     write_ndi_config(ndi)
     name = "" if other else str(data.get("device_name", "")).strip()
     if name and valid_name(name):
@@ -2902,7 +2926,10 @@ def act_reset():
         return ("err", "The default settings file %s is missing - run install.sh again." % ENV_DEFAULTS)
     with guard_lock():
         write_atomic(ENV_FILE, defaults)
-        guard_save(ENV_FILE, defaults.encode("utf-8"))
+        if not guard_save(ENV_FILE, defaults.encode("utf-8")):
+            raise GuardError("The default settings were not stored correctly on the memory card (they did not read "
+                             "back as written); nothing else was reset. Try again; if it keeps happening, replace "
+                             "the card.")
     try:
         os.remove(NDI_CONFIG)
     except OSError:
@@ -3493,7 +3520,10 @@ def op_action(token="", csrf="", path="", form=None):
     if not fn:
         return {"code": 404}
     form = {str(k): str(v) for k, v in (form or {}).items()} if isinstance(form, dict) else {}
-    r = fn(s, form)
+    try:
+        r = fn(s, form)
+    except GuardError as e:  # a change that did not read back from the card as written
+        r = ("err", str(e))
     if isinstance(r, dict):
         return r
     s["flash"] = r
@@ -3511,7 +3541,10 @@ def op_api_post(token="", ip="", path="", data=None):
     if not token_ok(token):
         api_failure(ip)
         return [401, {"error": "missing or wrong API token"}]
-    return list(api_post(str(path), data if isinstance(data, dict) else {}))
+    try:
+        return list(api_post(str(path), data if isinstance(data, dict) else {}))
+    except GuardError as e:  # a change that did not read back from the card as written
+        return [500, {"ok": False, "error": str(e)}]
 
 
 def op_http_token(token="", ip=""):
