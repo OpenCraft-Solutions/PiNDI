@@ -285,7 +285,9 @@ def guard_lock():
         finally:
             _guard_held.n -= 1
         return
-    with open(GUARD_LOCK, "a") as f:
+    # Root only: anyone who can open it could hold the lock and stall every check and settings change.
+    with os.fdopen(os.open(GUARD_LOCK, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as f:
+        os.fchmod(f.fileno(), 0o600)
         fcntl.flock(f, fcntl.LOCK_EX)
         _guard_held.n = 1
         try:
@@ -508,7 +510,9 @@ def guard_check(boot=False, act=True):
                 t = float(x)
             except ValueError:
                 continue
-            if 0 <= now - t < 3600:
+            # One "in the future" counts too: the clock went back (no real-time clock before NTP), and must
+            # not lift the limit.
+            if now - t < 3600:
                 recent.append(t)
         if len(recent) >= 2:
             log("guard: a boot file was put back, but the device already rebooted twice for that in the last "

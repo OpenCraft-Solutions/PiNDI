@@ -278,6 +278,8 @@ put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
 # The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take the
 # boot files' and settings' changes below for foreign ones and put the old files back: hold its lock until the
 # new copies are saved ("Optimising boot"). From here on the settings are read only once they are verified.
+(umask 077; exec 9>>/run/pindi-guard.lock)
+chmod 600 /run/pindi-guard.lock  # root only: anyone who can open it could hold the lock (and stall the guard)
 exec 9>>/run/pindi-guard.lock
 # Not got within a minute: stop (and roll back) rather than write unlocked.
 flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
