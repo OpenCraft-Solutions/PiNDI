@@ -286,10 +286,11 @@ exec 9>>/run/pindi-guard.lock
 flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
 CFG="$BOOT/config.txt"
 CMDLINE="$BOOT/cmdline.txt"
-# If the installation fails below, the boot files, the settings and their copies come back as they are now.
+# If the installation fails below, the copies come back as they are now, and the boot files and settings as
+# they are once put back from them (below): a rollback must not bring back a damaged file (an empty
+# cmdline.txt would not even boot to the guard).
 GUARD=/var/lib/pindi/guard
 for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
-    keep "$f"
     keep "$GUARD/$(echo "${f#/}" | tr / _).copy"
 done
 if [ "$GUARDED" -eq 1 ]; then
@@ -304,6 +305,9 @@ else
     # from before the downgrade miss the changes made since, so the current files are the starting point.
     rm -f "$GUARD"/*.copy
 fi
+for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
+    keep "$f"
+done
 cat > /etc/pam.d/pindi-web <<'EOF'
 # PiNDI web interface: same password check as a normal login / SSH.
 @include common-auth
@@ -445,6 +449,8 @@ NEWCFG="$TMP/config.txt.written"
 sed -E -e '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' \
     -e 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' \
     "$CFG" > "$NEWCFG"
+# Edited without a final newline (e.g. in Notepad): PiNDI's block must start on a line of its own.
+if [ -s "$NEWCFG" ] && [ -n "$(tail -c 1 "$NEWCFG")" ]; then echo >> "$NEWCFG"; fi
 cat >> "$NEWCFG" <<EOF
 # --- PiNDI begin ---
 [all]
