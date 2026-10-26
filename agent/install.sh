@@ -275,6 +275,31 @@ install -d /usr/local/lib/pindi
 GUARDED=0
 if grep -q -e "--guard" /usr/local/lib/pindi/pindi-web.py 2>/dev/null; then GUARDED=1; fi
 put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
+# The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take the
+# boot files' and settings' changes below for foreign ones and put the old files back: hold its lock until the
+# new copies are saved ("Optimising boot"). From here on the settings are read only once they are verified.
+exec 9>>/run/pindi-guard.lock
+# Not got within a minute: stop (and roll back) rather than write unlocked.
+flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
+CFG="$BOOT/config.txt"
+CMDLINE="$BOOT/cmdline.txt"
+# If the installation fails below, the boot files, the settings and their copies come back as they are now.
+GUARD=/var/lib/pindi/guard
+for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
+    keep "$f"
+    keep "$GUARD/$(echo "${f#/}" | tr / _).copy"
+done
+if [ "$GUARDED" -eq 1 ]; then
+    # Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
+    # edited and adopted as the new copy below (nothing is restarted).
+    PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore || {
+        echo "A damaged boot file or settings could not be put back from its copy (is the card failing?): stopping" >&2
+        false; }
+else
+    # Installed over a version without the guard (a first install, or an update after a downgrade): copies left
+    # from before the downgrade miss the changes made since, so the current files are the starting point.
+    rm -f "$GUARD"/*.copy
+fi
 cat > /etc/pam.d/pindi-web <<'EOF'
 # PiNDI web interface: same password check as a normal login / SSH.
 @include common-auth
@@ -376,30 +401,6 @@ systemctl enable pindi.service pindi-webd.service pindi-web.service pindi-sender
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"
-# The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take these
-# writes for foreign ones and put the old files back: hold its lock until the new copies are saved below.
-exec 9>>/run/pindi-guard.lock
-# Not got within a minute: stop (and roll back) rather than write unlocked.
-flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
-CFG="$BOOT/config.txt"
-CMDLINE="$BOOT/cmdline.txt"
-# If the installation fails below, the boot files, the settings and their copies come back as they are now.
-GUARD=/var/lib/pindi/guard
-for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
-    keep "$f"
-    keep "$GUARD/$(echo "${f#/}" | tr / _).copy"
-done
-if [ "$GUARDED" -eq 1 ]; then
-    # Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
-    # edited and adopted as the new copy below (nothing is restarted).
-    PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore || {
-        echo "A damaged boot file or settings could not be put back from its copy (is the card failing?): stopping" >&2
-        false; }
-else
-    # Installed over a version without the guard (a first install, or an update after a downgrade): copies left
-    # from before the downgrade miss the changes made since, so the current files are the starting point.
-    rm -f "$GUARD"/*.copy
-fi
 
 # config.txt: no rainbow, no delays, no Wi-Fi (unless on in the web UI)/Bluetooth (the overlays are named
 # differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which

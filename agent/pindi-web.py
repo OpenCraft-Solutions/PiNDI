@@ -497,8 +497,19 @@ def guard_check(boot=False, act=True):
         run("systemctl", "--no-block", "restart", "pindi.service", "pindi-sender.service")
     if boot and any(k == "boot" and ok for _, k, _, ok in restored):
         now = time.time()
-        recent = [t for t in (float(x) for x in read_text(GUARD_REBOOTS).split() if re.match(r"^[\d.]+$", x))
-                  if now - t < 3600]
+        recent = []  # a damaged history must not stop the reboot: unreadable entries are skipped
+        try:
+            with open(GUARD_REBOOTS, "rb") as f:
+                history = f.read().decode("ascii", "replace").split()
+        except OSError:
+            history = []
+        for x in history:
+            try:
+                t = float(x)
+            except ValueError:
+                continue
+            if 0 <= now - t < 3600:
+                recent.append(t)
         if len(recent) >= 2:
             log("guard: a boot file was put back, but the device already rebooted twice for that in the last "
                 "hour: not again (the card may not keep what is written to it)")
@@ -2681,24 +2692,26 @@ def api_post(path, data):
     m = re.match(r"^/api/v1/outputs/(\d+)/source$", path)
     if m:
         n = int(m.group(1))
-        o = next((o for o in outputs() if o["n"] == n), None)
-        if not o:
+        if n not in [o["n"] for o in outputs()]:
             return 404, {"error": "unknown output"}
-        stream = str(data.get("stream", o["stream"])).strip()
-        source_ip = str(data.get("source_ip", o["source_ip"])).strip()
-        backup = str(data.get("backup", o["backup"])).strip()
-        if not valid_name(stream) or not valid_name(backup):
-            return 400, {"error": "invalid stream name"}
-        if source_ip:
-            try:
-                source_ip = str(ipaddress.IPv4Address(source_ip))
-            except ValueError:
-                return 400, {"error": "source_ip must be an IPv4 address or empty"}
-        keys = {"PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
-                "PINDI_OUT%d_SOURCE_IP" % n: source_ip, "PINDI_OUT%d_BACKUP_STREAM" % n: backup}
-        if n == 1:
-            keys.update({"PINDI_STREAM": "", "PINDI_SOURCE_IP": ""})
-        write_env(keys)
+        with guard_lock():
+            # Fields left out keep their value - from the verified settings, never a damaged file.
+            base = read_env(guard_base(ENV_FILE))
+            stream = str(data.get("stream", out_setting(base, n, "STREAM"))).strip()
+            source_ip = str(data.get("source_ip", out_setting(base, n, "SOURCE_IP"))).strip()
+            backup = str(data.get("backup", out_setting(base, n, "BACKUP_STREAM"))).strip()
+            if not valid_name(stream) or not valid_name(backup):
+                return 400, {"error": "invalid stream name"}
+            if source_ip:
+                try:
+                    source_ip = str(ipaddress.IPv4Address(source_ip))
+                except ValueError:
+                    return 400, {"error": "source_ip must be an IPv4 address or empty"}
+            keys = {"PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
+                    "PINDI_OUT%d_SOURCE_IP" % n: source_ip, "PINDI_OUT%d_BACKUP_STREAM" % n: backup}
+            if n == 1:
+                keys.update({"PINDI_STREAM": "", "PINDI_SOURCE_IP": ""})
+            write_env(keys)
         write_switch(n, keys["PINDI_OUT%d_STREAM" % n], source_ip, backup)
         log("api: output %d -> %s from %s" % (n, stream or default_out_stream(n), source_ip or "any"))
         return 200, {"ok": True, "output": n, "stream": stream or default_out_stream(n), "source_ip": source_ip,
