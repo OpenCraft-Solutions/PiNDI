@@ -439,8 +439,9 @@ for cam in CAM0 CAM1; do
     CSI="$CSI$line"$'\n'
 done
 # Written next to it, flushed to the card, then renamed over it (as cmdline.txt below): never edited in place, so
-# a power cut leaves the old file or the new one, not a half-written or empty one.
-NEWCFG="$CFG.pindi-new"
+# a power cut leaves the old file or the new one, not a half-written or empty one. Put together on the root file
+# system first: what config.txt must read back as (its new verified copy, below) never comes from the card's copy.
+NEWCFG="$TMP/config.txt.written"
 sed -E -e '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' \
     -e 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' \
     "$CFG" > "$NEWCFG"
@@ -469,9 +470,9 @@ dtoverlay=disable-bt-pi5
 ${CSI}# --- PiNDI CSI-2 end ---
 # --- PiNDI end ---
 EOF
-sync "$NEWCFG"
-cp "$NEWCFG" "$TMP/config.txt.written"  # what config.txt must read back as (its new verified copy, below)
-mv -f "$NEWCFG" "$CFG"
+cp "$NEWCFG" "$CFG.pindi-new"
+sync "$CFG.pindi-new"
+mv -f "$CFG.pindi-new" "$CFG"
 sync
 
 # cmdline.txt: quiet boot, kernel messages off the screen, no serial console.
@@ -495,9 +496,9 @@ done
 set +f
 # Written next to it and renamed: a power cut must never leave an empty kernel command line (no boot).
 echo "${NEW# } console=tty3 quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0" \
-    > "$CMDLINE.pindi-new"
+    > "$TMP/cmdline.txt.written"
+cp "$TMP/cmdline.txt.written" "$CMDLINE.pindi-new"
 sync "$CMDLINE.pindi-new"
-cp "$CMDLINE.pindi-new" "$TMP/cmdline.txt.written"
 mv -f "$CMDLINE.pindi-new" "$CMDLINE"
 sync
 
