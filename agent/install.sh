@@ -67,7 +67,7 @@ trap rollback ERR
 # Files edited on Windows get CRLF line endings; normalise the ones we use.
 sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
     "$SRC/pindi-web.py" "$SRC/pindi-web.service" "$SRC/pindi-webd.service" "$SRC/pindi-sender.c" \
-    "$SRC/pindi-sender.service"
+    "$SRC/pindi-sender.service" "$SRC/pindi-guard.service"
 
 MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
 echo "Model: $MODEL"
@@ -272,6 +272,7 @@ cat > /etc/pam.d/pindi-web <<'EOF'
 @include common-account
 EOF
 put "$SRC/pindi-webd.service" /etc/systemd/system/pindi-webd.service 644
+put "$SRC/pindi-guard.service" /etc/systemd/system/pindi-guard.service 644
 put "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service 644
 # The front end serves TLS: its key is readable by pindi-web (the broker keeps it that way).
 if [ -d /etc/pindi/tls ]; then
@@ -362,10 +363,14 @@ EOF
 systemctl try-restart systemd-resolved.service || true
 
 systemctl daemon-reload
-systemctl enable pindi.service pindi-webd.service pindi-web.service pindi-sender.service
+systemctl enable pindi.service pindi-webd.service pindi-web.service pindi-sender.service pindi-guard.service
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"
+# The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take these
+# writes for foreign ones and put the old files back: hold its lock until the new copies are saved below.
+exec 9>>/run/pindi-guard.lock
+flock -w 60 9 || echo "The configuration guard's lock is busy: going on without it"
 
 # config.txt: no rainbow, no delays, no Wi-Fi (unless on in the web UI)/Bluetooth (the overlays are named
 # differently on the Pi 5). Pi 3/4: 128 MB for the video unit (default 76), which
@@ -437,7 +442,12 @@ sync
 
 # cmdline.txt: quiet boot, kernel messages off the screen, no serial console.
 CMDLINE="$BOOT/cmdline.txt"
-[ -f "$CMDLINE.pindi-orig" ] || cp "$CMDLINE" "$CMDLINE.pindi-orig"
+[ -f "$CMDLINE.pindi-orig" ] || ! grep -q "root=" "$CMDLINE" || cp "$CMDLINE" "$CMDLINE.pindi-orig"
+# A damaged one (no root= - the device would not boot): start again from the original.
+if ! grep -q "root=" "$CMDLINE" && grep -q "root=" "$CMDLINE.pindi-orig" 2>/dev/null; then
+    echo "cmdline.txt is damaged: starting again from $CMDLINE.pindi-orig"
+    cp "$CMDLINE.pindi-orig" "$CMDLINE"
+fi
 set -f
 NEW=""
 for tok in $(tr -d '\r\n' < "$CMDLINE"); do
@@ -452,6 +462,16 @@ echo "${NEW# } console=tty3 quiet loglevel=3 logo.nologo vt.global_cursor_defaul
     > "$CMDLINE.pindi-new"
 sync "$CMDLINE.pindi-new"
 mv -f "$CMDLINE.pindi-new" "$CMDLINE"
+sync
+
+# Verified copies of the boot files and the settings, kept on the root file system: the configuration guard
+# puts a damaged or foreign file back from them (pindi-guard.service at boot, the broker while running).
+if PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save; then
+    echo "Configuration copies saved and verified"
+else
+    echo "Warning: a configuration copy could not be saved or verified (the files are kept as they are)"
+fi
+flock -u 9
 
 # Services not needed on a wired NDI display. apt's daily timers would download and upgrade at random
 # times, during a show; OS updates run at a time set in the web interface instead (pindi-os-update).

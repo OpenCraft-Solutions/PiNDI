@@ -16,10 +16,14 @@ Small standard-library HTTPS server (port 443, self-signed or uploaded certifica
   - network: DHCP or static IP, with automatic rollback unless confirmed
   - Wi-Fi: off by default (hardware switched off in config.txt for a faster boot); on: one network, DHCP
   - change the login password, reboot
+  - configuration guard (--guard, and every minute in the broker): verified copies of config.txt, cmdline.txt and
+    /etc/default/pindi, put back if the file on the card is damaged or changed by something other than PiNDI
 """
 import base64
+import contextlib
 import ctypes
 import ctypes.util
+import fcntl
 import grp
 import hashlib
 import html
@@ -232,13 +236,206 @@ def read_env():
 
 
 def write_env(updates):
-    """Set (or remove, when empty) keys in the env file, keeping everything else."""
-    lines = read_text(ENV_FILE).splitlines()
-    keep = [l for l in lines if not any(l.strip().startswith(k + "=") for k in updates)]
-    for key, val in updates.items():
-        if val:
-            keep.append('%s="%s"' % (key, val.replace("\\", "\\\\").replace('"', '\\"')))
-    write_atomic(ENV_FILE, "\n".join(keep) + "\n")
+    """Set (or remove, when empty) keys in the env file, keeping everything else (and its verified copy)."""
+    with guard_lock():
+        lines = read_text(ENV_FILE).splitlines()
+        keep = [l for l in lines if not any(l.strip().startswith(k + "=") for k in updates)]
+        for key, val in updates.items():
+            if val:
+                keep.append('%s="%s"' % (key, val.replace("\\", "\\\\").replace('"', '\\"')))
+        write_atomic(ENV_FILE, "\n".join(keep) + "\n")
+        guard_save(ENV_FILE)
+
+
+# ---------------------------------------------------------------- configuration guard
+
+# Verified copies of the configuration, on the root file system (ext4: another partition than the FAT boot
+# partition). A file that is damaged (an SD card that lost a write, a FAT file left empty by a power cut) or
+# was changed by something other than PiNDI is put back from its copy: at boot (pindi-guard.service, which
+# reboots once if a boot file was put back, since the firmware has already read it) and every minute by the
+# broker (which restarts the player and sender if the settings were put back). A copy is only replaced by
+# guard_save(), after a change PiNDI made, with content that checks out as read back from the card; the copy
+# is read back from the card too. Writers hold guard_lock() from their write to guard_save(), so the check
+# never takes a change in progress for a foreign one. Keep a manual edit with: pindi-web.py --guard save
+GUARD_DIR = "/var/lib/pindi/guard"
+GUARD_LOCK = "/run/pindi-guard.lock"
+GUARD_STATUS = "/var/lib/pindi/guard.status"  # readable by the front end: the last restores, for the System card
+GUARD_REBOOTS = GUARD_DIR + "/reboots"  # times of the reboots after a restore (at most 2 an hour: no loop)
+_guard_held = threading.local()
+
+
+@contextlib.contextmanager
+def guard_lock():
+    """The guard's lock (root only; re-entrant within a thread). install.sh takes it too while it writes, and
+    sets PINDI_GUARD_LOCKED for the save it runs while holding it."""
+    if getattr(_guard_held, "n", 0) or os.environ.get("PINDI_GUARD_LOCKED") == "1":
+        _guard_held.n = getattr(_guard_held, "n", 0) + 1
+        try:
+            yield
+        finally:
+            _guard_held.n -= 1
+        return
+    with open(GUARD_LOCK, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        _guard_held.n = 1
+        try:
+            yield
+        finally:
+            _guard_held.n = 0
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def guard_files():
+    """(path, kind): "boot" files take effect at the next boot, "settings" when the player restarts."""
+    return [(CONFIG_TXT, "boot"), (CMDLINE_TXT, "boot"), (ENV_FILE, "settings")]
+
+
+def _guard_copy(path):
+    return os.path.join(GUARD_DIR, path.strip("/").replace("/", "_"))
+
+
+def read_card(path):
+    """The file as stored on the card, not as cached: flushed, its cached pages dropped, read again. None if
+    it can't be read."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                return b"".join(chunks)
+            chunks.append(b)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def guard_valid(path, data):
+    """Content this file can be used with: not empty, text, and complete as PiNDI writes it."""
+    if not data or b"\0" in data:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if path == CONFIG_TXT:
+        return "\n# --- PiNDI begin ---\n" in "\n" + text and "\n# --- PiNDI end ---" in text
+    if path == CMDLINE_TXT:
+        return "root=" in text and text.strip().count("\n") == 0
+    if path == ENV_FILE:
+        lines = [l.strip() for l in text.splitlines()]
+        return all(_ENV_LINE.match(l) for l in lines if l and not l.startswith("#"))
+    return True
+
+
+def _guard_load(path):
+    """The verified copy of path (its stored SHA-256 matches), or None."""
+    copy = _guard_copy(path)
+    try:
+        with open(copy, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if read_text(copy + ".sha256").strip() != hashlib.sha256(data).hexdigest() or not guard_valid(path, data):
+        return None
+    return data
+
+
+def guard_save(path):
+    """After PiNDI changed path: make what is on the card its new copy, if it checks out, and verify the copy by
+    reading it back from the card. False (the previous copy kept) if either fails."""
+    with guard_lock():
+        data = read_card(path)
+        if data is None or not guard_valid(path, data):
+            log("guard: %s does not check out as stored on the card; its copy is kept" % path)
+            return False
+        os.makedirs(GUARD_DIR, mode=0o700, exist_ok=True)
+        copy, sha = _guard_copy(path), hashlib.sha256(data).hexdigest()
+        if _guard_load(path) == data:
+            return True
+        write_atomic(copy, data.decode("utf-8"), 0o600)
+        write_atomic(copy + ".sha256", sha + "\n", 0o600)
+        if read_card(copy) != data or read_text(copy + ".sha256").strip() != sha:
+            log("guard: the copy of %s did not read back correctly" % path)
+            return False
+        return True
+
+
+def _guard_status(lines):
+    """The last restores (newest first, up to 20), for the System card."""
+    old = [l for l in read_text(GUARD_STATUS).splitlines() if l.strip()]
+    try:
+        write_atomic(GUARD_STATUS, "\n".join((lines + old)[:20]) + "\n", 0o644)
+    except OSError:
+        pass
+
+
+def guard_check(boot=False):
+    """Compare each file as stored on the card with its verified copy and put back a damaged or foreign one;
+    then restart the player and sender (settings), or reboot (a boot file, at boot). Files without a copy get
+    one if they check out (the first run after an install)."""
+    restored = []
+    with guard_lock():
+        for path, kind in guard_files():
+            copy = _guard_load(path)
+            live = read_card(path)
+            if copy is None:
+                if live is not None and guard_valid(path, live):
+                    guard_save(path)
+                continue
+            if live == copy:
+                continue
+            why = "damaged" if live is None or not guard_valid(path, live) else "changed by something other than PiNDI"
+            write_atomic(path, copy.decode("utf-8"), None if kind == "boot" else 0o644)
+            ok = read_card(path) == copy
+            log("guard: %s was %s: %s" % (path, why, "put back its verified copy" if ok else
+                                          "putting back its copy did not read back correctly"))
+            restored.append((path, kind, why, ok))
+    if not restored:
+        return restored
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    _guard_status(["%s\t%s\t%s\t%s" % (stamp, p, w, "restored" if ok else "restore failed")
+                   for p, _, w, ok in restored])
+    if any(k == "settings" for _, k, _, _ in restored):
+        # At boot too: the player starts before this check (as early as possible, for the splash screen).
+        run("systemctl", "--no-block", "restart", "pindi.service", "pindi-sender.service")
+    if boot and any(k == "boot" for _, k, _, _ in restored):
+        now = time.time()
+        recent = [t for t in (float(x) for x in read_text(GUARD_REBOOTS).split() if re.match(r"^[\d.]+$", x))
+                  if now - t < 3600]
+        if len(recent) >= 2:
+            log("guard: a boot file was put back, but the device already rebooted twice for that in the last "
+                "hour: not again (the card may not keep what is written to it)")
+        else:
+            write_atomic(GUARD_REBOOTS, " ".join("%.0f" % t for t in recent + [now]) + "\n", 0o600)
+            log("guard: rebooting, so the firmware reads the repaired boot files")
+            run("systemctl", "reboot")
+    return restored
+
+
+def guard_main(args):
+    """pindi-web.py --guard check [--boot] | save [file...]: the boot check (pindi-guard.service), and saving the
+    current files as the new copies (install.sh after it writes them; or to keep a manual edit)."""
+    if os.geteuid() != 0:
+        print("run as root (sudo)", file=sys.stderr)
+        return 1
+    if args[:1] == ["check"]:
+        guard_check(boot="--boot" in args)
+        return 0
+    if args[:1] == ["save"]:
+        paths = args[1:] or [p for p, _ in guard_files()]
+        bad = [p for p in paths if not guard_save(p)]
+        for p in paths:
+            print("%s: %s" % (p, "copy failed - see the log" if p in bad else "copy saved and verified"))
+        return 1 if bad else 0
+    print("usage: pindi-web.py --guard check [--boot] | save [file...]", file=sys.stderr)
+    return 2
 
 
 # ---------------------------------------------------------------- network
@@ -378,6 +575,7 @@ WIFI_UNIT = "wpa_supplicant@%s.service" % WIFI_IFACE
 WIFI_WANTS = "/etc/systemd/system/sys-subsystem-net-devices-%s.device.wants/%s" % (WIFI_IFACE, WIFI_UNIT)
 WIFI_DROPIN = "/etc/systemd/system/%s.d/pindi.conf" % WIFI_UNIT
 CONFIG_TXT = "/boot/firmware/config.txt" if os.path.exists("/boot/firmware/config.txt") else "/boot/config.txt"
+CMDLINE_TXT = os.path.join(os.path.dirname(CONFIG_TXT), "cmdline.txt")
 _scan = {"t": 0, "ssids": []}
 
 
@@ -440,12 +638,29 @@ def render_wifi_config(ssid, psk, country):
     return text + "\tkey_mgmt=NONE\n}\n"
 
 
+def boot_config_text():
+    """config.txt to edit: as stored on the card if it checks out, else its verified copy (an edit must not be
+    built on a damaged file)."""
+    live = read_card(CONFIG_TXT)
+    if live is not None and guard_valid(CONFIG_TXT, live):
+        return live.decode("utf-8")
+    copy = _guard_load(CONFIG_TXT)
+    return copy.decode("utf-8") if copy is not None else read_text(CONFIG_TXT)
+
+
+def write_boot_config(new):
+    """Write config.txt (takes effect at the next boot) and make it the verified copy. Call with guard_lock()."""
+    write_atomic(CONFIG_TXT, new, None)
+    guard_save(CONFIG_TXT)
+
+
 def set_wifi_overlay(on):
     """Comment the disable-wifi overlays in config.txt in or out; takes effect at the next boot."""
-    text = read_text(CONFIG_TXT)
-    new = re.sub(r"^#?(dtoverlay=disable-wifi(-pi5)?)$", ("#" if on else "") + r"\1", text, flags=re.M)
-    if new != text:
-        write_atomic(CONFIG_TXT, new, None)
+    with guard_lock():
+        text = boot_config_text()
+        new = re.sub(r"^#?(dtoverlay=disable-wifi(-pi5)?)$", ("#" if on else "") + r"\1", text, flags=re.M)
+        if new != read_text(CONFIG_TXT):
+            write_boot_config(new)
     return new != text
 
 
@@ -1152,18 +1367,19 @@ def csi_overlays(env):
 def set_csi_overlays(env):
     """Write them into PiNDI's block of config.txt (under [all]); True if that changed it. They take effect at the
     next boot."""
-    text = read_text(CONFIG_TXT)
-    block = "\n".join([CSI_BEGIN] + csi_overlays(env) + [CSI_END]) + "\n"
-    old = re.compile(r"^%s\n.*?^%s\n" % (re.escape(CSI_BEGIN), re.escape(CSI_END)), re.M | re.S)
-    end = re.compile(r"^# --- PiNDI end ---$", re.M)
-    if old.search(text):
-        new = old.sub(lambda m: block, text, count=1)
-    elif end.search(text):
-        new = end.sub(lambda m: block + m.group(0), text, count=1)
-    else:
-        new = text.rstrip("\n") + "\n[all]\n" + block
-    if new != text:
-        write_atomic(CONFIG_TXT, new, None)
+    with guard_lock():
+        text = boot_config_text()
+        block = "\n".join([CSI_BEGIN] + csi_overlays(env) + [CSI_END]) + "\n"
+        old = re.compile(r"^%s\n.*?^%s\n" % (re.escape(CSI_BEGIN), re.escape(CSI_END)), re.M | re.S)
+        end = re.compile(r"^# --- PiNDI end ---$", re.M)
+        if old.search(text):
+            new = old.sub(lambda m: block, text, count=1)
+        elif end.search(text):
+            new = end.sub(lambda m: block + m.group(0), text, count=1)
+        else:
+            new = text.rstrip("\n") + "\n[all]\n" + block
+        if new != read_text(CONFIG_TXT):
+            write_boot_config(new)
     return new != text
 
 
@@ -1938,8 +2154,23 @@ def dashboard(session):
         '<button>Change password</button></form></section>' % (hidden, esc(session["user"])))
 
     # System
+    restores = []  # what the configuration guard put back in the last 7 days (newest first)
+    for line in read_text(GUARD_STATUS).splitlines():
+        f = line.split("\t")
+        try:
+            if len(f) == 4 and time.time() - time.mktime(time.strptime(f[0], "%Y-%m-%d %H:%M:%S")) < 7 * 86400:
+                restores.append(f)
+        except ValueError:
+            pass
+    guard_note = ""
+    if restores:
+        guard_note = ('<p class="msg warn">The configuration was damaged or changed outside PiNDI and was put back '
+                      'from its verified copy:<br>%s<br>If this happens again, replace the memory card.</p>' %
+                      "<br>".join(esc("%s: %s (%s)%s" % ("PiNDI settings" if p == ENV_FILE else os.path.basename(p), w,
+                                                         t, "" if r == "restored" else " - putting it back failed"))
+                                  for t, p, w, r in restores[:5]))
     parts.append(
-        '<section class="card" id="system"><h2>System</h2>'
+        '<section class="card" id="system"><h2>System</h2>%s'
         '<div class="buttons"><a class="button secondary" href="/logs">View logs</a>'
         '<a class="button secondary" href="/diagnostics">Download diagnostics</a>'
         '<a class="button secondary" href="/backup">Download settings backup</a></div>'
@@ -1972,7 +2203,7 @@ def dashboard(session):
         '%s<button class="danger">Reset settings</button></form>'
         '<form class="inline" method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
         '<button class="danger">Reboot</button></form></div></section>' %
-        (hidden, hidden, esc(version()), hidden, hidden, hidden, hidden, hidden))
+        (guard_note, hidden, hidden, esc(version()), hidden, hidden, hidden, hidden, hidden))
 
     return page("PiNDI", "".join(parts), session["user"], csrf)
 
@@ -2594,7 +2825,9 @@ def act_reset():
     defaults = read_text(ENV_DEFAULTS)
     if not defaults:
         return ("err", "The default settings file %s is missing - run install.sh again." % ENV_DEFAULTS)
-    write_atomic(ENV_FILE, defaults)
+    with guard_lock():
+        write_atomic(ENV_FILE, defaults)
+        guard_save(ENV_FILE)
     try:
         os.remove(NDI_CONFIG)
     except OSError:
@@ -3271,13 +3504,17 @@ def broker_main():
         shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # an earlier update's unpacked files
     ensure_cert()
 
-    def watch():  # a new address or host name: a certificate that matches it
+    def watch():  # a new address or host name: a certificate that matches it; damaged or foreign configuration
         while True:
             time.sleep(60)
             try:
                 ensure_cert()
             except Exception as e:
                 log("tls: %s" % e)
+            try:
+                guard_check()
+            except Exception as e:
+                log("guard: %s" % e)
     threading.Thread(target=watch, daemon=True).start()
     try:
         os.remove(BROKER_SOCK)
@@ -3609,6 +3846,8 @@ class Server(http.server.ThreadingHTTPServer):
 def main():
     if "--broker" in sys.argv:
         return broker_main()
+    if "--guard" in sys.argv:
+        return guard_main(sys.argv[sys.argv.index("--guard") + 1:])
     if os.geteuid() == 0:
         log("warning: the front end is running as root; it is meant to run as %s (pindi-web.service)" % WEB_USER)
     TRAFFIC.start()
@@ -3620,4 +3859,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
