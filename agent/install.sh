@@ -39,14 +39,18 @@ step() { echo; echo "==> $*"; }
 PREV=/var/lib/pindi/previous.new
 rm -rf "$PREV"
 install -d -m 700 "$PREV"
-put() { # put SRC DEST MODE
-    local dest=$2
+keep() { # keep DEST: if the installation fails, it comes back as it is now (or is removed if it doesn't exist)
+    local dest=$1
     if [ -e "$dest" ] && [ ! -e "$PREV$dest" ]; then
         install -d "$PREV$(dirname "$dest")"
         cp -a "$dest" "$PREV$dest"
     elif [ ! -e "$dest" ]; then
         echo "$dest" >> "$PREV/.added"
     fi
+}
+put() { # put SRC DEST MODE
+    local dest=$2
+    keep "$dest"
     install -m "$3" "$1" "$dest.pindi-new"
     mv -f "$dest.pindi-new" "$dest"
 }
@@ -61,19 +65,21 @@ rollback() {
         while IFS= read -r f; do rm -f "$f"; done < "$PREV/.added"
     fi
     systemctl daemon-reload || true
+    sync
 }
 trap rollback ERR
 
 # Files edited on Windows get CRLF line endings; normalise the ones we use.
 sed -i 's/\r$//' "$SRC/pindi-player.c" "$SRC/pindi.service" "$SRC/pindi.conf" \
     "$SRC/pindi-web.py" "$SRC/pindi-web.service" "$SRC/pindi-webd.service" "$SRC/pindi-sender.c" \
-    "$SRC/pindi-sender.service"
+    "$SRC/pindi-sender.service" "$SRC/pindi-guard.service"
 
 MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
 echo "Model: $MODEL"
 
+# The boot partition: recognised by its mount, not by config.txt (which may be missing or damaged).
 BOOT=/boot/firmware
-[ -f "$BOOT/config.txt" ] || BOOT=/boot
+mountpoint -q "$BOOT" || [ -f "$BOOT/config.txt" ] || BOOT=/boot
 
 # ---------------------------------------------------------------- NDI license
 if [ "$ACCEPT_NDI" -ne 1 ]; then
@@ -265,13 +271,50 @@ for g in pindi-media video systemd-journal; do
     if getent group "$g" >/dev/null; then usermod -aG "$g" pindi-web; fi
 done
 install -d /usr/local/lib/pindi
+# Whether the installed version has the configuration guard (see "Optimising boot" below).
+GUARDED=0
+if grep -q -e "--guard" /usr/local/lib/pindi/pindi-web.py 2>/dev/null; then GUARDED=1; fi
 put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
+# The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take the
+# boot files' and settings' changes below for foreign ones and put the old files back: hold its lock until the
+# installer exits (a failure until then puts the files and copies from before back, which must not undo a
+# settings change made meanwhile). From here on the settings are read only once they are verified.
+(umask 077; exec 9>>/run/pindi-guard.lock)
+chmod 600 /run/pindi-guard.lock  # root only: anyone who can open it could hold the lock (and stall the guard)
+exec 9>>/run/pindi-guard.lock
+# Not got within a minute: stop (and roll back) rather than write unlocked.
+flock -w 60 9 || { echo "The configuration guard's lock is busy: stopping"; false; }
+CFG="$BOOT/config.txt"
+CMDLINE="$BOOT/cmdline.txt"
+# If the installation fails below, the copies come back as they are now, and the boot files and settings as
+# they are once put back from them (below): a rollback must not bring back a damaged file (an empty
+# cmdline.txt would not even boot to the guard).
+GUARD=/var/lib/pindi/guard
+for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
+    keep "$GUARD/$(echo "${f#/}" | tr / _).copy"
+done
+if [ "$GUARDED" -eq 1 ]; then
+    # Start from the verified state: a damaged or foreign file is put back from its copy first, so it is never
+    # edited and adopted as the new copy below (nothing is restarted).
+    PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard restore || {
+        echo "A boot file or the settings could not be checked or put back from a verified copy" \
+             "(is the card failing? see the messages above): stopping" >&2
+        false; }
+else
+    # Installed over a version without the guard (a first install, or an update after a downgrade): copies left
+    # from before the downgrade miss the changes made since, so the current files are the starting point.
+    rm -f "$GUARD"/*.copy
+fi
+for f in "$CFG" "$CMDLINE" /etc/default/pindi; do
+    keep "$f"
+done
 cat > /etc/pam.d/pindi-web <<'EOF'
 # PiNDI web interface: same password check as a normal login / SSH.
 @include common-auth
 @include common-account
 EOF
 put "$SRC/pindi-webd.service" /etc/systemd/system/pindi-webd.service 644
+put "$SRC/pindi-guard.service" /etc/systemd/system/pindi-guard.service 644
 put "$SRC/pindi-web.service" /etc/systemd/system/pindi-web.service 644
 # The front end serves TLS: its key is readable by pindi-web (the broker keeps it that way).
 if [ -d /etc/pindi/tls ]; then
@@ -362,7 +405,7 @@ EOF
 systemctl try-restart systemd-resolved.service || true
 
 systemctl daemon-reload
-systemctl enable pindi.service pindi-webd.service pindi-web.service pindi-sender.service
+systemctl enable pindi.service pindi-webd.service pindi-web.service pindi-sender.service pindi-guard.service
 
 # ---------------------------------------------------------------- boot speed
 step "Optimising boot ($BOOT)"
@@ -372,7 +415,6 @@ step "Optimising boot ($BOOT)"
 # holds every hardware H.264 decoder and encoder: with 76 a fourth one (e.g. two
 # HX displays and two HX inputs) fails with "Not enough GPU mem". The initramfs is skipped only when booting from the SD
 # card, whose driver and ext4 are built into the kernel; USB/NVMe boot keeps it.
-CFG="$BOOT/config.txt"
 [ -f "$CFG.pindi-orig" ] || [ ! -s "$CFG" ] || cp "$CFG" "$CFG.pindi-orig"
 # An empty config.txt (the FAT boot partition damaged by a power cut while it was being written) boots without
 # the display driver: start again from the original, which PiNDI's block is added to as usual.
@@ -401,11 +443,14 @@ for cam in CAM0 CAM1; do
     CSI="$CSI$line"$'\n'
 done
 # Written next to it, flushed to the card, then renamed over it (as cmdline.txt below): never edited in place, so
-# a power cut leaves the old file or the new one, not a half-written or empty one.
-NEWCFG="$CFG.pindi-new"
+# a power cut leaves the old file or the new one, not a half-written or empty one. Put together on the root file
+# system first: what config.txt must read back as (its new verified copy, below) never comes from the card's copy.
+NEWCFG="$TMP/config.txt.written"
 sed -E -e '/^# --- PiNDI begin ---$/,/^# --- PiNDI end ---$/d' \
     -e 's/^(camera_auto_detect|display_auto_detect|auto_initramfs|disable_splash|boot_delay|initial_turbo)=/#&/' \
     "$CFG" > "$NEWCFG"
+# Edited without a final newline (e.g. in Notepad): PiNDI's block must start on a line of its own.
+if [ -s "$NEWCFG" ] && [ -n "$(tail -c 1 "$NEWCFG")" ]; then echo >> "$NEWCFG"; fi
 cat >> "$NEWCFG" <<EOF
 # --- PiNDI begin ---
 [all]
@@ -431,13 +476,21 @@ dtoverlay=disable-bt-pi5
 ${CSI}# --- PiNDI CSI-2 end ---
 # --- PiNDI end ---
 EOF
-sync "$NEWCFG"
-mv -f "$NEWCFG" "$CFG"
+cp "$NEWCFG" "$CFG.pindi-new"
+sync "$CFG.pindi-new"
+mv -f "$CFG.pindi-new" "$CFG"
 sync
 
 # cmdline.txt: quiet boot, kernel messages off the screen, no serial console.
-CMDLINE="$BOOT/cmdline.txt"
-[ -f "$CMDLINE.pindi-orig" ] || cp "$CMDLINE" "$CMDLINE.pindi-orig"
+[ -f "$CMDLINE.pindi-orig" ] || ! grep -q "root=" "$CMDLINE" || cp "$CMDLINE" "$CMDLINE.pindi-orig"
+# A damaged one (no root= - the device would not boot): start again from the original.
+if ! grep -q "root=" "$CMDLINE" && grep -q "root=" "$CMDLINE.pindi-orig" 2>/dev/null; then
+    echo "cmdline.txt is damaged: starting again from $CMDLINE.pindi-orig"
+    cp "$CMDLINE.pindi-orig" "$CMDLINE"
+fi
+# Still none (missing, and no original or verified copy to start from): writing one would not boot.
+grep -q "root=" "$CMDLINE" 2>/dev/null || {
+    echo "cmdline.txt is missing or damaged (no root=) and can't be recovered: stopping" >&2; false; }
 set -f
 NEW=""
 for tok in $(tr -d '\r\n' < "$CMDLINE"); do
@@ -449,9 +502,22 @@ done
 set +f
 # Written next to it and renamed: a power cut must never leave an empty kernel command line (no boot).
 echo "${NEW# } console=tty3 quiet loglevel=3 logo.nologo vt.global_cursor_default=0 consoleblank=0" \
-    > "$CMDLINE.pindi-new"
+    > "$TMP/cmdline.txt.written"
+cp "$TMP/cmdline.txt.written" "$CMDLINE.pindi-new"
 sync "$CMDLINE.pindi-new"
 mv -f "$CMDLINE.pindi-new" "$CMDLINE"
+sync
+
+# Verified copies of the boot files and the settings, kept on the root file system: the configuration guard
+# puts a damaged or foreign file back from them (pindi-guard.service at boot, the broker while running). The
+# boot files must read back from the card exactly as written; the settings were not edited here (above, they
+# were put back from their copy if they were damaged). If not, the device may not boot: stop, and the files
+# and copies from before come back.
+PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save "$CFG=$TMP/config.txt.written" \
+    "$CMDLINE=$TMP/cmdline.txt.written" /etc/default/pindi || {
+    echo "The boot files or settings did not read back from the card as written (is it failing?): stopping" >&2
+    false; }
+echo "Configuration copies saved and verified"
 
 # Services not needed on a wired NDI display. apt's daily timers would download and upgrade at random
 # times, during a show; OS updates run at a time set in the web interface instead (pindi-os-update).

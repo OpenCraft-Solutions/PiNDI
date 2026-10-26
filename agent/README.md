@@ -390,6 +390,20 @@ logs** in the web interface.
 - The journal is capped at 64 MB, so logs never fill the SD card.
 - Settings writes are synced to the SD card, so a power cut right after saving
   can't leave an empty file.
+- **Configuration guard:** verified copies of `config.txt`, `cmdline.txt` and
+  `/etc/default/pindi` are kept on the root file system (`/var/lib/pindi/guard`,
+  another partition than the boot files). A file that is damaged (an SD card
+  that lost a write, a FAT file left empty by a power cut) or changed by
+  something other than PiNDI is put back from its copy: at boot, and every
+  minute while the device runs. If a
+  boot file was put back at boot, the device reboots once so the firmware reads
+  the repaired file (at most twice an hour); if the settings were put back, the
+  video and outgoing streams restart. A copy is only replaced after PiNDI
+  changes the file, with content that checks out as read back from the card,
+  and the copy is read back from the card too. The System card says when
+  something was put back. To keep a file you edited by hand, run
+  `sudo python3 /usr/local/lib/pindi/pindi-web.py --guard save`; otherwise it is
+  changed back within a minute.
 - The Device card warns about under-voltage and overheating.
 - An optional daily reboot clears any slow build-up on installations that run
   for months.

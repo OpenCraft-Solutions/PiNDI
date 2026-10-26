@@ -1,0 +1,18 @@
+[Unit]
+Description=PiNDI configuration guard: put back damaged configuration at boot
+# Compares config.txt, cmdline.txt and /etc/default/pindi as stored on the card with their verified copies
+# (pindi-web.py --guard; the broker repeats the check every minute while the device runs). A boot file that
+# had to be put back has already been read by the firmware: the device then reboots once (at most twice an
+# hour). Runs alongside the player, which starts as early as possible for the splash screen.
+After=local-fs.target
+Before=pindi-webd.service
+
+[Service]
+Type=oneshot
+# After a downgrade to a version without the guard this unit stays behind: run only if pindi-web.py has it.
+ExecCondition=/bin/grep -q -e "--guard" /usr/local/lib/pindi/pindi-web.py
+TimeoutStartSec=120
+ExecStart=/usr/bin/python3 /usr/local/lib/pindi/pindi-web.py --guard check --boot
+
+[Install]
+WantedBy=multi-user.target

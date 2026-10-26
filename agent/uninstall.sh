@@ -28,14 +28,16 @@ step() { echo; echo "==> $*"; }
 unit_exists() { [ -n "$(systemctl list-unit-files --no-legend "$1" 2>/dev/null)" ]; }
 
 step "Stopping and removing the PiNDI services"
-for u in pindi.service pindi-sender.service pindi-web.service pindi-webd.service pindi-reboot.timer pindi-os-update.timer \
-         pindi-os-update.service pindi-reboot.service; do
+# The configuration guard first (the broker's check, and at boot): it would put PiNDI's boot files back.
+for u in pindi-webd.service pindi-guard.service pindi.service pindi-sender.service pindi-web.service \
+         pindi-reboot.timer pindi-os-update.timer pindi-os-update.service pindi-reboot.service; do
     systemctl disable --now "$u" >/dev/null 2>&1 || true
 done
 rm -f /etc/systemd/system/pindi.service /etc/systemd/system/pindi-sender.service \
       /etc/systemd/system/pindi-web.service /etc/systemd/system/pindi-webd.service /etc/systemd/system/pindi-reboot.timer \
       /etc/systemd/system/pindi-reboot.service /etc/systemd/system/pindi-os-update.timer \
-      /etc/systemd/system/pindi-os-update.service /etc/systemd/system/pindi-drivers.service
+      /etc/systemd/system/pindi-os-update.service /etc/systemd/system/pindi-drivers.service \
+      /etc/systemd/system/pindi-guard.service /run/pindi-guard.lock
 rm -f /usr/local/bin/pindi-player /usr/local/bin/pindi-sender /etc/pam.d/pindi-web
 rm -rf /usr/local/lib/pindi /usr/share/pindi /etc/pindi /var/lib/pindi /var/lib/pindi-media /run/pindi \
        /run/pindi-ctl /run/pindi-web /run/pindi-webd
@@ -79,8 +81,9 @@ done
 rm -f /etc/cloud/cloud-init.disabled
 
 step "Boot configuration"
+# The boot partition: recognised by its mount, not by config.txt (which may be missing or damaged).
 BOOT=/boot/firmware
-[ -f "$BOOT/config.txt" ] || BOOT=/boot
+mountpoint -q "$BOOT" || [ -f "$BOOT/config.txt" ] || BOOT=/boot
 CFG="$BOOT/config.txt"
 CMDLINE="$BOOT/cmdline.txt"
 # config.txt: drop PiNDI's block and give back the lines it commented out (other edits are kept).
