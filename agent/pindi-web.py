@@ -469,6 +469,11 @@ def guard_check(boot=False, act=True):
                 if copy is None:
                     if live is not None and guard_valid(path, live):
                         guard_save(path)
+                    elif os.path.exists(_guard_copy(path)):
+                        # A copy that is itself damaged, and nothing usable to put back: reported (install.sh
+                        # stops; the System card shows it). Without any copy yet, the file is left as it is.
+                        log("guard: %s is damaged and has no usable verified copy" % path)
+                        restored.append((path, kind, "damaged, with no verified copy", False))
                     continue
                 if live == copy:
                     continue
@@ -2414,8 +2419,6 @@ def act_output(form):
         if (rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS) or
                 brightness not in dict(BRIGHTNESSES) or pacing not in dict(PACINGS)):
             return ("err", "Invalid display setting.")
-        # Explicit per output, so the shared PINDI_BANDWIDTH default of other outputs is left alone.
-        default_bw = (read_env().get("PINDI_BANDWIDTH") or "highest").lower()
         updates.update({
             "PINDI_OUT%d_ENABLED" % n: "" if enabled else "0",
             "PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
@@ -2424,7 +2427,8 @@ def act_output(form):
             "PINDI_OUT%d_MIRROR" % n: "" if mirror == "none" else mirror,
             "PINDI_OUT%d_BRIGHTNESS" % n: "" if brightness == "0" else brightness,
             "PINDI_OUT%d_PACING" % n: "" if pacing == "fast" else pacing,
-            "PINDI_OUT%d_BANDWIDTH" % n: "" if bandwidth == default_bw else bandwidth,
+            # Stored as chosen: not left to the shared PINDI_BANDWIDTH default (other outputs keep theirs).
+            "PINDI_OUT%d_BANDWIDTH" % n: bandwidth,
             "PINDI_OUT%d_MODE" % n: mode,
             "PINDI_OUT%d_BACKUP_STREAM" % n: backup,
             "PINDI_OUT%d_STANDBY_MIN" % n: "" if standby == "0" else standby,
