@@ -2443,6 +2443,11 @@ def act_output(form):
     if n == 1:
         source_keys |= {"PINDI_STREAM", "PINDI_SOURCE_IP"}
     changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
+
+    def bandwidth_of(env):
+        return out_setting(env, n, "BANDWIDTH", env.get("PINDI_BANDWIDTH") or "highest").lower()
+    if bandwidth_of(before) == bandwidth_of(after):  # e.g. an inherited default now stored: no restart for it
+        changed.discard("PINDI_OUT%d_BANDWIDTH" % n)
     o = next(o for o in outputs() if o["n"] == n)
     if changed and changed <= source_keys and o["enabled"] and o["state"] != "player not running":
         # Only the source changed: switch live, without restarting the player.

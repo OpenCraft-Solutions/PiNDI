@@ -277,7 +277,8 @@ if grep -q -e "--guard" /usr/local/lib/pindi/pindi-web.py 2>/dev/null; then GUAR
 put "$SRC/pindi-web.py" /usr/local/lib/pindi/pindi-web.py 755
 # The configuration guard (pindi-web.py --guard; its check runs every minute in the broker) must not take the
 # boot files' and settings' changes below for foreign ones and put the old files back: hold its lock until the
-# new copies are saved ("Optimising boot"). From here on the settings are read only once they are verified.
+# installer exits (a failure until then puts the files and copies from before back, which must not undo a
+# settings change made meanwhile). From here on the settings are read only once they are verified.
 (umask 077; exec 9>>/run/pindi-guard.lock)
 chmod 600 /run/pindi-guard.lock  # root only: anyone who can open it could hold the lock (and stall the guard)
 exec 9>>/run/pindi-guard.lock
@@ -509,7 +510,6 @@ PINDI_GUARD_LOCKED=1 python3 /usr/local/lib/pindi/pindi-web.py --guard save "$CF
     echo "The boot files or settings did not read back from the card as written (is it failing?): stopping" >&2
     false; }
 echo "Configuration copies saved and verified"
-flock -u 9
 
 # Services not needed on a wired NDI display. apt's daily timers would download and upgrade at random
 # times, during a show; OS updates run at a time set in the web interface instead (pindi-os-update).
