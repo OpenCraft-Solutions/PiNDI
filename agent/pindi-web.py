@@ -478,6 +478,26 @@ def _guard_pending(update=None):
     return dict(l.split("\t", 1) for l in lines if l.count("\t") == 1)
 
 
+def _guard_recent_reboots(now):
+    """Times of the guard's reboots in the last hour (damaged entries skipped: they must not stop a reboot)."""
+    try:
+        with open(GUARD_REBOOTS, "rb") as f:
+            history = f.read().decode("ascii", "replace").split()
+    except OSError:
+        history = []
+    recent = []
+    for x in history:
+        try:
+            t = float(x)
+        except ValueError:
+            continue
+        # One "in the future" counts too: the clock went back (no real-time clock before NTP), and must not lift
+        # the limit.
+        if now - t < 3600:
+            recent.append(t)
+    return recent
+
+
 def guard_check(boot=False, act=True):
     """Compare each file as stored on the card with its verified copy and put back a damaged or foreign one;
     then restart the player and sender (settings), or reboot (a boot file, at boot) - unless act is False
@@ -487,6 +507,9 @@ def guard_check(boot=False, act=True):
     reboot follows when a later check reads it back intact."""
     restored = []
     reboot_for = set()  # boot files whose repair the firmware has not read yet
+    now = time.time()
+    recent = _guard_recent_reboots(now)
+    may_reboot = act and len(recent) < 2  # at most 2 an hour: no reboot loop
     with guard_lock():
         pending = _guard_pending()
         for path, kind in guard_files():
@@ -505,10 +528,13 @@ def guard_check(boot=False, act=True):
                         guard_save(path)  # no copy yet (the first check after an install)
                     continue
                 if live == copy:
-                    if path in pending:  # put back earlier, but its read-back failed: verified now
-                        restored.append((path, kind, "put back earlier, verified now", True))
+                    if path in pending:  # put back earlier, but no restart or reboot followed yet: verified now
                         # Owed when put back at boot (no reboot followed); at boot the firmware has read it now.
-                        if kind == "boot" and pending[path] == "1" and not boot:
+                        owed = kind == "boot" and pending[path] == "1" and not boot
+                        if owed and act and not may_reboot:
+                            continue  # stays pending: the reboot follows once the limit allows it
+                        restored.append((path, kind, "put back earlier, verified now", True))
+                        if owed:
                             reboot_for.add(path)
                     continue
                 why = ("damaged" if live is None or not guard_valid(path, live) else
@@ -533,8 +559,9 @@ def guard_check(boot=False, act=True):
             log("guard: %s was %s: %s" % (path, why, "put back its verified copy" if ok else
                                           "putting back its copy failed"))
             restored.append((path, kind, why, ok))
-        # The restart/reboot below is for those read back intact: no longer pending (the rest stay).
-        done = {p for p, _, _, ok in restored if ok}
+        # The restart/reboot below is for those read back intact: no longer pending. The rest stay, and so do
+        # boot files whose reboot the limit holds back (install.sh, act False, reboots by itself).
+        done = {p for p, _, _, ok in restored if ok} - (reboot_for if act and not may_reboot else set())
         if done & set(pending):
             _guard_pending({p: v for p, v in pending.items() if p not in done})
     if not restored:
@@ -548,25 +575,9 @@ def guard_check(boot=False, act=True):
         # At boot too: the player starts before this check (as early as possible, for the splash screen).
         run("systemctl", "--no-block", "restart", "pindi.service", "pindi-sender.service")
     if any(k == "boot" and ok and p in reboot_for for p, k, _, ok in restored):
-        now = time.time()
-        recent = []  # a damaged history must not stop the reboot: unreadable entries are skipped
-        try:
-            with open(GUARD_REBOOTS, "rb") as f:
-                history = f.read().decode("ascii", "replace").split()
-        except OSError:
-            history = []
-        for x in history:
-            try:
-                t = float(x)
-            except ValueError:
-                continue
-            # One "in the future" counts too: the clock went back (no real-time clock before NTP), and must
-            # not lift the limit.
-            if now - t < 3600:
-                recent.append(t)
-        if len(recent) >= 2:
+        if not may_reboot:
             log("guard: a boot file was put back, but the device already rebooted twice for that in the last "
-                "hour: not again (the card may not keep what is written to it)")
+                "hour: not yet (the card may not keep what is written to it; retried when the hour is up)")
         else:
             write_atomic(GUARD_REBOOTS, " ".join("%.0f" % t for t in recent + [now]) + "\n", 0o600)
             log("guard: rebooting, so the firmware reads the repaired boot files")
