@@ -640,7 +640,7 @@ class Scanner:
 # What install.sh needs (the same files make-update.sh packages), plus the NDI SDK the user downloaded.
 AGENT_FILES = ["VERSION", "README.md", "install.sh", "uninstall.sh", "pindi.conf", "Splash.jpg", "update-key.pub",
                "pindi-player.c", "pindi-sender.c", "pindi-web.py", "pindi.service", "pindi-sender.service",
-               "pindi-web.service", "pindi-webd.service"]
+               "pindi-web.service", "pindi-webd.service", "pindi-guard.service"]
 INSTALL_TIMEOUT = 3600  # install.sh with apt full-upgrade on a slow SD card
 BOOT_WAIT = 300
 

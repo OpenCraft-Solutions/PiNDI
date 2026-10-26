@@ -551,7 +551,8 @@ def guard_main(args):
                 print("%s: %s" % (expected, e), file=sys.stderr)
                 return 1
         paths = list(want)
-        bad = [p for p in paths if not guard_save(p, want[p])]
+        with guard_lock():  # all at once: the broker's check must not put back a file between two saves
+            bad = [p for p in paths if not guard_save(p, want[p])]
         for p in paths:
             print("%s: %s" % (p, "copy failed - see the log" if p in bad else "copy saved and verified"))
         # Copies in the format of the first test builds (content and checksum in two files).
@@ -787,7 +788,9 @@ def set_wifi_overlay(on):
     with guard_lock():
         text = boot_config_text()
         new = re.sub(r"^#?(dtoverlay=disable-wifi(-pi5)?)$", ("#" if on else "") + r"\1", text, flags=re.M)
-        if new.encode("utf-8") != (read_card(CONFIG_TXT) or b""):  # bytes: the file may not even be text
+        # Also when only its copy lacks the change (an earlier attempt whose copy failed to save). Bytes: the
+        # file may not even be text.
+        if new != text or new.encode("utf-8") != (read_card(CONFIG_TXT) or b""):
             write_boot_config(new)
     return new != text
 
@@ -1506,7 +1509,9 @@ def set_csi_overlays(env):
             new = end.sub(lambda m: block + m.group(0), text, count=1)
         else:
             new = text.rstrip("\n") + "\n[all]\n" + block
-        if new.encode("utf-8") != (read_card(CONFIG_TXT) or b""):  # bytes: the file may not even be text
+        # Also when only its copy lacks the change (an earlier attempt whose copy failed to save). Bytes: the
+        # file may not even be text.
+        if new != text or new.encode("utf-8") != (read_card(CONFIG_TXT) or b""):
             write_boot_config(new)
     return new != text
 
