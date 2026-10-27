@@ -98,7 +98,7 @@ class Device:
                          "stream": o["stream"], "source_ip": o["source_ip"], "backup": "",
                          "display": {"link": "connected", "mode": "1920x1080@60"}})
         up = int(time.time() - self.started)
-        return {"api_version": 3,
+        return {"api_version": 4,
                 "device": {"name": self.name, "ndi_name": self.name.upper(), "serial": self.serial,
                            "model": "Raspberry Pi 4 Model B" if self.n % 2 else "Raspberry Pi 5", "version": self.version,
                            "ip": "127.0.0.1", "health": "CPU %.0f °C · load %.1f (4 cores)" % (self.temp, self.load),

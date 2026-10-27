@@ -255,8 +255,11 @@ function renderMatrix() {
   const cell = (d, o, s, routed, live) => {
     const key = `${d.id}/${o.n}/${s ? s.name + '\t' + s.ip : ''}`;
     const cls = busy.has(key) ? 'busy' : live ? 'live' : routed ? 'routed' : '';
-    const label = s ? `${s.name} to ${devName(d)} output ${o.n}` : `${devName(d)} output ${o.n} back to its own stream`;
-    return `<td><button class="${cls}" ${d.online ? '' : 'disabled'} title="${esc(label)}" aria-label="${esc(label)}" ` +
+    // Agents before API version 4 would take an rtp:// or srt:// address for an NDI stream name.
+    const old = !!(s && s.kind) && !(d.status.api_version >= 4);
+    const label = old ? `${devName(d)} can't show ${s.kind} streams: update it to PiNDI 1.7.0 or newer` :
+      s ? `${s.name} to ${devName(d)} output ${o.n}` : `${devName(d)} output ${o.n} back to its own stream`;
+    return `<td><button class="${cls}" ${d.online && !old ? '' : 'disabled'} title="${esc(label)}" aria-label="${esc(label)}" ` +
       `aria-pressed="${routed}" data-dev="${esc(d.id)}" data-out="${o.n}" data-key="${esc(key)}" ` +
       `data-stream="${esc(s ? s.stream : '')}" data-ip="${esc(s ? s.ip : '')}"></button></td>`;
   };

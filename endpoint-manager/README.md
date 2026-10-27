@@ -125,6 +125,8 @@ routing one sets the output's stream to `srt://<device>:<port>`, and the output 
 8 outputs per input). Encrypted ones aren't offered, because devices don't give their passphrase out, and
 neither are inputs that call one receiver themselves: set those on the device.
 
+RTP and SRT crosspoints are disabled for outputs on devices older than PiNDI 1.7.0, which can't show them.
+
 Switching sends `POST /api/v1/outputs/<n>/source` to the device. With **Lock to the sender's IP** (the default),
 the output only accepts that stream from that sender, so two senders with the same stream name can't be
 mixed up. **Own stream** sets the output back to its default stream, `OUT_<serial>`.
