@@ -110,7 +110,7 @@ fi
 OPTIONAL_PACKAGES=()
 OPTIONAL_WHY=()
 if grep -qE "Raspberry Pi (5|500)|Compute Module 5" /proc/device-tree/model 2>/dev/null; then
-    OPTIONAL_PACKAGES+=(libavcodec61)
+    OPTIONAL_PACKAGES+=("libavcodec61|libavcodec62|libavcodec60|libavcodec59")  # the OS release's: 59 in Bookworm
     OPTIONAL_WHY+=("H.264 RTP and SRT streams can't be shown on this device")
 fi
 OPTIONAL_PACKAGES+=("libsrt1.5-gnutls|libsrt1.4-gnutls")
