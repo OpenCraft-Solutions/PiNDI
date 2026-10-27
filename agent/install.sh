@@ -104,6 +104,12 @@ PACKAGES=(gcc libc6-dev pkg-config
 if [ -f "$SRC/Install_NDI_Advanced_SDK_v6_Linux.tar.gz" ]; then
     PACKAGES+=(libavcodec61)
 fi
+# Installed when apt is used, not required offline (an update package can't add them): boards without
+# a hardware H.264 decoder (Pi 5) decode H.264 RTP streams with libavcodec, also loaded at run time.
+OPTIONAL_PACKAGES=()
+if grep -qE "Raspberry Pi (5|500)|Compute Module 5" /proc/device-tree/model 2>/dev/null; then
+    OPTIONAL_PACKAGES+=(libavcodec61)
+fi
 if [ "$OFFLINE" -eq 1 ]; then
     step "Checking packages (offline)"
     MISSING=()
@@ -124,6 +130,10 @@ else
         apt-get "${APT_OPTS[@]}" full-upgrade
     fi
     apt-get "${APT_OPTS[@]}" install --no-install-recommends "${PACKAGES[@]}"
+    if [ "${#OPTIONAL_PACKAGES[@]}" -gt 0 ]; then
+        apt-get "${APT_OPTS[@]}" install --no-install-recommends "${OPTIONAL_PACKAGES[@]}" ||
+            echo "Could not install ${OPTIONAL_PACKAGES[*]}: H.264 RTP streams can't be shown on this device." >&2
+    fi
 fi
 
 # ---------------------------------------------------------------- NDI runtime
@@ -548,17 +558,12 @@ if ! grep -qE "Raspberry Pi (4|5|400|500|Compute Module (4|5))" /proc/device-tre
 fi
 
 # Camera / ISP drivers are never used; they cost boot time. The Pi 3/4 hardware H.264
-# decoder (bcm2835_codec and what it needs) is kept when the NDI Advanced SDK is
-# installed: the player uses it for NDI|HX.
+# encoder and decoder (bcm2835_codec and what it needs) are kept: NDI|HX and H.264 RTP
+# use them, and RTP needs no NDI Advanced SDK.
 {
     echo "# Installed by PiNDI: unused camera, ISP and V4L2 codec drivers."
     echo "blacklist bcm2835_v4l2"
     echo "blacklist bcm2835_isp"
-    if [ ! -e /usr/local/lib/libndi_advanced.so ]; then
-        echo "blacklist bcm2835_codec"
-        echo "blacklist bcm2835_mmal_vchiq"
-        echo "blacklist vc_sm_cma"
-    fi
     echo "blacklist rpi_hevc_dec"
 } > /etc/modprobe.d/pindi-blacklist.conf
 
