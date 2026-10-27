@@ -22,6 +22,7 @@
 #include <ifaddrs.h>
 #include <math.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -2364,9 +2365,39 @@ static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_fra
 
 /* ------------------------------------------------------------------ status for the web UI */
 
+/* A stream as shown (status, splash, logs): an SRT address without its passphrase. */
+static void stream_shown(const char *s, char *buf, size_t n)
+{
+    const char *q = strchr(s, '?');
+    if (strncasecmp(s, "srt://", 6) || !q) {
+        snprintf(buf, n, "%s", s);
+        return;
+    }
+    size_t k = (size_t)(q - s) < n ? (size_t)(q - s) : n - 1;
+    memcpy(buf, s, k);
+    buf[k] = 0;
+    bool encrypted = false;
+    char sep = '?';
+    for (const char *p = q + 1; *p;) {
+        const char *amp = strchr(p, '&');
+        size_t l = amp ? (size_t)(amp - p) : strlen(p);
+        if (l >= 11 && !strncasecmp(p, "passphrase=", 11)) {
+            encrypted = true;
+        } else if (l && k + l + 2 < n) {
+            buf[k++] = sep;
+            memcpy(buf + k, p, l);
+            buf[k += l] = 0;
+            sep = '&';
+        }
+        p += l + (amp ? 1 : 0);
+    }
+    if (encrypted && k + 13 < n)
+        memcpy(buf + k, " (encrypted)", 13);
+}
+
 static void status_set(struct output *o, const char *state, const char *source, const char *url, const char *video)
 {
-    char buf[1024], path[64];
+    char buf[1024], path[64], target[sizeof o->target];
     if (!strcmp(o->st.state, state) && !strcmp(o->st.source, source) && !strcmp(o->st.url, url) &&
         !strcmp(o->st.video, video) && !strcmp(o->st.target, o->target))
         return;
@@ -2375,8 +2406,9 @@ static void status_set(struct output *o, const char *state, const char *source, 
     snprintf(o->st.source, sizeof o->st.source, "%s", source);
     snprintf(o->st.url, sizeof o->st.url, "%s", url);
     snprintf(o->st.video, sizeof o->st.video, "%s", video);
+    stream_shown(o->target, target, sizeof target);
     snprintf(buf, sizeof buf, "state=%s\ntarget=%s\nsource=%s\nurl=%s\nvideo=%s\n",
-             o->st.state, o->target, o->st.source, o->st.url, o->st.video);
+             o->st.state, target, o->st.source, o->st.url, o->st.video);
     snprintf(path, sizeof path, RUN_DIR "/out%d.status", o->n);
     write_file_atomic(path, buf);
 
@@ -2395,9 +2427,10 @@ static void status_set(struct output *o, const char *state, const char *source, 
                  video);
     else if (!strcmp(state, "searching") || !strncmp(state, "playing", 7))
         snprintf(msg, sizeof msg, "Waiting for %s stream %s%s",
-                 strncasecmp(o->target, "rtp://", 6) ? "NDI" : "H.264 RTP", o->target, from);
+                 !strncasecmp(o->target, "rtp://", 6) ? "H.264 RTP" : !strncasecmp(o->target, "srt://", 6) ? "SRT" : "NDI",
+                 target, from);
     else if (!strncmp(state, "cannot", 6))
-        snprintf(msg, sizeof msg, "%s: %s", o->target, state);
+        snprintf(msg, sizeof msg, "%s: %s", target, state);
     else
         msg[0] = 0;
     pthread_mutex_lock(&o->lock);
@@ -2746,7 +2779,9 @@ static int switch_poll(struct output *o, uint64_t *seen)
     set_target(o, stream, ip, backup);
     if (!strcmp(old_target, o->target) && !strcmp(old_ip, o->source_ip) && !strcmp(old_backup, o->backup))
         return 0;
-    LOG("ndi: output %d: switching to %s from %s%s%s", o->n, o->target, *o->source_ip ? o->source_ip : "any host",
+    char shown[sizeof o->target];
+    stream_shown(o->target, shown, sizeof shown);
+    LOG("ndi: output %d: switching to %s from %s%s%s", o->n, shown, *o->source_ip ? o->source_ip : "any host",
         *o->backup ? ", backup " : "", o->backup);
     return strcmp(old_ip, o->source_ip) ? 2 : 1;
 }
@@ -3584,23 +3619,24 @@ static bool swdec_decode(struct output *o, struct swdec *s, uint8_t *au, size_t 
     return shown;
 }
 
-/* What an output receiving RTP has open. */
-struct rtp_rx {
-    int vfd, cfd, afd;       /* video, its RTCP, audio */
-    struct rtp_depack dp;
+/* What an output receiving H.264 as RTP (or SRT) has open. */
+struct h264_rx {
+    int vfd, cfd, afd;       /* RTP: video, its RTCP, audio */
+    struct rtp_depack dp;    /* the picture being put together */
     struct hwdec hw;
     struct swdec sw;
     bool hw_on, sw_on, hw_failed;
     bool chosen;             /* the decoder has been chosen (none if neither could be opened) */
+    char dev[32];            /* the hardware decoder, "" = none found (yet) */
     int w, h;                /* from the SPS */
-    int64_t sr_ntp;          /* last sender report: wall clock (100 ns UTC) at RTP time sr_rtp; 0 = none */
+    int64_t sr_ntp;          /* RTP: last sender report: wall clock (100 ns UTC) at RTP time sr_rtp; 0 = none */
     uint32_t sr_rtp, sr_ssrc;
-    uint64_t audio_ts;       /* audio timestamps, unwrapped */
+    uint64_t audio_ts;       /* RTP: audio timestamps, unwrapped */
     uint32_t audio_last;
     bool audio_known;
 };
 
-static void rtp_rx_close(struct output *o, struct rtp_rx *r)
+static void h264_rx_close(struct output *o, struct h264_rx *r)
 {
     if (r->hw_on)
         hwdec_close(o, &r->hw);
@@ -3614,6 +3650,55 @@ static void rtp_rx_close(struct output *o, struct rtp_rx *r)
     }
 }
 
+/* A complete picture in r->dp (sent: its capture time, 100 ns UTC, or INT64_MAX). The decoder is chosen at
+ * the first keyframe, when the size is known: the hardware one (Pi 3/4) if this display can show its
+ * pictures, else libavcodec. kind: "H.264 RTP" or "H.264 SRT"; tag: "rtp" or "srt" (logs). vid gets the
+ * picture size. False if nothing here decodes it; *shown: false if the display can't show what it decoded. */
+static bool h264_picture(struct output *o, struct h264_rx *r, const char *kind, const char *tag, const char *src,
+                         const char *from, char *vid, size_t vidn, int64_t sent, uint64_t recv_us, bool *shown)
+{
+    struct rtp_depack *dp = &r->dp;
+    if (dp->new_sps) {
+        int w, h;
+        if (sps_size(dp->sps, dp->sps_len, &w, &h) && (w != r->w || h != r->h)) {
+            LOG("%s: output %d: %dx%d H.264 from %s", tag, o->n, w, h, from);
+            r->w = w;
+            r->h = h;
+            snprintf(vid, vidn, "%dx%d", w, h); /* the frame rate follows */
+        }
+        dp->new_sps = false;
+    }
+    if (!r->chosen && dp->key && r->w) {
+        r->chosen = true;
+        if (!*r->dev)
+            hwdec_scan(r->dev, sizeof r->dev); /* its driver may have loaded after the player started */
+        if (*r->dev && o->has_nv12 && !r->hw_failed)
+            r->hw_on = hwdec_open(o, &r->hw, r->dev, r->w, r->h);
+        if (!r->hw_on)
+            r->sw_on = swdec_open(o, &r->sw);
+        char buf[512], path[64];
+        snprintf(buf, sizeof buf, "source=%s\ncodec=%s, %s\n", src, kind,
+                 r->hw_on ? "hardware decoded" : r->sw_on ? "software decoded" : "cannot be decoded here");
+        snprintf(path, sizeof path, RUN_DIR "/out%d.codec", o->n);
+        write_file_atomic(path, buf);
+        if (!r->hw_on && !r->sw_on)
+            LOG("%s: output %d: no H.264 decoder (no hardware decoder, no libavcodec)", tag, o->n);
+    }
+    *shown = true;
+    if (r->hw_on) {
+        r->hw.aspect = (double)r->w / r->h;
+        if (!hwdec_queue(o, &r->hw, NULL, 0, dp->au, dp->len, dp->key, sent, recv_us)) {
+            hwdec_close(o, &r->hw); /* software decoding from the next keyframe */
+            r->hw_on = r->chosen = false;
+            r->hw_failed = true;
+            dp->resync = true;
+        }
+    } else if (r->sw_on) {
+        *shown = swdec_decode(o, &r->sw, dp->au, dp->len, sent, recv_us);
+    }
+    return r->hw_on || r->sw_on;
+}
+
 /* Is the packet from the output's source IP (if it has one)? */
 static bool rtp_from_ok(struct output *o, const struct sockaddr_in *from)
 {
@@ -3622,7 +3707,7 @@ static bool rtp_from_ok(struct output *o, const struct sockaddr_in *from)
 }
 
 /* RTCP: the video sender's report ties its timestamps to its wall clock. */
-static void rtp_rtcp(struct rtp_rx *r, const uint8_t *p, size_t n)
+static void rtp_rtcp(struct h264_rx *r, const uint8_t *p, size_t n)
 {
     while (n >= 4 && (p[0] >> 6) == 2) {
         size_t len = ((size_t)p[2] << 8 | p[3]) * 4 + 4;
@@ -3642,7 +3727,7 @@ static void rtp_rtcp(struct rtp_rx *r, const uint8_t *p, size_t n)
 }
 
 /* A picture's capture time (100 ns UTC) from the last sender report, else INT64_MAX. */
-static int64_t rtp_sent(const struct rtp_rx *r, uint32_t ts)
+static int64_t rtp_sent(const struct h264_rx *r, uint32_t ts)
 {
     if (!r->sr_ntp || r->sr_ssrc != r->dp.ssrc)
         return INT64_MAX;
@@ -3650,7 +3735,7 @@ static int64_t rtp_sent(const struct rtp_rx *r, uint32_t ts)
 }
 
 /* Audio packets waiting on afd, played as one frame. */
-static void rtp_audio(struct output *o, struct rtp_rx *r, float *abuf, size_t cap)
+static void rtp_audio(struct output *o, struct h264_rx *r, float *abuf, size_t cap)
 {
     uint8_t pkt[2048];
     size_t got = 0;
@@ -3709,13 +3794,13 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
     snprintf(src, sizeof src, "%s", o->target);
     if (!rtp_url(src, &group, &port))
         return 0;
-    struct rtp_rx r = { .vfd = -1, .cfd = -1, .afd = -1, .hw = { .fd = -1 } };
+    struct h264_rx r = { .vfd = -1, .cfd = -1, .afd = -1, .hw = { .fd = -1 }, .dp.resync = true };
     r.dp.buf = malloc(RTP_HEADROOM + RTP_MAX_AU + RTP_PAD);
     r.dp.au = r.dp.buf + RTP_HEADROOM;
     enum { ACAP = 4800 }; /* 100 ms per channel */
     float *abuf = malloc(ACAP * 2 * sizeof(float));
     uint8_t *pkt = malloc(65536);
-    char from_s[64] = "", vid[64] = "", dev[32] = "";
+    char from_s[64] = "", vid[64] = "";
     uint64_t start = now_ms(), last_switch = 0, last_sources = 0, last_stats = start, last_video = 0, last_open = 0;
     uint64_t last_fps = start, pictures = 0, stat_pictures = 0, stat_packets = 0;
     unsigned fps_pictures = 0;
@@ -3798,50 +3883,9 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             last_video = now;
             int res;
             while ((res = depack_packet(&r.dp, pkt, (size_t)n)) != RTP_NONE) {
-                struct rtp_depack *dp = &r.dp;
-                int64_t sent = rtp_sent(&r, dp->ts);
-                if (dp->new_sps) {
-                    int w, h;
-                    if (sps_size(dp->sps, dp->sps_len, &w, &h) && (w != r.w || h != r.h)) {
-                        LOG("rtp: output %d: %dx%d H.264 from %s", o->n, w, h, from_s);
-                        r.w = w;
-                        r.h = h;
-                        snprintf(vid, sizeof vid, "%dx%d", w, h); /* the frame rate follows */
-                    }
-                    dp->new_sps = false;
-                }
-                /* The decoder: the hardware one (Pi 3/4) if this display can show its pictures, else
-                 * libavcodec. Chosen at the first keyframe, when the size is known. */
-                if (!r.chosen && dp->key && r.w) {
-                    r.chosen = true;
-                    if (!*dev)
-                        hwdec_scan(dev, sizeof dev); /* its driver may have loaded after the player started */
-                    if (*dev && o->has_nv12 && !r.hw_failed)
-                        r.hw_on = hwdec_open(o, &r.hw, dev, r.w, r.h);
-                    if (!r.hw_on)
-                        r.sw_on = swdec_open(o, &r.sw);
-                    char buf[512], path[64];
-                    snprintf(buf, sizeof buf, "source=%s\ncodec=%s\n", src,
-                             r.hw_on ? "H.264 RTP, hardware decoded" : r.sw_on ? "H.264 RTP, software decoded"
-                                                                       : "H.264 RTP (cannot be decoded here)");
-                    snprintf(path, sizeof path, RUN_DIR "/out%d.codec", o->n);
-                    write_file_atomic(path, buf);
-                    if (!r.hw_on && !r.sw_on)
-                        LOG("rtp: output %d: no H.264 decoder (no hardware decoder, no libavcodec)", o->n);
-                }
-                bool shown = true;
-                if (r.hw_on) {
-                    r.hw.aspect = (double)r.w / r.h;
-                    if (!hwdec_queue(o, &r.hw, NULL, 0, dp->au, dp->len, dp->key, sent, recv_us)) {
-                        hwdec_close(o, &r.hw); /* software decoding from the next keyframe */
-                        r.hw_on = r.chosen = false;
-                        r.hw_failed = true;
-                        dp->resync = true;
-                    }
-                } else if (r.sw_on) {
-                    shown = swdec_decode(o, &r.sw, dp->au, dp->len, sent, recv_us);
-                }
-                if (r.hw_on || r.sw_on) {
+                bool shown;
+                if (h264_picture(o, &r, "H.264 RTP", "rtp", src, from_s, vid, sizeof vid, rtp_sent(&r, r.dp.ts),
+                                 recv_us, &shown)) {
                     pictures++;
                     fps_pictures++;
                     if (!got)
@@ -3906,12 +3950,1028 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             last_stats = now;
         }
     }
-    rtp_rx_close(o, &r);
+    h264_rx_close(o, &r);
     audio_close(o);
     free(r.dp.buf);
     free(abuf);
     free(pkt);
     return ret;
+}
+
+/* ------------------------------------------------------------------ H.264 over SRT */
+
+/* An output whose stream is "srt://host:port" calls that SRT sender: another PiNDI's input sent as H.264
+ * SRT, or OBS, ffmpeg, vMix, hardware encoders. "srt://:port" listens instead, for a sender to call this
+ * device. ?passphrase=...&latency=<ms>&streamid=... as ffmpeg and VLC write them (latency: SRT's default
+ * 120 ms; the larger of the two ends' counts). SRT sends lost packets again within the latency, so it
+ * crosses Wi-Fi, routed networks and the internet; what still doesn't arrive in time is dropped, and the
+ * picture then waits for the next keyframe. The stream is an MPEG transport stream: H.264 (no B-frames,
+ * as live encoders send) decoded as for RTP, audio as SMPTE 302M PCM (PiNDI senders), or AAC with
+ * libavcodec. A PiNDI sender's timestamps are its capture times (it says so in the SDT): the latency
+ * figure. libsrt is loaded at run time. */
+
+#define TS_PES_MAX 65536
+#define SRT_ACAP 16384 /* audio frames per channel decoded at once: a whole 302M PES */
+enum { SRTS_CONNECTED = 5, SRTO_RCVSYN = 2, SRTO_LATENCY = 23, SRTO_PASSPHRASE = 26, SRTO_CONNTIMEO = 36,
+       SRTO_STREAMID = 46, SRT_EPOLL_IN = 1, SRT_EPOLL_ERR = 8 };
+
+struct srt_url {
+    bool listen;
+    char host[128];
+    int port;
+    char passphrase[80];
+    int latency; /* ms, -1: libsrt's default (120) */
+    char streamid[128];
+};
+
+static int hexval(int c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* "srt://[host]:port[?key=value&...]": no host (or "@", "0.0.0.0") listens, a host is called; mode=listener
+ * or caller says so explicitly. Values may be %-encoded. Other keys (ffmpeg has many) are ignored. */
+static bool srt_parse(const char *s, struct srt_url *u, const char **err)
+{
+    memset(u, 0, sizeof *u);
+    u->latency = -1;
+    *err = "not an srt:// address";
+    if (strncasecmp(s, "srt://", 6))
+        return false;
+    s += 6;
+    if (*s == '@')
+        s++;
+    const char *q = strchr(s, '?');
+    size_t hl = q ? (size_t)(q - s) : strlen(s);
+    const char *colon = memrchr(s, ':', hl);
+    *err = "no port (srt://host:port, or srt://:port to listen)";
+    if (!colon || (size_t)(colon - s) >= sizeof u->host)
+        return false;
+    memcpy(u->host, s, (size_t)(colon - s));
+    u->host[colon - s] = 0;
+    char *end;
+    long port = strtol(colon + 1, &end, 10);
+    if (end != s + hl || port < 1 || port > 65535)
+        return false;
+    u->port = (int)port;
+    u->listen = !*u->host || !strcmp(u->host, "0.0.0.0");
+    for (const char *p = q ? q + 1 : NULL; p && *p;) {
+        const char *amp = strchr(p, '&'), *eq = strchr(p, '=');
+        size_t kl = (size_t)((amp ? amp : p + strlen(p)) - p);
+        char key[24], val[160];
+        size_t vn = 0;
+        if (eq && eq < p + kl && (size_t)(eq - p) < sizeof key) {
+            memcpy(key, p, (size_t)(eq - p));
+            key[eq - p] = 0;
+            for (const char *v = eq + 1; v < p + kl && vn + 1 < sizeof val; v++) {
+                if (*v == '%' && v + 2 < p + kl + 1 && hexval(v[1]) >= 0 && hexval(v[2]) >= 0) {
+                    val[vn++] = (char)(hexval(v[1]) * 16 + hexval(v[2]));
+                    v += 2;
+                } else {
+                    val[vn++] = *v;
+                }
+            }
+            val[vn] = 0;
+            if (!strcasecmp(key, "passphrase")) {
+                *err = "the passphrase must be 10 to 79 characters";
+                if (vn < 10 || vn > 79)
+                    return false;
+                memcpy(u->passphrase, val, vn + 1);
+            } else if (!strcasecmp(key, "latency")) {
+                long l = strtol(val, &end, 10);
+                *err = "the latency must be 20 to 8000 ms";
+                if (*end || l < 20 || l > 8000)
+                    return false;
+                u->latency = (int)l;
+            } else if (!strcasecmp(key, "streamid")) {
+                snprintf(u->streamid, sizeof u->streamid, "%.127s", val);
+            } else if (!strcasecmp(key, "mode")) {
+                *err = "mode must be listener or caller";
+                if (strcasecmp(val, "listener") && strcasecmp(val, "caller"))
+                    return false;
+                u->listen = !strcasecmp(val, "listener");
+            }
+        }
+        p = amp ? amp + 1 : NULL;
+    }
+    *err = "a caller needs the sender's address (srt://host:port)";
+    if (!u->listen && !*u->host)
+        return false;
+    return true;
+}
+
+/* libsrt, loaded at run time: SRT is optional (install.sh installs it when it can). */
+static struct {
+    pthread_mutex_t mu;
+    bool tried, ok;
+    char name[32];
+    int (*startup)(void);
+    int (*create_socket)(void);
+    int (*setsockflag)(int s, int opt, const void *val, int len);
+    int (*bind)(int s, const struct sockaddr *a, int len);
+    int (*listen)(int s, int backlog);
+    int (*accept)(int s, struct sockaddr *a, int *len);
+    int (*connect)(int s, const struct sockaddr *a, int len);
+    int (*recvmsg)(int s, char *buf, int len);
+    int (*close)(int s);
+    int (*getsockstate)(int s);
+    const char *(*getlasterror_str)(void);
+    int (*getlasterror)(int *errno_loc);
+    int (*epoll_create)(void);
+    int (*epoll_add_usock)(int eid, int s, const int *events);
+    int (*epoll_wait)(int eid, int *rd, int *rn, int *wr, int *wn, int64_t ms, int *lrd, int *lrn, int *lwr,
+                      int *lwn);
+    int (*epoll_release)(int eid);
+    int (*bstats)(int s, void *perf, int clear);
+    void (*setloglevel)(int level);
+    int (*getrejectreason)(int s);              /* optional (SRT 1.3.4) */
+    const char *(*rejectreason_str)(int reason);
+} srt = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static bool srt_load(void)
+{
+    pthread_mutex_lock(&srt.mu);
+    if (!srt.tried) {
+        srt.tried = true;
+        static const char *const libs[] = { "libsrt-gnutls.so.1.5", "libsrt.so.1.5", "libsrt-openssl.so.1.5",
+                                            "libsrt-gnutls.so.1.4", "libsrt.so.1.4" };
+        void *lib = NULL;
+        for (size_t i = 0; i < sizeof libs / sizeof *libs && !lib; i++)
+            if ((lib = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL)))
+                snprintf(srt.name, sizeof srt.name, "%s", libs[i]);
+#define SRT_SYM(f) (*(void **)&srt.f = lib ? dlsym(lib, "srt_" #f) : NULL)
+        srt.ok = SRT_SYM(startup) && SRT_SYM(create_socket) && SRT_SYM(setsockflag) && SRT_SYM(bind) &&
+                 SRT_SYM(listen) && SRT_SYM(accept) && SRT_SYM(connect) && SRT_SYM(recvmsg) && SRT_SYM(close) &&
+                 SRT_SYM(getsockstate) && SRT_SYM(getlasterror_str) && SRT_SYM(getlasterror) &&
+                 SRT_SYM(epoll_create) && SRT_SYM(epoll_add_usock) && SRT_SYM(epoll_wait) &&
+                 SRT_SYM(epoll_release) && SRT_SYM(bstats) && SRT_SYM(setloglevel);
+        SRT_SYM(getrejectreason);
+        SRT_SYM(rejectreason_str);
+#undef SRT_SYM
+        if (srt.ok) {
+            srt.setloglevel(3); /* LOG_ERR */
+            srt.ok = srt.startup() >= 0;
+        }
+        LOG("srt: %s%s", srt.ok ? "with " : "not available (no libsrt)", srt.ok ? srt.name : "");
+    }
+    bool ok = srt.ok;
+    pthread_mutex_unlock(&srt.mu);
+    return ok;
+}
+
+/* The start of SRT_TRACEBSTATS, which has kept its place since SRT 1.3 (only totals are used). */
+struct srt_stats_head {
+    int64_t ms, sent, recv;
+    int snd_loss, rcv_loss, retrans, sent_ack, recv_ack, sent_nak, recv_nak;
+    int64_t snd_duration;
+    int snd_drop, rcv_drop, rcv_undecrypt;
+};
+
+/* An SRT socket for u, not blocking: options both ends must agree on, set before connecting. -1 on failure. */
+static int srt_socket(const struct srt_url *u)
+{
+    int s = srt.create_socket();
+    if (s < 0)
+        return -1;
+    bool no = false;
+    int ms = 3000;
+    if (srt.setsockflag(s, SRTO_RCVSYN, &no, sizeof no) < 0 ||
+        srt.setsockflag(s, SRTO_CONNTIMEO, &ms, sizeof ms) < 0 ||
+        (u->latency >= 0 && srt.setsockflag(s, SRTO_LATENCY, &u->latency, sizeof u->latency) < 0) ||
+        (*u->passphrase && srt.setsockflag(s, SRTO_PASSPHRASE, u->passphrase, (int)strlen(u->passphrase)) < 0) ||
+        (*u->streamid && !u->listen &&
+         srt.setsockflag(s, SRTO_STREAMID, u->streamid, (int)strlen(u->streamid)) < 0)) {
+        srt.close(s);
+        return -1;
+    }
+    return s;
+}
+
+/* Why a call failed: the sender's rejection (wrong passphrase...), else the last error. */
+static const char *srt_why(int s)
+{
+    int r = srt.getrejectreason ? srt.getrejectreason(s) : 0;
+    if (r == 6) /* SRT_REJ_BADSECRET */
+        return "wrong or missing passphrase";
+    if (r == 13) /* SRT_REJ_UNSECURE */
+        return "a passphrase is needed on both ends, or neither";
+    if (r > 1 && srt.rejectreason_str)
+        return srt.rejectreason_str(r);
+    return srt.getlasterror_str();
+}
+
+/* A transport stream (ISO 13818-1), as far as needed here: PAT, PMT and SDT; one H.264 and one audio
+ * elementary stream. */
+enum { TS_NONE, TS_VIDEO, TS_VIDEO_AGAIN, TS_AUDIO, TS_AUDIO_AGAIN }; /* AGAIN: pass the same packet again */
+enum { TA_NONE, TA_S302M, TA_AAC, TA_OTHER };
+
+struct ts_pes {
+    int pid;            /* -1: none */
+    uint8_t cc;
+    bool cc_known;
+    bool on;            /* in a PES packet */
+    size_t want, got;   /* its payload bytes (want 0: until the next one starts) */
+    int64_t pts;        /* 90 kHz, of the PES being put together; -1 = none */
+};
+
+struct ts_demux {
+    int pmt_pid;
+    struct ts_pes v, a;
+    int video_type, audio_type; /* the PMT's stream_type; TA_ */
+    char audio_name[24];
+    bool pindi;                 /* the SDT names PiNDI as provider: PTS are capture times (UTC) */
+    char service[64];
+    uint8_t *abuf;              /* the audio PES being put together */
+    size_t alen;
+    int64_t done_pts;           /* the PTS of the PES just completed */
+    uint64_t cc_errors;
+    uint8_t part[188];          /* a packet split between messages */
+    size_t part_n;
+};
+
+static void ts_reset(struct ts_demux *t)
+{
+    t->v.on = t->a.on = t->v.cc_known = t->a.cc_known = false;
+    t->part_n = 0;
+}
+
+static int64_t ts_pts(const uint8_t *p)
+{
+    return (int64_t)(p[0] >> 1 & 7) << 30 | (int64_t)p[1] << 22 | (int64_t)(p[2] >> 1) << 15 | (int64_t)p[3] << 7 |
+           p[4] >> 1;
+}
+
+/* A PSI section from a packet's payload (pointer field first); its length up to the CRC, 0 if it isn't
+ * table tid or doesn't fit the packet (PiNDI's and most encoders' sections fit one). */
+static size_t ts_section(const uint8_t *pl, size_t n, int tid, const uint8_t **sec)
+{
+    if (!n || (size_t)pl[0] + 1 + 3 > n)
+        return 0;
+    const uint8_t *s = pl + 1 + pl[0];
+    size_t len = (size_t)(s[1] & 0x0f) << 8 | s[2];
+    if (s[0] != tid || len < 9 || s + 3 + len > pl + n)
+        return 0;
+    *sec = s;
+    return 3 + len - 4;
+}
+
+static void ts_psi(struct ts_demux *t, int pid, const uint8_t *pl, size_t n)
+{
+    const uint8_t *s;
+    size_t len;
+    if (pid == 0 && (len = ts_section(pl, n, 0x00, &s))) {
+        for (size_t i = 8; i + 4 <= len; i += 4) {
+            int prog = s[i] << 8 | s[i + 1], pmt = (s[i + 2] & 0x1f) << 8 | s[i + 3];
+            if (prog) { /* the first program */
+                if (pmt != t->pmt_pid)
+                    t->v.pid = t->a.pid = -1;
+                t->pmt_pid = pmt;
+                break;
+            }
+        }
+    } else if (pid == t->pmt_pid && (len = ts_section(pl, n, 0x02, &s)) && len >= 12) {
+        int vpid = -1, apid = -1, vtype = 0, atype = TA_NONE, rank = 0;
+        const char *aname = "";
+        for (size_t i = 12 + ((size_t)(s[10] & 0x0f) << 8 | s[11]); i + 5 <= len;) {
+            int type = s[i], epid = (s[i + 1] & 0x1f) << 8 | s[i + 2];
+            size_t il = (size_t)(s[i + 3] & 0x0f) << 8 | s[i + 4];
+            const uint8_t *d = s + i + 5;
+            bool bssd = false, ac3 = type == 0x81;
+            for (size_t k = 0; k + 2 <= il && i + 5 + k + 2 + d[k + 1] <= len; k += 2 + d[k + 1]) {
+                bssd |= d[k] == 0x05 && d[k + 1] >= 4 && !memcmp(d + k + 2, "BSSD", 4);
+                ac3 |= d[k] == 0x6a || d[k] == 0x7a; /* AC-3, E-AC-3 */
+            }
+            if (vpid < 0 && type == 0x1b) { /* H.264 */
+                vpid = epid;
+                vtype = type;
+            } else if (vpid < 0 && !vtype && (type == 0x24 || type == 0x02 || type == 0x10)) {
+                vtype = type; /* HEVC, MPEG-2, MPEG-4 video: said not to play */
+            }
+            /* Audio: 302M, else AAC, else whatever there is (said not to play). */
+            int r = bssd ? 3 : type == 0x0f ? 2 : ac3 || type == 0x03 || type == 0x04 || type == 0x11 ? 1 : 0;
+            if (r > rank) {
+                rank = r;
+                apid = epid;
+                atype = r == 3 ? TA_S302M : r == 2 ? TA_AAC : TA_OTHER;
+                aname = ac3 ? "AC-3" : type == 0x11 ? "AAC (LATM)" : r == 1 ? "MPEG audio" : "";
+            }
+            i += 5 + il;
+        }
+        if (vpid != t->v.pid) {
+            t->v.pid = vpid;
+            t->v.on = t->v.cc_known = false;
+        }
+        if (apid != t->a.pid) {
+            t->a.pid = apid;
+            t->a.on = t->a.cc_known = false;
+        }
+        t->video_type = vtype;
+        t->audio_type = atype;
+        snprintf(t->audio_name, sizeof t->audio_name, "%s", aname);
+    } else if (pid == 0x11 && (len = ts_section(pl, n, 0x42, &s))) {
+        for (size_t i = 11; i + 5 <= len;) { /* services */
+            size_t dl = (size_t)(s[i + 3] & 0x0f) << 8 | s[i + 4];
+            for (size_t k = i + 5; k + 2 <= i + 5 + dl && k + 2 + s[k + 1] <= len; k += 2 + s[k + 1]) {
+                if (s[k] != 0x48 || s[k + 1] < 3)
+                    continue;
+                size_t pl_ = s[k + 3], nl = k + 4 + pl_ < len ? s[k + 4 + pl_] : 0;
+                if (4 + pl_ + 1 + nl > (size_t)s[k + 1] + 2)
+                    continue;
+                t->pindi = pl_ == 5 && !memcmp(s + k + 4, "PiNDI", 5);
+                snprintf(t->service, sizeof t->service, "%.*s", (int)nl, (const char *)s + k + 5 + pl_);
+                return;
+            }
+            i += 5 + dl;
+        }
+    }
+}
+
+/* A complete H.264 PES: what depack_nal notes of each NAL unit, then whether it is worth decoding. */
+static bool ts_video_done(struct rtp_depack *dp)
+{
+    const uint8_t *d = dp->au;
+    size_t len = dp->len, i = 0;
+    while (i + 3 < len) {
+        while (i + 3 < len && !(d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1))
+            i++;
+        if (i + 3 >= len)
+            break;
+        size_t s = i + 3, e = s;
+        while (e + 3 <= len && !(d[e] == 0 && d[e + 1] == 0 && d[e + 2] == 1))
+            e++;
+        if (e + 3 > len)
+            e = len;
+        i = e;
+        while (e > s && d[e - 1] == 0)
+            e--;
+        if (e == s)
+            continue;
+        int type = d[s] & 0x1f;
+        size_t n = e - s;
+        dp->key |= type == 5;
+        if (type == 7 && n <= sizeof dp->sps) {
+            if (n != dp->sps_len || memcmp(dp->sps, d + s, n))
+                dp->new_sps = true;
+            memcpy(dp->sps, d + s, n);
+            dp->sps_len = n;
+            dp->has_ps = dp->pps_len > 0;
+        } else if (type == 8 && n <= sizeof dp->pps) {
+            memcpy(dp->pps, d + s, n);
+            dp->pps_len = n;
+            dp->has_ps = dp->sps_len > 0;
+        }
+    }
+    return depack_finish(dp);
+}
+
+/* One TS packet. TS_VIDEO: a picture is ready in dp (until the next call); TS_AUDIO: an audio PES in
+ * t->abuf / t->alen; both with t->done_pts. */
+static int ts_packet(struct ts_demux *t, struct rtp_depack *dp, const uint8_t *p)
+{
+    if (p[0] != 0x47 || (p[1] & 0x80)) /* not a packet; transport error */
+        return TS_NONE;
+    bool pusi = p[1] & 0x40;
+    int pid = (p[1] & 0x1f) << 8 | p[2], afc = p[3] >> 4 & 3;
+    size_t off = 4;
+    bool disc = false;
+    if (afc & 2) {
+        off += 1 + (size_t)p[4];
+        disc = p[4] && (p[5] & 0x80); /* the sender says the counter jumps */
+    }
+    if (!(afc & 1) || off >= 188)
+        return TS_NONE;
+    const uint8_t *pl = p + off;
+    size_t n = 188 - off;
+    if (pid == 0 || pid == 0x11 || pid == t->pmt_pid) {
+        if (pusi)
+            ts_psi(t, pid, pl, n);
+        return TS_NONE;
+    }
+    bool video = pid == t->v.pid;
+    struct ts_pes *s = video ? &t->v : pid == t->a.pid ? &t->a : NULL;
+    if (!s)
+        return TS_NONE;
+    uint8_t cc = p[3] & 15;
+    if (s->cc_known && cc == s->cc && !disc)
+        return TS_NONE; /* sent twice */
+    bool gap = s->cc_known && cc != ((s->cc + 1) & 15) && !disc;
+    if (pusi && s->on) { /* the previous PES ends here */
+        s->on = false;
+        t->done_pts = s->pts;
+        if (video) {
+            if (gap || s->want)
+                dp->broken = true; /* its end is missing */
+            if (ts_video_done(dp))
+                return TS_VIDEO_AGAIN;
+        } else if (!gap && !s->want) {
+            return TS_AUDIO_AGAIN;
+        }
+    }
+    s->cc = cc;
+    s->cc_known = true;
+    if (gap) {
+        t->cc_errors++;
+        if (video) {
+            dp->broken |= s->on;
+            dp->resync = true;
+        } else {
+            s->on = false;
+        }
+    }
+    if (pusi) {
+        if (n < 9 || pl[0] || pl[1] || pl[2] != 1 || (size_t)9 + pl[8] > n)
+            return TS_NONE;
+        size_t plen = (size_t)pl[4] << 8 | pl[5], hl = 9 + (size_t)pl[8];
+        s->pts = (pl[7] & 0x80) && pl[8] >= 5 ? ts_pts(pl + 9) : -1;
+        s->want = plen ? (plen + 6 > hl ? plen + 6 - hl : 0) : 0;
+        if (plen && !s->want)
+            return TS_NONE;
+        s->got = 0;
+        s->on = true;
+        if (video)
+            depack_restart(dp);
+        else
+            t->alen = 0;
+        pl += hl;
+        n -= hl;
+    }
+    if (!s->on)
+        return TS_NONE;
+    if (s->want && s->got + n > s->want)
+        n = s->want - s->got;
+    if (video) {
+        depack_append(dp, pl, n, NULL, 0);
+    } else if (t->alen + n <= TS_PES_MAX) {
+        memcpy(t->abuf + t->alen, pl, n);
+        t->alen += n;
+    } else {
+        s->on = false;
+        return TS_NONE;
+    }
+    s->got += n;
+    if (s->want && s->got >= s->want) {
+        s->on = false;
+        t->done_pts = s->pts;
+        return video ? (ts_video_done(dp) ? TS_VIDEO : TS_NONE) : TS_AUDIO;
+    }
+    return TS_NONE;
+}
+
+static uint8_t rev8(uint8_t b)
+{
+    b = (uint8_t)((b & 0xf0) >> 4 | (b & 0x0f) << 4);
+    b = (uint8_t)((b & 0xcc) >> 2 | (b & 0x33) << 2);
+    return (uint8_t)((b & 0xaa) >> 1 | (b & 0x55) << 1);
+}
+
+/* SMPTE 302M (AES3 in a transport stream: 2 to 8 channels of 16, 20 or 24 bits, bit-reversed) to planar
+ * float, cap frames per channel: the frames decoded, *ch the channels. */
+static int s302m_decode(const uint8_t *p, size_t n, float *out, size_t cap, int *ch)
+{
+    if (n < 4)
+        return 0;
+    uint32_t h = get32(p);
+    size_t size = h >> 16;
+    int c = (int)(h >> 14 & 3) * 2 + 2, bits = (int)(h >> 4 & 3) * 4 + 16;
+    if (size + 4 > n || bits > 24)
+        return 0;
+    size_t block = bits == 16 ? 5 : bits == 20 ? 6 : 7, pairs = (size_t)c / 2; /* bytes per channel pair */
+    size_t frames = size / (block * pairs);
+    if (frames > cap)
+        frames = cap;
+    p += 4;
+    for (size_t f = 0; f < frames; f++)
+        for (size_t k = 0; k < pairs; k++, p += block) {
+            uint32_t a, b; /* left-aligned in 32 bits */
+            if (bits == 16) {
+                a = (uint32_t)(rev8(p[1]) << 8 | rev8(p[0])) << 16;
+                b = (uint32_t)(rev8(p[4] & 0xf0) << 12 | rev8(p[3]) << 4 | rev8(p[2]) >> 4) << 16;
+            } else if (bits == 20) {
+                a = (uint32_t)rev8(p[2] & 0xf0) << 28 | (uint32_t)rev8(p[1]) << 20 | (uint32_t)rev8(p[0]) << 12;
+                b = (uint32_t)rev8(p[5] & 0xf0) << 28 | (uint32_t)rev8(p[4]) << 20 | (uint32_t)rev8(p[3]) << 12;
+            } else {
+                a = (uint32_t)rev8(p[2]) << 24 | (uint32_t)rev8(p[1]) << 16 | (uint32_t)rev8(p[0]) << 8;
+                b = (uint32_t)rev8(p[6] & 0xf0) << 28 | (uint32_t)rev8(p[5]) << 20 | (uint32_t)rev8(p[4]) << 12 |
+                    (uint32_t)rev8(p[3] & 0x0f) << 4;
+            }
+            out[k * 2 * cap + f] = (float)(int32_t)a / 2147483648.0f;
+            out[(k * 2 + 1) * cap + f] = (float)(int32_t)b / 2147483648.0f;
+        }
+    *ch = c;
+    return (int)frames;
+}
+
+/* AAC (ADTS) through libavcodec, when it is there. */
+struct adec { void *ctx, *pkt, *frm; bool tried; };
+
+static void adec_close(struct adec *a)
+{
+    if (a->ctx)
+        av.free_context(&a->ctx);
+    if (a->pkt)
+        av.packet_free(&a->pkt);
+    if (a->frm)
+        av.frame_free(&a->frm);
+    memset(a, 0, sizeof *a);
+}
+
+static bool adec_open(struct adec *a)
+{
+    if (a->tried)
+        return a->ctx != NULL;
+    a->tried = true;
+    if (!av_load())
+        return false;
+    const void *codec = av.find_decoder(0x15002); /* AV_CODEC_ID_AAC */
+    a->ctx = codec ? av.alloc_context(codec) : NULL;
+    a->pkt = av.packet_alloc();
+    a->frm = av.frame_alloc();
+    if (!a->ctx || !a->pkt || !a->frm || av.open(a->ctx, codec, NULL) < 0) {
+        adec_close(a);
+        a->tried = true;
+        return false;
+    }
+    return true;
+}
+
+/* ADTS frames to planar float: frames per channel decoded, *ch and *rate from the headers. */
+static int adec_decode(struct adec *a, uint8_t *p, size_t n, float *out, size_t cap, int *ch, int *rate)
+{
+    static const int rates[] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000 };
+    size_t got = 0;
+    while (n >= 7 && p[0] == 0xff && (p[1] & 0xf6) == 0xf0) {
+        size_t fl = (size_t)(p[3] & 3) << 11 | (size_t)p[4] << 3 | p[5] >> 5;
+        int ri = p[2] >> 2 & 15, cfg = (p[2] & 1) << 2 | p[3] >> 6;
+        if (fl < 7 || fl > n || ri >= 12 || !cfg)
+            break;
+        int c = cfg == 7 ? 8 : cfg;
+        if (got && (c != *ch || rates[ri] != *rate))
+            break; /* the format changed: the rest is lost (it hardly ever does) */
+        *ch = c;
+        *rate = rates[ri];
+        struct av_packet_head *pk = a->pkt;
+        pk->data = p;
+        pk->size = (int)fl;
+        if (av.send_packet(a->ctx, a->pkt) >= 0)
+            while (av.receive_frame(a->ctx, a->frm) == 0) {
+                const struct av_frame_head *f = a->frm;
+                if (f->format != 8 /* AV_SAMPLE_FMT_FLTP */)
+                    continue;
+                size_t k = (size_t)f->nb_samples < cap - got ? (size_t)f->nb_samples : cap - got;
+                for (int i = 0; i < c && i < 8; i++)
+                    memcpy(out + (size_t)i * cap + got, f->data[i], k * sizeof(float));
+                got += k;
+            }
+        p += fl;
+        n -= fl;
+    }
+    return (int)got;
+}
+
+/* A PiNDI sender's PTS (its capture time: UTC, 90 kHz, modulo 2^33) as 100 ns UTC; INT64_MAX if the
+ * clocks are more than a minute apart. */
+static int64_t ts_utc(int64_t pts)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 10000000 + ts.tv_nsec / 100;
+    int64_t d = (now * 9 / 1000 - pts) & 0x1ffffffffLL;
+    if (d >= 1LL << 32)
+        d -= 1LL << 33; /* a little ahead: the clocks differ */
+    if (d < -90000 * 60 || d > 90000 * 60)
+        return INT64_MAX;
+    return now - d * 1000 / 9;
+}
+
+/* What an output receiving SRT has. */
+struct srt_rx {
+    struct output *o;
+    struct h264_rx r;
+    struct ts_demux t;
+    struct adec aac;
+    const char *src;
+    char from[64], vid[64];
+    bool audio_on, got, audio_said;
+    uint64_t start, last_video, pictures, fps_pictures, splash_at;
+    float *abuf;
+    int64_t a_pts, a_last; /* audio PTS, unwrapped */
+    bool a_known;
+};
+
+static void srt_audio(struct srt_rx *x)
+{
+    struct output *o = x->o;
+    struct ts_demux *t = &x->t;
+    int ch = 2, rate = 48000, frames = 0;
+    if (t->audio_type == TA_S302M) {
+        frames = s302m_decode(t->abuf, t->alen, x->abuf, SRT_ACAP, &ch);
+    } else if (t->audio_type == TA_AAC && adec_open(&x->aac)) {
+        frames = adec_decode(&x->aac, t->abuf, t->alen, x->abuf, SRT_ACAP, &ch, &rate);
+    } else if (!x->audio_said) {
+        x->audio_said = true;
+        LOG("srt: output %d: %s audio cannot be played here%s", o->n,
+            t->audio_type == TA_AAC ? "AAC" : *t->audio_name ? t->audio_name : "this",
+            t->audio_type == TA_AAC ? " (it needs libavcodec)" : "");
+        audio_info(o, "%s audio: not supported", t->audio_type == TA_AAC ? "AAC" : t->audio_name);
+    }
+    if (frames <= 0)
+        return;
+    if (t->done_pts >= 0) {
+        x->a_pts += x->a_known ? ((t->done_pts - x->a_last + (1LL << 32)) & 0x1ffffffffLL) - (1LL << 32) : 0;
+        x->a_last = t->done_pts;
+        x->a_known = true;
+    }
+    NDIlib_audio_frame_v3_t a = {
+        .sample_rate = rate, .no_channels = ch, .no_samples = frames, .timestamp = x->a_pts * 1000 / 9,
+        .FourCC = NDIlib_FourCC_audio_type_FLTP, .p_data = (uint8_t *)x->abuf,
+        .channel_stride_in_bytes = (int)(SRT_ACAP * sizeof(float)),
+    };
+    audio_play(o, &a);
+    share_audio(o, &a);
+}
+
+/* One TS packet through the demuxer, and what it completes on to the decoder or the speakers. */
+static void srt_ts(struct srt_rx *x, const uint8_t *p, uint64_t recv_us, uint64_t now)
+{
+    struct output *o = x->o;
+    int res;
+    while ((res = ts_packet(&x->t, &x->r.dp, p)) != TS_NONE) {
+        if (res == TS_AUDIO || res == TS_AUDIO_AGAIN) {
+            if (x->audio_on)
+                srt_audio(x);
+        } else {
+            x->last_video = now;
+            int64_t sent = x->t.pindi && x->t.done_pts >= 0 ? ts_utc(x->t.done_pts) : INT64_MAX;
+            bool shown;
+            if (h264_picture(o, &x->r, "H.264 SRT", "srt", x->src, x->from, x->vid, sizeof x->vid, sent, recv_us,
+                             &shown)) {
+                x->pictures++;
+                x->fps_pictures++;
+                if (!x->got)
+                    LOG("srt: output %d: first picture after %llu ms%s%s", o->n,
+                        (unsigned long long)(now - x->start), *x->t.service ? ", from " : "", x->t.service);
+                x->got = true;
+                x->splash_at = 0;
+                status_set(o, shown ? "playing" : "cannot display (format)", x->src, x->from, x->vid);
+            } else {
+                status_set(o, "cannot decode H.264 here", x->src, x->from, "");
+            }
+        }
+        if (res == TS_VIDEO || res == TS_AUDIO)
+            break;
+    }
+}
+
+/* An SRT message: its TS packets (one cut between messages is put back together). */
+static void srt_message(struct srt_rx *x, const uint8_t *m, size_t n, uint64_t recv_us, uint64_t now)
+{
+    struct ts_demux *t = &x->t;
+    size_t at = 0;
+    if (t->part_n) {
+        size_t k = 188 - t->part_n < n ? 188 - t->part_n : n;
+        memcpy(t->part + t->part_n, m, k);
+        t->part_n += k;
+        at = k;
+        if (t->part_n < 188)
+            return;
+        srt_ts(x, t->part, recv_us, now);
+        t->part_n = 0;
+    }
+    while (at < n) {
+        if (m[at] != 0x47) {
+            at++; /* find the next packet */
+        } else if (at + 188 <= n) {
+            srt_ts(x, m + at, recv_us, now);
+            at += 188;
+        } else {
+            memcpy(t->part, m + at, n - at);
+            t->part_n = n - at;
+            break;
+        }
+    }
+}
+
+/* Receive the output's SRT stream until it is switched (returns switch_poll's result), or the display goes
+ * away (0). splash_at: the previous stream's picture stays up until then, or the first frame. */
+static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instance_t find, bool audio_on,
+                    int stats_ms, uint64_t splash_at)
+{
+    char src[200];
+    stream_shown(o->target, src, sizeof src);
+    struct srt_url u;
+    const char *err;
+    bool url_ok = srt_parse(o->target, &u, &err), lib_ok = url_ok && srt_load();
+    int ret = 0;
+    if (!url_ok || !lib_ok) { /* nothing to do until the stream is switched */
+        if (!url_ok)
+            LOG("srt: output %d: \"%s\": %s", o->n, src, err);
+        status_set(o, url_ok ? "cannot receive SRT: libsrt is not installed" : "cannot use this SRT address", src,
+                   "", "");
+        while (running && !ret) {
+            pthread_mutex_lock(&o->lock);
+            bool usable = o->usable;
+            pthread_mutex_unlock(&o->lock);
+            if (!usable)
+                break;
+            ret = switch_poll(o, switch_seen);
+            usleep(300000);
+        }
+        return ret;
+    }
+    static struct srt_rx zero;
+    struct srt_rx *x = malloc(sizeof *x);
+    uint8_t *msg = malloc(1500);
+    if (x) {
+        *x = zero;
+        x->r.vfd = x->r.cfd = x->r.afd = -1;
+        x->r.hw.fd = -1;
+        x->r.dp.buf = malloc(RTP_HEADROOM + RTP_MAX_AU + RTP_PAD);
+        x->r.dp.au = x->r.dp.buf + RTP_HEADROOM;
+        x->r.dp.resync = true; /* from the first keyframe */
+        x->t.abuf = malloc(TS_PES_MAX);
+        x->abuf = malloc(SRT_ACAP * 8 * sizeof(float));
+        x->t.pmt_pid = x->t.v.pid = x->t.a.pid = -1;
+        x->o = o;
+        x->src = src;
+        x->audio_on = audio_on;
+        x->splash_at = splash_at;
+        x->start = now_ms();
+    }
+    int sock = -1, lsock = -1, eid = srt.epoll_create(), in_eid = 0;
+    bool connected = false, warned = false;
+    uint64_t next_try = 0, connect_at = 0, last_switch = 0, last_sources = 0, last_fps = 0, last_stats = now_ms(),
+             stat_pictures = 0, stat_bytes = 0;
+    struct srt_stats_head prev = { 0 };
+    LOG("srt: output %d: %s %s", o->n, u.listen ? "listening at" : "calling", src);
+    status_set(o, "searching", "", "", "");
+    while (running && x && msg && x->r.dp.buf && x->t.abuf && x->abuf && eid >= 0) {
+        uint64_t now = now_ms();
+        pthread_mutex_lock(&o->lock);
+        bool usable = o->usable;
+        pthread_mutex_unlock(&o->lock);
+        if (!usable)
+            break;
+        if (now - last_switch >= 300) {
+            last_switch = now;
+            if ((ret = switch_poll(o, switch_seen)))
+                break;
+        }
+        if (find && o->n == 1 && now - last_sources >= 2000) {
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            sources_publish(srcs, count);
+            last_sources = now;
+        }
+        if (x->splash_at && !x->got && now >= x->splash_at) {
+            request_splash(o);
+            x->splash_at = 0;
+        }
+
+        /* The connection: call the sender (again a second after a failure), or wait for it to call. */
+        if (sock < 0 && lsock < 0 && now >= next_try) {
+            if (u.listen) {
+                struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)u.port) };
+                lsock = srt_socket(&u);
+                if (lsock >= 0 && !srt.bind(lsock, (struct sockaddr *)&a, sizeof a) && !srt.listen(lsock, 1)) {
+                    int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR;
+                    srt.epoll_add_usock(eid, lsock, &ev);
+                    in_eid++;
+                    status_set(o, "searching", "", "", "");
+                    warned = false;
+                } else {
+                    char st[96];
+                    snprintf(st, sizeof st, "cannot receive on port %d", u.port);
+                    if (!warned)
+                        LOG("srt: output %d: %s: %s (trying again)", o->n, st, srt.getlasterror_str());
+                    warned = true;
+                    status_set(o, st, src, "", "");
+                    if (lsock >= 0)
+                        srt.close(lsock);
+                    lsock = -1;
+                    next_try = now + 2000;
+                }
+            } else {
+                struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *ai = NULL;
+                char port[8];
+                snprintf(port, sizeof port, "%d", u.port);
+                next_try = now + 1000;
+                if (getaddrinfo(u.host, port, &hints, &ai) || !ai) {
+                    char ip[64];
+                    read_ip(ip, sizeof ip);
+                    status_set(o, strcmp(ip, "no network") ? "cannot find the sender's address" : "waiting for network",
+                               src, "", "");
+                } else if ((sock = srt_socket(&u)) >= 0 && srt.connect(sock, ai->ai_addr, (int)ai->ai_addrlen) >= 0) {
+                    int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR;
+                    srt.epoll_add_usock(eid, sock, &ev);
+                    in_eid++;
+                    connect_at = now;
+                    char ip[INET_ADDRSTRLEN] = "";
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, ip, sizeof ip);
+                    snprintf(x->from, sizeof x->from, "%s:%d", ip, u.port);
+                    if (!x->got)
+                        status_set(o, "connecting", src, x->from, "");
+                } else if (sock >= 0) {
+                    srt.close(sock);
+                    sock = -1;
+                }
+                if (ai)
+                    freeaddrinfo(ai);
+            }
+        }
+        if (lsock >= 0 && sock < 0) {
+            struct sockaddr_in a;
+            int al = sizeof a;
+            int c = srt.accept(lsock, (struct sockaddr *)&a, &al);
+            if (c >= 0) {
+                char ip[INET_ADDRSTRLEN] = "";
+                inet_ntop(AF_INET, &a.sin_addr, ip, sizeof ip);
+                if (!rtp_from_ok(o, &a)) {
+                    LOG("srt: output %d: refused %s (not the source IP %s)", o->n, ip, o->source_ip);
+                    srt.close(c);
+                } else {
+                    sock = c;
+                    int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR;
+                    srt.epoll_add_usock(eid, sock, &ev);
+                    in_eid++;
+                    connected = true;
+                    snprintf(x->from, sizeof x->from, "%s:%d", ip, ntohs(a.sin_port));
+                    LOG("srt: output %d: %s connected", o->n, x->from);
+                    if (!x->got)
+                        status_set(o, "connecting", src, x->from, "");
+                    memset(&prev, 0, sizeof prev);
+                }
+            }
+        }
+        if (sock >= 0 && !connected) {
+            int st = srt.getsockstate(sock);
+            if (st == SRTS_CONNECTED) {
+                connected = true;
+                warned = false;
+                memset(&prev, 0, sizeof prev);
+                LOG("srt: output %d: connected to %s", o->n, x->from);
+            } else if (st > SRTS_CONNECTED || now - connect_at > 5000) {
+                char why[96];
+                snprintf(why, sizeof why, "%s", srt_why(sock));
+                if (!warned)
+                    LOG("srt: output %d: cannot connect to %s: %s (trying again)", o->n, x->from, why);
+                warned = true;
+                srt.close(sock);
+                sock = -1;
+                in_eid--;
+                char state[160];
+                snprintf(state, sizeof state, "cannot connect: %s", why);
+                if (!x->got)
+                    status_set(o, state, src, x->from, "");
+            }
+        }
+
+        int rd[4], rn = 4;
+        int wait = x->r.hw_on && x->r.hw.fed > x->r.hw.decoded ? 4 : 20;
+        if (in_eid > 0)
+            srt.epoll_wait(eid, rd, &rn, NULL, NULL, wait, NULL, NULL, NULL, NULL);
+        else
+            usleep((useconds_t)wait * 1000);
+        uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
+        now = now_ms();
+
+        for (int k = 0; k < 256 && connected; k++) { /* everything waiting, before decoding anything */
+            int n = srt.recvmsg(sock, (char *)msg, 1500);
+            if (n > 0) {
+                stat_bytes += (uint64_t)n;
+                srt_message(x, msg, (size_t)n, recv_us, now);
+                continue;
+            }
+            /* Nothing waiting, else the connection is gone (a sender that is gone stops its keepalives:
+             * broken after SRT's peer idle timeout, 5 s). */
+            if (n < 0 && srt.getlasterror(NULL) / 1000 == 6)
+                break;
+            LOG("srt: output %d: %s disconnected", o->n, x->from);
+            srt.close(sock);
+            sock = -1;
+            in_eid--;
+            connected = false;
+            ts_reset(&x->t);
+            x->r.dp.resync = true;
+            next_try = u.listen ? now : now + 1000;
+            break;
+        }
+        if (x->r.hw_on)
+            hwdec_poll(o, &x->r.hw, 0);
+        if (audio_on && x->got && o->au.last_frame + 3000 < now && now - x->start > 3000 && o->au.pcm) {
+            audio_close(o);
+            audio_info(o, "no audio in this stream");
+        }
+        if (connected && x->t.v.pid < 0 && x->t.video_type && !x->got) {
+            char st[64];
+            snprintf(st, sizeof st, "cannot decode %s here",
+                     x->t.video_type == 0x24 ? "HEVC (H.265)" : x->t.video_type == 0x10 ? "MPEG-4 video" : "MPEG-2 video");
+            status_set(o, st, src, x->from, "");
+        }
+
+        if (now - last_fps >= 2000) { /* the frame rate as received */
+            if (last_fps)
+                snprintf(x->vid, sizeof x->vid, "%dx%d %.2f fps", x->r.w, x->r.h,
+                         x->fps_pictures * 1000.0 / (double)(now - last_fps));
+            x->fps_pictures = 0;
+            last_fps = now;
+            pthread_mutex_lock(&share_mu);
+            snprintf(o->share_url, sizeof o->share_url, "%s", x->from);
+            snprintf(o->share_video, sizeof o->share_video, "%s", x->vid);
+            pthread_mutex_unlock(&share_mu);
+        }
+        if (x->got && now - x->last_video > RTP_LOST_MS) {
+            LOG("srt: output %d: lost %s", o->n, src);
+            x->got = false;
+            x->r.dp.resync = true;
+            x->r.hw.need_key = true;
+            request_splash(o);
+            audio_close(o);
+            if (audio_on)
+                audio_info(o, "");
+            status_set(o, "searching", "", "", "");
+        }
+        if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
+            union { struct srt_stats_head h; uint8_t all[2048]; } st = { 0 };
+            if (connected && srt.bstats(sock, &st, 0) >= 0) {
+                LOG("srt: output %d: %.1f Mbit/s, %d packets lost, %d resent, %d too late, %llu TS gaps, "
+                    "%llu pictures in %.0f s%s", o->n, stat_bytes * 8 / 1e3 / (double)(now - last_stats),
+                    st.h.rcv_loss - prev.rcv_loss, st.h.retrans - prev.retrans, st.h.rcv_drop - prev.rcv_drop,
+                    (unsigned long long)x->t.cc_errors, (unsigned long long)(x->pictures - stat_pictures),
+                    (now - last_stats) / 1000.0,
+                    (x->r.hw_on && x->r.hw.need_key) || x->r.dp.resync ? ", waiting for a keyframe" : "");
+                prev = st.h;
+            }
+            x->t.cc_errors = 0;
+            stat_bytes = 0;
+            stat_pictures = x->pictures;
+            last_stats = now;
+        }
+    }
+    if (sock >= 0)
+        srt.close(sock);
+    if (lsock >= 0)
+        srt.close(lsock);
+    if (eid >= 0)
+        srt.epoll_release(eid);
+    if (x) {
+        h264_rx_close(o, &x->r);
+        adec_close(&x->aac);
+        free(x->r.dp.buf);
+        free(x->t.abuf);
+        free(x->abuf);
+    }
+    audio_close(o);
+    free(x);
+    free(msg);
+    return ret;
+}
+
+/* Display in standby with an SRT stream: is the sender there? One try (about a second): wakes the
+ * display when it is. */
+static bool srt_probe(struct output *o)
+{
+    struct srt_url u;
+    const char *err;
+    if (!srt_parse(o->target, &u, &err) || !srt_load()) {
+        usleep(500000);
+        return false;
+    }
+    bool found = false;
+    int s = srt_socket(&u), eid = srt.epoll_create(), c = -1;
+    int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR, rd[2], rn = 2;
+    if (s >= 0 && eid >= 0) {
+        if (u.listen) {
+            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)u.port) };
+            if (!srt.bind(s, (struct sockaddr *)&a, sizeof a) && !srt.listen(s, 1)) {
+                srt.epoll_add_usock(eid, s, &ev);
+                struct sockaddr_in from;
+                int fl = sizeof from;
+                if (srt.epoll_wait(eid, rd, &rn, NULL, NULL, 1000, NULL, NULL, NULL, NULL) > 0 &&
+                    (c = srt.accept(s, (struct sockaddr *)&from, &fl)) >= 0)
+                    found = rtp_from_ok(o, &from);
+            }
+        } else {
+            struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *ai = NULL;
+            char port[8];
+            snprintf(port, sizeof port, "%d", u.port);
+            if (!getaddrinfo(u.host, port, &hints, &ai) && ai && srt.connect(s, ai->ai_addr, (int)ai->ai_addrlen) >= 0) {
+                for (int i = 0; i < 20 && srt.getsockstate(s) < SRTS_CONNECTED; i++)
+                    usleep(50000);
+                found = srt.getsockstate(s) == SRTS_CONNECTED;
+            }
+            if (ai)
+                freeaddrinfo(ai);
+        }
+    }
+    if (c >= 0)
+        srt.close(c);
+    if (s >= 0)
+        srt.close(s);
+    if (eid >= 0)
+        srt.epoll_release(eid);
+    if (!found)
+        usleep(500000);
+    return found;
 }
 
 static void *receiver(void *arg)
@@ -4062,10 +5122,21 @@ static void *receiver(void *arg)
         pthread_mutex_unlock(&o->lock);
         uint32_t rtp_group;
         int rtp_port;
-        bool rtp = rtp_url(o->target, &rtp_group, &rtp_port);
+        bool rtp = rtp_url(o->target, &rtp_group, &rtp_port), srt_ = !strncasecmp(o->target, "srt://", 6);
         if ((!standby || !rtp) && rtp_probe >= 0) {
             close(rtp_probe);
             rtp_probe = -1;
+        }
+        if (standby && srt_) { /* an SRT stream: wake as soon as its sender is there */
+            status_set(o, "standby (display off)", "", "", "");
+            if (srt_probe(o)) {
+                pthread_mutex_lock(&o->lock);
+                o->wake_request = true;
+                pthread_mutex_unlock(&o->lock);
+                wake();
+                usleep(500000);
+            }
+            continue;
         }
         if (standby && rtp) { /* an RTP stream: wake as soon as its packets arrive */
             if (rtp_probe < 0)
@@ -4255,18 +5326,21 @@ static void *receiver(void *arg)
             }
         }
 
-        if (!recv && rtp) { /* H.264 over RTP, not NDI */
+        if (!recv && (rtp || srt_)) { /* H.264 over RTP or SRT, not NDI */
             struct output *L = share_claim(o, o->target, "", -1);
             if (L) {
-                LOG("rtp: output %d: %s is already received by output %d, showing it from there (decoded once)",
-                    o->n, o->target, L->n);
+                char shown[sizeof o->target];
+                stream_shown(o->target, shown, sizeof shown);
+                LOG("%s: output %d: %s is already received by output %d, showing it from there (decoded once)",
+                    rtp ? "rtp" : "srt", o->n, shown, L->n);
                 following = true;
                 on_backup = false;
                 search_since = 0;
                 splash_at = 0;
                 continue;
             }
-            int sw = rtp_play(o, &switch_seen, find, audio_on, stats_ms, splash_at);
+            int sw = rtp ? rtp_play(o, &switch_seen, find, audio_on, stats_ms, splash_at)
+                         : srt_play(o, &switch_seen, find, audio_on, stats_ms, splash_at);
             share_release(o);
             now = now_ms();
             if (audio_on)
@@ -4667,11 +5741,14 @@ static void configure_output(struct output *o)
         o->audio_delay_ms = 1000;
     o->pacing = !strcmp(ocfg(o->n, "PACING", "fast"), "smooth"); /* experimental: off unless chosen */
     o->disabled = !strcmp(ocfg(o->n, "ENABLED", "1"), "0");
+    char shown[sizeof o->target];
+    stream_shown(o->target, shown, sizeof shown);
     if (o->disabled)
         LOG("output %d: disabled", o->n);
     else
-        LOG("output %d: looking for NDI stream %s from %s%s%s", o->n, o->target,
-            *o->source_ip ? o->source_ip : "any host", *o->backup ? ", backup " : "", o->backup);
+        LOG("output %d: looking for %s stream %s from %s%s%s", o->n,
+            !strncasecmp(o->target, "rtp://", 6) ? "H.264 RTP" : !strncasecmp(o->target, "srt://", 6) ? "SRT" : "NDI",
+            shown, *o->source_ip ? o->source_ip : "any host", *o->backup ? ", backup " : "", o->backup);
 }
 
 /* ------------------------------------------------------------------ preview for the web UI */
