@@ -88,6 +88,26 @@
         </form>
       </div>
 
+      <div class="card" id="updates-card">
+        <div class="card-head">
+          <h2>Updates from GitHub</h2>
+          <div class="controls">
+            <button type="button" id="check-updates" class="secondary">Check for updates</button>
+            <button type="button" id="update-manager" class="secondary">Update the manager</button>
+          </div>
+        </div>
+        <div id="updates-result"><p class="muted small">Finds the newest PiNDI agent release in the repository, to
+          install on the selected devices, and updates this manager from the repository's branch.</p></div>
+        <form id="repo-form" class="row update">
+          <label>Repository <input id="repo-url" size="44" autocomplete="off" spellcheck="false"></label>
+          <label>Branch <input id="repo-branch" size="12" autocomplete="off" spellcheck="false"></label>
+          <button class="secondary">Save</button>
+          <span class="muted small">Using a fork? Enter its GitHub address. Empty fields go back to the default.
+            Devices only install packages signed with the key they were installed with, so a fork's releases
+            suit devices installed from the fork.</span>
+        </form>
+      </div>
+
       <div class="card">
         <div class="card-head">
           <h2>Find Raspberry Pis</h2>

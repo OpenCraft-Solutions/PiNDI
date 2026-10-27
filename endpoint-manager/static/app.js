@@ -393,19 +393,129 @@ async function showLog(id) {
   }
 }
 
+// ------------------------------------------------------------------ updates from GitHub
+
+let updates = null; // settings and this manager's version (polled with the admin page)
+let latest = null; // the last "Check for updates" answer
+let repoEdited = false; // don't overwrite what is being typed
+
+function cmpVersion(a, b) {
+  const x = String(a || '').split('.').map(Number), y = String(b || '').split('.').map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+function renderUpdates() {
+  if (!updates) return;
+  if (!repoEdited) {
+    $('#repo-url').value = updates.settings.repo;
+    $('#repo-branch').value = updates.settings.branch;
+  }
+  $('#repo-url').placeholder = updates.settings.default_repo;
+  const loc = updates.local, g = loc.git, job = loc.job;
+  let html = `<p class="muted small">This manager: ${esc(loc.version)}, ` + (g ?
+    `git checkout on ${esc(g.branch)} at <code>${esc(g.head.slice(0, 7))}</code>${g.dirty ? ' with local changes' : ''}.` :
+    'not a git checkout: an update downloads the branch over its folder.') + '</p>';
+  if (latest) {
+    const a = latest.agent, m = latest.manager;
+    if (!a) html += '<p class="muted">The repository has no agent release with an update package.</p>';
+    else if (a.error) html += `<p class="error">Agent releases: ${esc(a.error)}</p>`;
+    else {
+      const older = devices.filter(d => d.status && cmpVersion(d.status.device.version, a.version) < 0).length;
+      html += `<p>Newest agent: <strong>${esc(a.version)}</strong> <span class="muted small">${esc(a.published.slice(0, 10))}</span> ` +
+        `<a href="${esc(a.url)}" target="_blank" rel="noopener">release notes</a> · ` +
+        `${older ? `${older} device(s) run an older version` : 'every device online has it (or newer)'} ` +
+        `<button type="button" class="small" id="install-release" data-tag="${esc(a.tag)}" data-version="${esc(a.version)}">` +
+        `Install ${esc(a.version)} on selected</button></p>`;
+    }
+    if (m.error) html += `<p class="error">Manager: ${esc(m.error)}</p>`;
+    else {
+      const state = { current: ['ok', 'up to date'], ahead: ['ok', 'this checkout is newer'],
+        behind: ['warn', 'update available'], unknown: ['', 'may differ'] }[m.state] || ['', ''];
+      html += `<p>Manager in the repository: <strong>${esc(m.version || '?')}</strong>, latest change ` +
+        `<code>${esc(m.commit.slice(0, 7))}</code> ${esc(m.message)} <span class="muted small">${esc(m.date.slice(0, 10))}</span> ` +
+        `<span class="badge ${state[0]}">${state[1]}</span></p>`;
+    }
+  }
+  if (job.state) {
+    const cls = { running: 'warn', restarting: 'warn', failed: 'bad', done: 'ok' }[job.state] || '';
+    html += `<p>Manager update: <span class="badge ${cls}">${esc(job.state)}</span> ` +
+      '<button type="button" class="link small" id="manager-log">log</button></p>';
+  }
+  $('#updates-result').innerHTML = html;
+  $('#update-manager').disabled = job.state === 'running' || job.state === 'restarting';
+}
+
+async function checkUpdates() {
+  const btn = $('#check-updates');
+  btn.disabled = true;
+  try {
+    latest = await api('POST', '/api/updates/check', {});
+    renderUpdates();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function installRelease(tag, version) {
+  const ids = [...selected];
+  if (!ids.length) return toast('Select the devices to update first.', true);
+  if (!confirm(`Download PiNDI ${version} from GitHub and install it on ${ids.length} device(s)? Each one reboots ` +
+    'when done (about 2 minutes); video stops meanwhile.')) return;
+  try {
+    await api('POST', '/api/updates/agent', { ids, tag, downgrade: $('#update-downgrade').checked,
+      user: $('#update-user').value, password: $('#update-password').value });
+    toast('Update started: progress shows in the table.');
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function updateManager() {
+  if (!confirm(`Update the manager from ${updates.settings.repo} (${updates.settings.branch}) and restart it? ` +
+    'Everyone signed in has to sign in again.')) return;
+  try {
+    await api('POST', '/api/updates/manager', {});
+  } catch (e) {
+    return toast(e.message, true);
+  }
+  const wait = setInterval(async () => {  // faster than the page poll; the restart signs everyone out
+    try {
+      updates = await api('GET', '/api/updates');
+      renderUpdates();
+      if (updates.local.job.state === 'restarting') {
+        clearInterval(wait);
+        toast('The manager is restarting: sign in again.');
+        setTimeout(() => location.reload(), 5000);
+      } else if (updates.local.job.state !== 'running') {
+        clearInterval(wait);
+        toast(updates.local.job.state === 'done' ? 'The manager is already up to date.' : 'The manager update failed: see its log.',
+          updates.local.job.state !== 'done');
+      }
+    } catch (e) {
+      clearInterval(wait);
+    }
+  }, 1500);
+}
+
 // ------------------------------------------------------------------ pages, polling, sign-in
 
 function render() {
   $$('header nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
   $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + page));
-  ({ monitor: renderMonitor, matrix: renderMatrix, admin: () => { renderAdmin(); renderDiscover(); } })[page]();
+  ({ monitor: renderMonitor, matrix: renderMatrix, admin: () => { renderAdmin(); renderDiscover(); renderUpdates(); } })[page]();
 }
 
 async function refresh() {
   const st = await api('GET', '/api/state');
   devices = st.devices;
   if (page === 'monitor') history = await api('GET', '/api/history');
-  if (page === 'admin') discover = await api('GET', '/api/discover');
+  if (page === 'admin') [discover, updates] = await Promise.all([api('GET', '/api/discover'), api('GET', '/api/updates')]);
   $('#updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
   render();
 }
@@ -536,6 +646,32 @@ $('#update-form').addEventListener('submit', async ev => {
     toast(e.message, true);
   } finally {
     btn.disabled = false;
+  }
+});
+
+$('#check-updates').addEventListener('click', checkUpdates);
+$('#update-manager').addEventListener('click', updateManager);
+$('#updates-result').addEventListener('click', ev => {
+  const b = ev.target.closest('button');
+  if (b && b.id === 'install-release') installRelease(b.dataset.tag, b.dataset.version);
+  if (b && b.id === 'manager-log') {
+    $('#log-title').textContent = 'Manager update log';
+    $('#log-text').textContent = updates.local.job.log || 'Nothing yet.';
+    $('#log-dialog').showModal();
+  }
+});
+['#repo-url', '#repo-branch'].forEach(s => $(s).addEventListener('input', () => { repoEdited = true; }));
+$('#repo-form').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  try {
+    const r = await api('POST', '/api/updates/settings', { repo: $('#repo-url').value, branch: $('#repo-branch').value });
+    updates.settings = r.settings;
+    repoEdited = false;
+    latest = null; // it was about the other repository
+    renderUpdates();
+    toast('Saved.');
+  } catch (e) {
+    toast(e.message, true);
   }
 });
 
