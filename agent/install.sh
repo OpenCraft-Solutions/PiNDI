@@ -105,11 +105,16 @@ if [ -f "$SRC/Install_NDI_Advanced_SDK_v6_Linux.tar.gz" ]; then
     PACKAGES+=(libavcodec61)
 fi
 # Installed when apt is used, not required offline (an update package can't add them): boards without
-# a hardware H.264 decoder (Pi 5) decode H.264 RTP streams with libavcodec, also loaded at run time.
+# a hardware H.264 decoder (Pi 5) decode H.264 RTP and SRT streams with libavcodec, also loaded at run
+# time; SRT streams need libsrt (1.5 in Bookworm and Trixie, 1.4 in Bullseye).
 OPTIONAL_PACKAGES=()
+OPTIONAL_WHY=()
 if grep -qE "Raspberry Pi (5|500)|Compute Module 5" /proc/device-tree/model 2>/dev/null; then
     OPTIONAL_PACKAGES+=(libavcodec61)
+    OPTIONAL_WHY+=("H.264 RTP and SRT streams can't be shown on this device")
 fi
+OPTIONAL_PACKAGES+=("libsrt1.5-gnutls|libsrt1.4-gnutls")
+OPTIONAL_WHY+=("SRT streams can't be sent or received")
 if [ "$OFFLINE" -eq 1 ]; then
     step "Checking packages (offline)"
     MISSING=()
@@ -130,10 +135,15 @@ else
         apt-get "${APT_OPTS[@]}" full-upgrade
     fi
     apt-get "${APT_OPTS[@]}" install --no-install-recommends "${PACKAGES[@]}"
-    if [ "${#OPTIONAL_PACKAGES[@]}" -gt 0 ]; then
-        apt-get "${APT_OPTS[@]}" install --no-install-recommends "${OPTIONAL_PACKAGES[@]}" ||
-            echo "Could not install ${OPTIONAL_PACKAGES[*]}: H.264 RTP streams can't be shown on this device." >&2
-    fi
+    for i in "${!OPTIONAL_PACKAGES[@]}"; do # one at a time: one that is missing doesn't stop the others
+        pkg=""
+        for p in ${OPTIONAL_PACKAGES[$i]//|/ }; do # the first this release has
+            if apt-cache show "$p" >/dev/null 2>&1; then pkg=$p; break; fi
+        done
+        if [ -z "$pkg" ] || ! apt-get "${APT_OPTS[@]}" install --no-install-recommends "$pkg"; then
+            echo "Could not install ${pkg:-${OPTIONAL_PACKAGES[$i]}}: ${OPTIONAL_WHY[$i]}." >&2
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------- NDI runtime
