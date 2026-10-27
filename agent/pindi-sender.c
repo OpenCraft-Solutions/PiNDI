@@ -1138,7 +1138,7 @@ static bool srt_load(void)
                  SRT_SYM(epoll_release) && SRT_SYM(setloglevel);
 #undef SRT_SYM
         if (srt.ok) {
-            srt.setloglevel(3); /* LOG_ERR */
+            srt.setloglevel(2); /* LOG_CRIT: failures are logged here, once, not at each try */
             srt.ok = srt.startup() >= 0;
         }
         LOG("SRT %s%s", srt.ok ? "with " : "not available (no libsrt)", srt.ok ? srt.name : "");

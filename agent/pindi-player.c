@@ -4109,7 +4109,7 @@ static bool srt_load(void)
         SRT_SYM(rejectreason_str);
 #undef SRT_SYM
         if (srt.ok) {
-            srt.setloglevel(3); /* LOG_ERR */
+            srt.setloglevel(2); /* LOG_CRIT: failures are logged here, once, not at each try */
             srt.ok = srt.startup() >= 0;
         }
         LOG("srt: %s%s", srt.ok ? "with " : "not available (no libsrt)", srt.ok ? srt.name : "");
@@ -4698,7 +4698,7 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
         x->start = now_ms();
     }
     int sock = -1, lsock = -1, eid = srt.epoll_create(), in_eid = 0;
-    bool connected = false, warned = false;
+    bool connected = false, warned = false, lsock_ready = false;
     uint64_t next_try = 0, connect_at = 0, last_switch = 0, last_sources = 0, last_fps = 0, last_stats = now_ms(),
              stat_pictures = 0, stat_bytes = 0;
     struct srt_stats_head prev = { 0 };
@@ -4778,7 +4778,7 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
                     freeaddrinfo(ai);
             }
         }
-        if (lsock >= 0 && sock < 0) {
+        if (lsock >= 0 && lsock_ready) { /* a sender is calling (accept when there is none says so) */
             struct sockaddr_in a;
             int al = sizeof a;
             int c = srt.accept(lsock, (struct sockaddr *)&a, &al);
@@ -4787,6 +4787,9 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
                 inet_ntop(AF_INET, &a.sin_addr, ip, sizeof ip);
                 if (!rtp_from_ok(o, &a)) {
                     LOG("srt: output %d: refused %s (not the source IP %s)", o->n, ip, o->source_ip);
+                    srt.close(c);
+                } else if (sock >= 0) {
+                    LOG("srt: output %d: refused %s (already receiving from %s)", o->n, ip, x->from);
                     srt.close(c);
                 } else {
                     sock = c;
@@ -4825,12 +4828,15 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             }
         }
 
-        int rd[4], rn = 4;
+        int rd[4], rn = 4, ready = 0;
         int wait = x->r.hw_on && x->r.hw.fed > x->r.hw.decoded ? 4 : 20;
         if (in_eid > 0)
-            srt.epoll_wait(eid, rd, &rn, NULL, NULL, wait, NULL, NULL, NULL, NULL);
+            ready = srt.epoll_wait(eid, rd, &rn, NULL, NULL, wait, NULL, NULL, NULL, NULL);
         else
             usleep((useconds_t)wait * 1000);
+        lsock_ready = false;
+        for (int i = 0; ready > 0 && i < rn && i < 4; i++)
+            lsock_ready |= lsock >= 0 && rd[i] == lsock;
         uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
         now = now_ms();
 
