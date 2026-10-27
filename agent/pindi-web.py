@@ -2826,7 +2826,8 @@ API_TOKEN_FILE = "/etc/pindi/api-token"
 # Raised when the API gains something clients may check for (all still under /api/v1/, nothing removed):
 # 2 = metrics and update state in the status, reboot, update, update log, thumbnails, token from a sign-in.
 # 3 = shutdown.
-API_VERSION = 3
+# 4 = H.264 RTP: rtp:// output streams, the inputs' codec and RTP destination, their SDP files.
+API_VERSION = 4
 
 
 def api_token(create=True):
