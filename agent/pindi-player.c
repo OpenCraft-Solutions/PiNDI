@@ -38,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -1920,10 +1921,10 @@ static void yuv422p_to_uyvy(const uint8_t *y, const uint8_t *u, const uint8_t *v
     }
 }
 
-/* Receiver thread: a planar 4:2:2 or 4:2:0 picture (this device's own capture input). False if this
- * display can't show it. */
-static bool post_planar(struct output *o, const uint8_t *y, const uint8_t *u, const uint8_t *v, int w, int h,
-                        bool is420, int64_t sent, uint64_t recv_us)
+/* Receiver thread: a planar 4:2:2 or 4:2:0 picture (this device's own capture input, or software-decoded
+ * H.264); ys, cs: bytes per luma and chroma row. False if this display can't show it. */
+static bool post_planar(struct output *o, const uint8_t *y, const uint8_t *u, const uint8_t *v, int ys, int cs,
+                        int w, int h, bool is420, int64_t sent, uint64_t recv_us)
 {
     uint32_t fmt = is420 ? (o->has_nv12 ? DRM_FORMAT_NV12 : 0)
                          : (o->has_nv16 ? DRM_FORMAT_NV16 : o->has_uyvy ? DRM_FORMAT_UYVY : 0);
@@ -1936,17 +1937,17 @@ static bool post_planar(struct output *o, const uint8_t *y, const uint8_t *u, co
     struct buf *b = &o->vid[idx];
     int cw = w / 2;
     for (int r = 0; r < h; r++) {
-        const uint8_t *yr = y + (size_t)r * w;
+        const uint8_t *yr = y + (size_t)r * ys;
         uint8_t *dst = b->map + (size_t)r * b->pitch;
         if (fmt == DRM_FORMAT_UYVY) {
-            yuv422p_to_uyvy(yr, u + (size_t)r * cw, v + (size_t)r * cw, dst, w);
+            yuv422p_to_uyvy(yr, u + (size_t)r * cs, v + (size_t)r * cs, dst, w);
             continue;
         }
         memcpy(dst, yr, (size_t)w);
         if (fmt == DRM_FORMAT_NV16)
-            uv_interleave(u + (size_t)r * cw, v + (size_t)r * cw, b->map + b->uv_off + (size_t)r * b->pitch, cw);
+            uv_interleave(u + (size_t)r * cs, v + (size_t)r * cs, b->map + b->uv_off + (size_t)r * b->pitch, cw);
         else if (!(r & 1))
-            uv_interleave(u + (size_t)(r / 2) * cw, v + (size_t)(r / 2) * cw,
+            uv_interleave(u + (size_t)(r / 2) * cs, v + (size_t)(r / 2) * cs,
                           b->map + b->uv_off + (size_t)(r / 2) * b->pitch, cw);
     }
     frame_end(o, idx, (double)w / h, sent, recv_us);
@@ -1997,22 +1998,27 @@ struct hwdec {
     uint64_t decoded, fed;
 };
 
-static char hw_dev[32]; /* the decoder's /dev/videoN, "" if there is none */
+static char hw_dev[32]; /* the decoder's /dev/videoN, "" if there is none (set before the receivers start) */
 
-static void hwdec_find(void)
+/* The hardware decoder's device node into dev ("" if there is none). */
+static void hwdec_scan(char *dev, size_t n)
 {
-    for (int i = 0; i < 64; i++) {
+    *dev = 0;
+    for (int i = 0; i < 64 && !*dev; i++) {
         char path[64], name[64] = "";
         snprintf(path, sizeof path, "/sys/class/video4linux/video%d/name", i);
         FILE *f = fopen(path, "r");
         if (!f)
             continue;
         if (fgets(name, sizeof name, f) && !strncmp(name, "bcm2835-codec-decode", 20))
-            snprintf(hw_dev, sizeof hw_dev, "/dev/video%d", i);
+            snprintf(dev, n, "/dev/video%d", i);
         fclose(f);
-        if (*hw_dev)
-            break;
     }
+}
+
+static void hwdec_find(void)
+{
+    hwdec_scan(hw_dev, sizeof hw_dev);
     LOG("video: hardware H.264 decoder %s", *hw_dev ? hw_dev : "not available");
 }
 
@@ -2064,15 +2070,16 @@ static void hwdec_close(struct output *o, struct hwdec *d)
     d->fd = -1;
 }
 
-static bool hwdec_open(struct output *o, struct hwdec *d, int w, int h)
+/* dev: the decoder (hw_dev). w x h: the stream's size (NDI, or the SPS). */
+static bool hwdec_open(struct output *o, struct hwdec *d, const char *dev, int w, int h)
 {
     memset(d, 0, sizeof *d);
     for (int b = 0; b < NBUF; b++)
         d->dmabuf[b] = -1;
     d->need_key = true;
-    d->fd = open(hw_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    d->fd = open(dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (d->fd < 0) {
-        LOG("video: output %d: cannot open %s: %s", o->n, hw_dev, strerror(errno));
+        LOG("video: output %d: cannot open %s: %s", o->n, dev, strerror(errno));
         return false;
     }
     struct v4l2_format f = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE };
@@ -2102,13 +2109,13 @@ static bool hwdec_open(struct output *o, struct hwdec *d, int w, int h)
     int type = f.type;
     if (xioctl(d->fd, VIDIOC_STREAMON, &type))
         goto fail;
-    /* NDI gives the size: set the capture side up now. The decoder reports a format change
+    /* The size is known: set the capture side up now. The decoder reports a format change
      * (source change event) only if the stream turns out different. */
     d->vw = d->cw = w;
     d->vh = h;
     d->ch = nv12_rows(h);
     d->want_cap = true;
-    LOG("video: output %d: hardware H.264 decoding (%s)", o->n, hw_dev);
+    LOG("video: output %d: hardware H.264 decoding (%s)", o->n, dev);
     return true;
 fail:
     LOG("video: output %d: hardware decoder setup failed: %s", o->n, strerror(errno));
@@ -2293,17 +2300,11 @@ static void hwdec_poll(struct output *o, struct hwdec *d, int wait_ms)
     }
 }
 
-/* One compressed H.264 frame from NDI. False: the decoder failed (fall back to the NDI library). */
-static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
+/* One H.264 picture (Annex B): pre (parameter sets, may be empty), then data. sent: its capture time
+ * (100 ns UTC) or INT64_MAX. False: the decoder failed. */
+static bool hwdec_queue(struct output *o, struct hwdec *d, const uint8_t *pre, size_t pre_len, const uint8_t *data,
+                        size_t len, bool key, int64_t sent, uint64_t recv_us)
 {
-    const struct ndi_packet *pk = (const struct ndi_packet *)v->p_data;
-    /* version is the header's size: 44 bytes (sizeof here is 48, padded to 8 for the int64s). */
-    const int32_t hdr = (int32_t)(offsetof(struct ndi_packet, extra_data_size) + sizeof pk->extra_data_size);
-    if (!v->p_data || v->data_size_in_bytes < hdr || pk->version < hdr ||
-        (int64_t)pk->version + pk->data_size + pk->extra_data_size > v->data_size_in_bytes)
-        return true;
-    bool key = pk->flags & 1;
-    d->aspect = v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres;
     pthread_mutex_lock(&o->lock);
     bool usable = o->usable && !o->cant_display;
     pthread_mutex_unlock(&o->lock);
@@ -2319,20 +2320,16 @@ static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_fra
     int i = 0;
     while (i < HW_IN_BUFS && (d->in[i].queued || !d->in[i].map))
         i++;
-    size_t len = (size_t)pk->data_size + (key ? pk->extra_data_size : 0);
-    if (i == HW_IN_BUFS || len > d->in[i].len) {
+    if (i == HW_IN_BUFS || pre_len + len > d->in[i].len) {
         d->need_key = true; /* decoder busy: drop, and restart cleanly at the next keyframe */
         return true;
     }
-    const uint8_t *data = (const uint8_t *)pk + pk->version;
-    size_t off = 0;
-    if (key) { /* parameter sets (SPS/PPS) first */
-        memcpy(d->in[i].map, data + pk->data_size, pk->extra_data_size);
-        off = pk->extra_data_size;
-    }
-    memcpy(d->in[i].map + off, data, pk->data_size);
+    if (pre_len)
+        memcpy(d->in[i].map, pre, pre_len);
+    memcpy(d->in[i].map + pre_len, data, len);
+    len += pre_len;
     uint32_t m = d->seq++ % 16;
-    d->meta[m].sent = frame_pts(v);
+    d->meta[m].sent = sent;
     d->meta[m].recv = recv_us;
     struct v4l2_plane pl = { .bytesused = (uint32_t)len, .length = (uint32_t)d->in[i].len };
     struct v4l2_buffer vb = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
@@ -2346,6 +2343,23 @@ static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_fra
     d->need_key = false;
     d->fed++;
     return true;
+}
+
+/* One compressed H.264 frame from NDI. False: the decoder failed (fall back to the NDI library). */
+static bool hwdec_feed(struct output *o, struct hwdec *d, const NDIlib_video_frame_v2_t *v, uint64_t recv_us)
+{
+    const struct ndi_packet *pk = (const struct ndi_packet *)v->p_data;
+    /* version is the header's size: 44 bytes (sizeof here is 48, padded to 8 for the int64s). */
+    const int32_t hdr = (int32_t)(offsetof(struct ndi_packet, extra_data_size) + sizeof pk->extra_data_size);
+    if (!v->p_data || v->data_size_in_bytes < hdr || pk->version < hdr ||
+        (int64_t)pk->version + pk->data_size + pk->extra_data_size > v->data_size_in_bytes)
+        return true;
+    bool key = pk->flags & 1;
+    d->aspect = v->picture_aspect_ratio > 0 ? v->picture_aspect_ratio : (double)v->xres / v->yres;
+    const uint8_t *data = (const uint8_t *)pk + pk->version;
+    /* On keyframes the parameter sets (SPS/PPS, the extra data after the frame) go first. */
+    return hwdec_queue(o, d, data + pk->data_size, key ? pk->extra_data_size : 0, data, pk->data_size, key,
+                       frame_pts(v), recv_us);
 }
 
 /* ------------------------------------------------------------------ status for the web UI */
@@ -2380,7 +2394,10 @@ static void status_set(struct output *o, const char *state, const char *source, 
         snprintf(msg, sizeof msg, "%s: %s is too big for this device - use the low-bandwidth preview", source,
                  video);
     else if (!strcmp(state, "searching") || !strncmp(state, "playing", 7))
-        snprintf(msg, sizeof msg, "Waiting for NDI stream %s%s", o->target, from);
+        snprintf(msg, sizeof msg, "Waiting for %s stream %s%s", strncasecmp(o->target, "rtp://", 6) ? "NDI" : "H.264 RTP",
+                 o->target, from);
+    else if (!strncmp(state, "cannot", 6))
+        snprintf(msg, sizeof msg, "%s: %s", o->target, state);
     else
         msg[0] = 0;
     pthread_mutex_lock(&o->lock);
@@ -2934,7 +2951,7 @@ static int local_play(struct output *o, const char *path, uint64_t *switch_seen,
                 LOCAL_DATA + (size_t)ssz * LOCAL_SLOTS <= len) {
                 const uint8_t *base = map + LOCAL_DATA + (size_t)slot * ssz;
                 size_t ysz = (size_t)w * h, csz = is420 ? ysz / 4 : ysz / 2;
-                bool ok = post_planar(o, base, base + ysz, base + ysz + csz, w, h, is420, lf->slot_time[slot],
+                bool ok = post_planar(o, base, base + ysz, base + ysz + csz, w, w / 2, w, h, is420, lf->slot_time[slot],
                                       clock_us(CLOCK_MONOTONIC));
                 if (LOAD(lf->slot_seq[slot]) != s)
                     torn++; /* overwritten while copying (we fell 4 frames behind): a mixed picture */
@@ -3096,6 +3113,797 @@ static void share_audio(struct output *o, const NDIlib_audio_frame_v3_t *a)
     pthread_mutex_unlock(&share_mu);
 }
 
+/* ------------------------------------------------------------------ H.264 over RTP */
+
+/* An output whose stream is "rtp://[group]:port" receives H.264 over RTP (RFC 6184) instead of NDI:
+ * from another PiNDI's input sent as H.264 RTP, or any RTP sender (ffmpeg, GStreamer, OBS, hardware
+ * encoders) using single NAL unit, STAP-A or FU-A packets and no B-frames. A multicast group is joined;
+ * without one ("rtp://:5004") the stream is sent to this device's address. Audio: L16 on port + 2 (48 kHz
+ * stereo, or the static 44.1 kHz payload types 10 and 11). RTCP sender reports on port + 1 give the
+ * pictures' capture times, for the latency figure and smooth pacing. Decoding: the Pi 3/4 hardware
+ * decoder, as for NDI|HX; boards without one (Pi 5) use FFmpeg's libavcodec, loaded at run time. There
+ * is no back channel: after a lost packet the picture waits for the next keyframe (from PiNDI: at most a
+ * second away). */
+
+#define RTP_MAX_AU (4 << 20) /* largest picture accepted */
+#define RTP_HEADROOM 1024    /* in front of a picture: room to put the parameter sets before a keyframe */
+#define RTP_PAD 64           /* zeros after it (libavcodec reads ahead) */
+#define RTP_LOST_MS 3000     /* no video for this long: the stream is gone */
+
+/* "rtp://239.1.2.3:5004", "rtp://:5004" or "rtp://@:5004" (as VLC writes it). *group: the multicast
+ * group (network order), 0 for unicast. Ports up to 65532: the next three carry RTCP and audio. */
+static bool rtp_url(const char *s, uint32_t *group, int *port)
+{
+    if (strncasecmp(s, "rtp://", 6))
+        return false;
+    s += 6;
+    if (*s == '@')
+        s++;
+    const char *colon = strrchr(s, ':');
+    char host[32], *end;
+    if (!colon || (size_t)(colon - s) >= sizeof host)
+        return false;
+    memcpy(host, s, (size_t)(colon - s));
+    host[colon - s] = 0;
+    long p = strtol(colon + 1, &end, 10);
+    struct in_addr a = { 0 };
+    if (*end || p < 1024 || p > 65532 || (*host && inet_pton(AF_INET, host, &a) != 1))
+        return false;
+    if (*host && (ntohl(a.s_addr) >> 28) != 14)
+        a.s_addr = 0; /* a unicast address: it can only be this device's own */
+    if (group)
+        *group = a.s_addr;
+    if (port)
+        *port = (int)p;
+    return true;
+}
+
+/* A UDP socket on port (joined to group if it is one), -1 on failure (errno). */
+static int rtp_socket(uint32_t group, int port)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    int one = 1, buf = 4 << 20; /* a 1080p keyframe arrives as one burst of 100+ packets */
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf); /* up to net.core.rmem_max: Large network buffers */
+    /* Bound to the group itself, so another group on the same port isn't received too. */
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port), .sin_addr.s_addr = group };
+    struct ip_mreq mr = { .imr_multiaddr.s_addr = group, .imr_interface.s_addr = INADDR_ANY };
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) ||
+        (group && setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof mr))) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+/* RTP packet header: the payload's offset and length; false if it isn't an RTP packet. */
+static bool rtp_header(const uint8_t *p, size_t n, size_t *off, size_t *len)
+{
+    if (n < 12 || (p[0] >> 6) != 2)
+        return false;
+    size_t h = 12 + (size_t)(p[0] & 15) * 4;
+    if (p[0] & 0x10) { /* header extension */
+        if (n < h + 4)
+            return false;
+        h += 4 + ((size_t)p[h + 2] << 8 | p[h + 3]) * 4;
+    }
+    size_t pad = (p[0] & 0x20) ? p[n - 1] : 0;
+    if (h + pad > n)
+        return false;
+    *off = h;
+    *len = n - h - pad;
+    return true;
+}
+
+static uint32_t get32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+/* Pictures put together from RTP packets, as Annex B. */
+struct rtp_depack {
+    uint8_t *buf, *au;   /* buf: headroom + picture + padding; au = buf + RTP_HEADROOM */
+    size_t len;
+    uint32_t ts, ssrc;
+    uint16_t next_seq;
+    bool seq_known, started, done;
+    bool broken;         /* a packet of this picture is missing */
+    bool resync;         /* something was lost: wait for a keyframe */
+    bool fu;             /* in a fragmented NAL unit */
+    bool key, has_ps;    /* the picture has an IDR slice; SPS and PPS */
+    uint8_t sps[256], pps[256];
+    size_t sps_len, pps_len;
+    bool new_sps;        /* the SPS changed (size): checked by the caller */
+    uint64_t lost;       /* packets */
+};
+
+enum { RTP_NONE, RTP_AU, RTP_AU_AGAIN }; /* AU_AGAIN: a picture is ready; pass the same packet again */
+
+static void depack_append(struct rtp_depack *dp, const uint8_t *a, size_t an, const uint8_t *b, size_t bn)
+{
+    if (dp->len + an + bn > RTP_MAX_AU) {
+        dp->broken = true;
+        return;
+    }
+    memcpy(dp->au + dp->len, a, an);
+    if (bn)
+        memcpy(dp->au + dp->len + an, b, bn);
+    dp->len += an + bn;
+}
+
+/* A complete NAL unit (single, or from a STAP-A) or the start of a fragmented one. */
+static void depack_nal(struct rtp_depack *dp, const uint8_t *nal, size_t n, bool whole)
+{
+    static const uint8_t sc[4] = { 0, 0, 0, 1 };
+    int type = nal[0] & 0x1f;
+    dp->key |= type == 5;
+    if (whole && type == 7 && n <= sizeof dp->sps) {
+        if (n != dp->sps_len || memcmp(dp->sps, nal, n))
+            dp->new_sps = true;
+        memcpy(dp->sps, nal, n);
+        dp->sps_len = n;
+        dp->has_ps = dp->pps_len > 0;
+    } else if (whole && type == 8 && n <= sizeof dp->pps) {
+        memcpy(dp->pps, nal, n);
+        dp->pps_len = n;
+        dp->has_ps = dp->sps_len > 0;
+    }
+    depack_append(dp, sc, sizeof sc, nal, n);
+}
+
+/* The picture is complete: is it worth decoding? */
+static bool depack_finish(struct rtp_depack *dp)
+{
+    dp->started = false;
+    dp->fu = false;
+    bool ok = dp->len && !dp->broken && (dp->key || !dp->resync);
+    if (dp->broken)
+        dp->resync = true;
+    else if (ok && dp->key)
+        dp->resync = false;
+    dp->done = true; /* reset when the next packet comes */
+    if (!ok)
+        return false;
+    /* A keyframe without parameter sets of its own (they came out of band, or earlier): the last ones first. */
+    if (dp->key && !dp->has_ps && dp->sps_len && dp->pps_len && dp->sps_len + dp->pps_len + 8 <= RTP_HEADROOM) {
+        uint8_t *p = dp->au - (dp->sps_len + dp->pps_len + 8);
+        memcpy(p, "\0\0\0\1", 4);
+        memcpy(p + 4, dp->sps, dp->sps_len);
+        memcpy(p + 4 + dp->sps_len, "\0\0\0\1", 4);
+        memcpy(p + 8 + dp->sps_len, dp->pps, dp->pps_len);
+        dp->len += dp->sps_len + dp->pps_len + 8;
+        dp->au = p;
+    }
+    memset(dp->au + dp->len, 0, RTP_PAD);
+    return true;
+}
+
+static void depack_restart(struct rtp_depack *dp)
+{
+    dp->done = dp->started = dp->fu = false;
+    dp->au = dp->buf + RTP_HEADROOM;
+    dp->len = 0;
+    dp->broken = dp->key = dp->has_ps = false;
+}
+
+/* One video packet. RTP_AU: a picture is ready in dp->au / dp->len (dp->key: a keyframe), until the
+ * next call. */
+static int depack_packet(struct rtp_depack *dp, const uint8_t *p, size_t n)
+{
+    if (dp->done)
+        depack_restart(dp);
+    size_t off, len;
+    if (!rtp_header(p, n, &off, &len) || !len)
+        return RTP_NONE;
+    uint16_t seq = (uint16_t)(p[2] << 8 | p[3]);
+    uint32_t ts = get32(p + 4), ssrc = get32(p + 8);
+    bool marker = p[1] & 0x80;
+    if (dp->seq_known && ssrc != dp->ssrc) { /* another sender, or it restarted */
+        depack_restart(dp);
+        dp->seq_known = false;
+        dp->resync = true;
+    }
+    int16_t gap = dp->seq_known ? (int16_t)(seq - dp->next_seq) : 0;
+    if (gap < 0 && gap > -1000)
+        return RTP_NONE; /* late or repeated: its picture has been dealt with */
+    if (dp->started && ts != dp->ts) {
+        /* A new picture before the last one's marked end: that end is what's missing - or the sender
+         * doesn't mark ends, and with no gap the picture is complete. */
+        if (gap)
+            dp->broken = true;
+        if (depack_finish(dp))
+            return RTP_AU_AGAIN; /* this packet again, once that picture is dealt with */
+        depack_restart(dp);
+    }
+    if (gap) {
+        dp->lost += gap > 0 ? (uint64_t)gap : 1;
+        dp->broken = dp->resync = true;
+    }
+    dp->seq_known = true;
+    dp->ssrc = ssrc;
+    dp->next_seq = (uint16_t)(seq + 1);
+    dp->ts = ts;
+    dp->started = true;
+
+    const uint8_t *pl = p + off;
+    int type = pl[0] & 0x1f;
+    if (type >= 1 && type <= 23) {
+        depack_nal(dp, pl, len, true);
+    } else if (type == 24) { /* STAP-A: several units, each after its 16-bit size */
+        size_t at = 1;
+        while (at + 2 < len) {
+            size_t s = (size_t)pl[at] << 8 | pl[at + 1];
+            at += 2;
+            if (!s || at + s > len) {
+                dp->broken = true;
+                break;
+            }
+            depack_nal(dp, pl + at, s, true);
+            at += s;
+        }
+    } else if (type == 28 && len > 2) { /* FU-A: one unit in pieces */
+        bool start = pl[1] & 0x80, end = pl[1] & 0x40;
+        if (start) {
+            uint8_t hdr = (uint8_t)((pl[0] & 0xe0) | (pl[1] & 0x1f));
+            depack_nal(dp, &hdr, 1, false);
+            depack_append(dp, pl + 2, len - 2, NULL, 0);
+            dp->fu = !end;
+        } else if (dp->fu) {
+            depack_append(dp, pl + 2, len - 2, NULL, 0);
+            dp->fu = !end;
+        } else {
+            dp->broken = true; /* its start is missing */
+        }
+    } else {
+        dp->broken = true; /* FU-B, STAP-B, MTAP: not used for live streams */
+    }
+    if (marker && depack_finish(dp))
+        return RTP_AU;
+    return RTP_NONE;
+}
+
+/* Exp-Golomb bit reader over an RBSP (emulation prevention bytes removed). */
+struct bits { const uint8_t *p; size_t n, i; bool bad; };
+
+static unsigned bits_u(struct bits *b, int k)
+{
+    unsigned v = 0;
+    while (k--) {
+        if (b->i >= b->n * 8) {
+            b->bad = true;
+            return 0;
+        }
+        v = v << 1 | (b->p[b->i / 8] >> (7 - b->i % 8) & 1);
+        b->i++;
+    }
+    return v;
+}
+
+static unsigned bits_ue(struct bits *b)
+{
+    int z = 0;
+    while (!b->bad && !bits_u(b, 1) && z < 32)
+        z++;
+    return z >= 32 ? (b->bad = true, 0) : ((1u << z) - 1 + bits_u(b, z));
+}
+
+static int bits_se(struct bits *b)
+{
+    unsigned v = bits_ue(b);
+    return v & 1 ? (int)((v + 1) / 2) : -(int)(v / 2);
+}
+
+/* The picture size an SPS describes (cropping applied). */
+static bool sps_size(const uint8_t *nal, size_t len, int *w, int *h)
+{
+    uint8_t rbsp[256];
+    size_t n = 0;
+    int zeros = 0;
+    for (size_t i = 1; i < len && n < sizeof rbsp; i++) { /* after the NAL header */
+        if (zeros >= 2 && nal[i] == 3) {
+            zeros = 0;
+            continue;
+        }
+        zeros = nal[i] ? 0 : zeros + 1;
+        rbsp[n++] = nal[i];
+    }
+    struct bits b = { rbsp, n, 0, false };
+    unsigned profile = bits_u(&b, 8);
+    bits_u(&b, 16); /* constraint flags, level */
+    bits_ue(&b);    /* seq_parameter_set_id */
+    unsigned chroma = 1;
+    if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 ||
+        profile == 86 || profile == 118 || profile == 128 || profile == 138 || profile == 139 || profile == 134 ||
+        profile == 135) {
+        chroma = bits_ue(&b);
+        if (chroma == 3)
+            bits_u(&b, 1); /* separate_colour_plane_flag */
+        bits_ue(&b);       /* bit depths */
+        bits_ue(&b);
+        bits_u(&b, 1);     /* qpprime_y_zero_transform_bypass_flag */
+        if (bits_u(&b, 1)) /* scaling matrices */
+            for (int i = 0; i < (chroma == 3 ? 12 : 8) && !b.bad; i++)
+                if (bits_u(&b, 1))
+                    for (int j = 0, last = 8, next = 8; j < (i < 6 ? 16 : 64) && !b.bad; j++) {
+                        if (next)
+                            next = (last + bits_se(&b) + 256) % 256;
+                        last = next ? next : last;
+                    }
+    }
+    bits_ue(&b); /* log2_max_frame_num_minus4 */
+    unsigned poc = bits_ue(&b);
+    if (poc == 0) {
+        bits_ue(&b);
+    } else if (poc == 1) {
+        bits_u(&b, 1);
+        bits_se(&b);
+        bits_se(&b);
+        for (unsigned i = 0, k = bits_ue(&b); i < k && !b.bad; i++)
+            bits_se(&b);
+    }
+    bits_ue(&b);   /* max_num_ref_frames */
+    bits_u(&b, 1); /* gaps_in_frame_num_value_allowed_flag */
+    unsigned mbw = bits_ue(&b) + 1, mbh = bits_ue(&b) + 1, frames_only = bits_u(&b, 1);
+    if (!frames_only)
+        bits_u(&b, 1); /* mb_adaptive_frame_field_flag */
+    bits_u(&b, 1);     /* direct_8x8_inference_flag */
+    unsigned cl = 0, cr = 0, ct = 0, cb = 0;
+    if (bits_u(&b, 1)) {
+        cl = bits_ue(&b);
+        cr = bits_ue(&b);
+        ct = bits_ue(&b);
+        cb = bits_ue(&b);
+    }
+    unsigned ux = chroma == 1 || chroma == 2 ? 2 : 1, uy = (chroma == 1 ? 2 : 1) * (2 - frames_only);
+    long ww = (long)mbw * 16 - (long)ux * (cl + cr), hh = (long)mbh * 16 * (2 - frames_only) - (long)uy * (ct + cb);
+    if (b.bad || ww < 16 || hh < 16 || ww > 8192 || hh > 8192)
+        return false;
+    *w = (int)ww;
+    *h = (int)hh;
+    return true;
+}
+
+/* FFmpeg's libavcodec, loaded at run time as the NDI Advanced SDK does (no build dependency): only the
+ * calls below, and the first fields of AVFrame and AVPacket, which have kept their places since FFmpeg 1. */
+struct av_frame_head { uint8_t *data[8]; int linesize[8]; uint8_t **extended_data; int width, height, nb_samples, format; };
+struct av_packet_head { void *buf; int64_t pts, dts; uint8_t *data; int size; };
+enum { AV_CODEC_H264 = 27, AV_YUV420P = 0, AV_YUV422P = 4, AV_YUVJ420P = 12, AV_YUVJ422P = 13 };
+
+static struct {
+    pthread_mutex_t mu;
+    bool tried, ok;
+    char name[32];
+    const void *(*find_decoder)(int id);
+    void *(*alloc_context)(const void *codec);
+    int (*open)(void *ctx, const void *codec, void **opts);
+    int (*send_packet)(void *ctx, const void *pkt);
+    int (*receive_frame)(void *ctx, void *frame);
+    void (*free_context)(void **ctx);
+    void *(*packet_alloc)(void);
+    void (*packet_free)(void **pkt);
+    void *(*frame_alloc)(void);
+    void (*frame_free)(void **frame);
+    int (*dict_set)(void **dict, const char *key, const char *value, int flags);
+    void (*dict_free)(void **dict);
+} av = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static bool av_load(void)
+{
+    pthread_mutex_lock(&av.mu);
+    if (!av.tried) {
+        av.tried = true;
+        static const char *const libs[] = { "libavcodec.so.61", "libavcodec.so.62", "libavcodec.so.60",
+                                            "libavcodec.so.59" };
+        void *lib = NULL;
+        for (size_t i = 0; i < sizeof libs / sizeof *libs && !lib; i++)
+            if ((lib = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL)))
+                snprintf(av.name, sizeof av.name, "%s", libs[i]);
+#define AV_SYM(f, s) (*(void **)&av.f = lib ? dlsym(lib, s) : NULL)
+        av.ok = AV_SYM(find_decoder, "avcodec_find_decoder") && AV_SYM(alloc_context, "avcodec_alloc_context3") &&
+                AV_SYM(open, "avcodec_open2") && AV_SYM(send_packet, "avcodec_send_packet") &&
+                AV_SYM(receive_frame, "avcodec_receive_frame") && AV_SYM(free_context, "avcodec_free_context") &&
+                AV_SYM(packet_alloc, "av_packet_alloc") && AV_SYM(packet_free, "av_packet_free") &&
+                AV_SYM(frame_alloc, "av_frame_alloc") && AV_SYM(frame_free, "av_frame_free") &&
+                AV_SYM(dict_set, "av_dict_set") && AV_SYM(dict_free, "av_dict_free");
+#undef AV_SYM
+        LOG("video: software H.264 decoding %s%s", av.ok ? "with " : "not available", av.ok ? av.name : "");
+    }
+    bool ok = av.ok;
+    pthread_mutex_unlock(&av.mu);
+    return ok;
+}
+
+struct swdec { void *ctx, *pkt, *frm; uint64_t decoded, fed; };
+
+static void swdec_close(struct swdec *s)
+{
+    if (s->ctx)
+        av.free_context(&s->ctx);
+    if (s->pkt)
+        av.packet_free(&s->pkt);
+    if (s->frm)
+        av.frame_free(&s->frm);
+    memset(s, 0, sizeof *s);
+}
+
+static bool swdec_open(struct output *o, struct swdec *s)
+{
+    memset(s, 0, sizeof *s);
+    if (!av_load())
+        return false;
+    const void *codec = av.find_decoder(AV_CODEC_H264);
+    void *opts = NULL;
+    s->ctx = codec ? av.alloc_context(codec) : NULL;
+    s->pkt = av.packet_alloc();
+    s->frm = av.frame_alloc();
+    /* Each picture out as soon as it is decoded: no frame threads (each adds a frame of delay), no
+     * reordering (live senders use no B-frames). */
+    av.dict_set(&opts, "threads", "auto", 0);
+    av.dict_set(&opts, "thread_type", "slice", 0);
+    av.dict_set(&opts, "flags", "low_delay", 0);
+    bool ok = s->ctx && s->pkt && s->frm && av.open(s->ctx, codec, &opts) == 0;
+    av.dict_free(&opts);
+    if (!ok) {
+        LOG("video: output %d: software H.264 decoder setup failed", o->n);
+        swdec_close(s);
+        return false;
+    }
+    LOG("video: output %d: software H.264 decoding (%s)", o->n, av.name);
+    return true;
+}
+
+/* One picture (Annex B, padded). False if the display can't show the decoded format. */
+static bool swdec_decode(struct output *o, struct swdec *s, uint8_t *au, size_t len, int64_t sent, uint64_t recv_us)
+{
+    struct av_packet_head *pk = s->pkt;
+    pk->data = au;
+    pk->size = (int)len;
+    s->fed++;
+    if (av.send_packet(s->ctx, s->pkt) < 0)
+        return true; /* a damaged picture: the decoder says so and carries on */
+    bool shown = true;
+    while (av.receive_frame(s->ctx, s->frm) == 0) {
+        const struct av_frame_head *f = s->frm;
+        bool is420 = f->format == AV_YUV420P || f->format == AV_YUVJ420P;
+        if (is420 || f->format == AV_YUV422P || f->format == AV_YUVJ422P)
+            shown = post_planar(o, f->data[0], f->data[1], f->data[2], f->linesize[0], f->linesize[1], f->width,
+                                f->height, is420, sent, recv_us);
+        else
+            shown = false; /* 10-bit, 4:4:4... */
+        s->decoded++;
+    }
+    return shown;
+}
+
+/* What an output receiving RTP has open. */
+struct rtp_rx {
+    int vfd, cfd, afd;       /* video, its RTCP, audio */
+    struct rtp_depack dp;
+    struct hwdec hw;
+    struct swdec sw;
+    bool hw_on, sw_on, hw_failed;
+    bool chosen;             /* the decoder has been chosen (none if neither could be opened) */
+    int w, h;                /* from the SPS */
+    int64_t sr_ntp;          /* last sender report: wall clock (100 ns UTC) at RTP time sr_rtp; 0 = none */
+    uint32_t sr_rtp, sr_ssrc;
+    uint64_t audio_ts;       /* audio timestamps, unwrapped */
+    uint32_t audio_last;
+    bool audio_known;
+};
+
+static void rtp_rx_close(struct output *o, struct rtp_rx *r)
+{
+    if (r->hw_on)
+        hwdec_close(o, &r->hw);
+    if (r->sw_on)
+        swdec_close(&r->sw);
+    r->hw_on = r->sw_on = false;
+    for (int *fd = &r->vfd; fd <= &r->afd; fd++) {
+        if (*fd >= 0)
+            close(*fd);
+        *fd = -1;
+    }
+}
+
+/* Is the packet from the output's source IP (if it has one)? */
+static bool rtp_from_ok(struct output *o, const struct sockaddr_in *from)
+{
+    struct in_addr want;
+    return !*o->source_ip || inet_pton(AF_INET, o->source_ip, &want) != 1 || want.s_addr == from->sin_addr.s_addr;
+}
+
+/* RTCP: the video sender's report ties its timestamps to its wall clock. */
+static void rtp_rtcp(struct rtp_rx *r, const uint8_t *p, size_t n)
+{
+    while (n >= 4 && (p[0] >> 6) == 2) {
+        size_t len = ((size_t)p[2] << 8 | p[3]) * 4 + 4;
+        if (len > n)
+            return;
+        if (p[1] == 200 && len >= 28 && (!r->dp.seq_known || get32(p + 4) == r->dp.ssrc)) {
+            uint64_t secs = get32(p + 8), frac = get32(p + 12);
+            if (secs > 2208988800u) {
+                r->sr_ntp = (int64_t)(secs - 2208988800u) * 10000000 + (int64_t)((frac * 10000000) >> 32);
+                r->sr_rtp = get32(p + 16);
+                r->sr_ssrc = get32(p + 4);
+            }
+        }
+        p += len;
+        n -= len;
+    }
+}
+
+/* A picture's capture time (100 ns UTC) from the last sender report, else INT64_MAX. */
+static int64_t rtp_sent(const struct rtp_rx *r, uint32_t ts)
+{
+    if (!r->sr_ntp || r->sr_ssrc != r->dp.ssrc)
+        return INT64_MAX;
+    return r->sr_ntp + (int64_t)(int32_t)(ts - r->sr_rtp) * 10000000 / 90000;
+}
+
+/* Audio packets waiting on afd, played as one frame. */
+static void rtp_audio(struct output *o, struct rtp_rx *r, float *abuf, size_t cap)
+{
+    uint8_t pkt[2048];
+    size_t got = 0;
+    int rate = 48000, ch = 2;
+    for (int k = 0; k < 64; k++) {
+        struct sockaddr_in from;
+        socklen_t fl = sizeof from;
+        ssize_t n = recvfrom(r->afd, pkt, sizeof pkt, 0, (struct sockaddr *)&from, &fl);
+        size_t off, len;
+        if (n < 0)
+            break;
+        if (!rtp_from_ok(o, &from) || !rtp_header(pkt, (size_t)n, &off, &len))
+            continue;
+        int pt = pkt[1] & 0x7f;
+        int prate = pt == 10 || pt == 11 ? 44100 : 48000, pch = pt == 11 ? 1 : 2;
+        uint32_t ts = get32(pkt + 4);
+        r->audio_ts += r->audio_known ? (uint64_t)(int64_t)(int32_t)(ts - r->audio_last) : 0;
+        r->audio_last = ts;
+        r->audio_known = true;
+        if (got && (prate != rate || pch != ch))
+            break; /* the format changed: play what we have (the rest waits for the next call) */
+        rate = prate;
+        ch = pch;
+        size_t frames = len / (2 * (size_t)ch);
+        if (frames > cap - got)
+            frames = cap - got;
+        for (size_t i = 0; i < frames; i++)
+            for (int c = 0; c < ch; c++) {
+                const uint8_t *s = pkt + off + (i * (size_t)ch + (size_t)c) * 2;
+                abuf[(size_t)c * cap + got + i] = (int16_t)(s[0] << 8 | s[1]) / 32768.0f;
+            }
+        got += frames;
+        if (got == cap)
+            break;
+    }
+    if (!got)
+        return;
+    NDIlib_audio_frame_v3_t a = {
+        .sample_rate = rate, .no_channels = ch, .no_samples = (int)got,
+        .timestamp = (int64_t)(r->audio_ts * 10000000 / (uint64_t)rate),
+        .FourCC = NDIlib_FourCC_audio_type_FLTP, .p_data = (uint8_t *)abuf,
+        .channel_stride_in_bytes = (int)(cap * sizeof(float)),
+    };
+    audio_play(o, &a);
+    share_audio(o, &a);
+}
+
+/* Receive the output's RTP stream until it is switched (returns switch_poll's result), or the display
+ * goes away (0). splash_at: the previous stream's picture stays up until then, or the first frame. */
+static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instance_t find, bool audio_on,
+                    int stats_ms, uint64_t splash_at)
+{
+    uint32_t group;
+    int port;
+    char src[160];
+    snprintf(src, sizeof src, "%s", o->target);
+    if (!rtp_url(src, &group, &port))
+        return 0;
+    struct rtp_rx r = { .vfd = -1, .cfd = -1, .afd = -1, .hw = { .fd = -1 } };
+    r.dp.buf = malloc(RTP_HEADROOM + RTP_MAX_AU + RTP_PAD);
+    r.dp.au = r.dp.buf + RTP_HEADROOM;
+    enum { ACAP = 4800 }; /* 100 ms per channel */
+    float *abuf = malloc(ACAP * 2 * sizeof(float));
+    uint8_t *pkt = malloc(65536);
+    char from_s[64] = "", vid[64] = "", dev[32] = "";
+    uint64_t start = now_ms(), last_switch = 0, last_sources = 0, last_stats = start, last_video = 0, last_open = 0;
+    uint64_t last_fps = start, pictures = 0, stat_pictures = 0, stat_packets = 0;
+    unsigned fps_pictures = 0;
+    bool got = false, warned = false;
+    int ret = 0;
+    LOG("rtp: output %d: receiving %s", o->n, src);
+    status_set(o, "searching", "", "", "");
+    while (running && r.dp.buf && abuf && pkt) {
+        uint64_t now = now_ms();
+        pthread_mutex_lock(&o->lock);
+        bool usable = o->usable;
+        pthread_mutex_unlock(&o->lock);
+        if (!usable)
+            break;
+        if (now - last_switch >= 300) {
+            last_switch = now;
+            if ((ret = switch_poll(o, switch_seen)))
+                break;
+        }
+        if (find && o->n == 1 && now - last_sources >= 2000) {
+            uint32_t count = 0;
+            const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+            sources_publish(srcs, count);
+            last_sources = now;
+        }
+        if (splash_at && !got && now >= splash_at) {
+            request_splash(o);
+            splash_at = 0;
+        }
+        /* Sockets: at the start, again after a failure (the network isn't up yet, the port is taken), and
+         * after 10 s without video (joining the group again, in case a switch forgot it). */
+        bool reopen = r.vfd >= 0 && now - last_video > 10000 && now - last_open > 10000;
+        if ((r.vfd < 0 && now - last_open >= 2000) || reopen) {
+            for (int *fd = &r.vfd; fd <= &r.afd; fd++) {
+                if (*fd >= 0)
+                    close(*fd);
+                *fd = -1;
+            }
+            last_open = now;
+            r.vfd = rtp_socket(group, port);
+            if (r.vfd < 0) {
+                if (!warned)
+                    LOG("rtp: output %d: cannot receive on port %d: %s (trying again)", o->n, port, strerror(errno));
+                warned = true;
+                char st[64];
+                snprintf(st, sizeof st, "cannot receive on port %d", port);
+                status_set(o, st, src, "", "");
+                usleep(100000);
+                continue;
+            }
+            warned = false;
+            r.cfd = rtp_socket(group, port + 1);
+            r.afd = audio_on ? rtp_socket(group, port + 2) : -1;
+        }
+
+        struct pollfd pf[3] = { { .fd = r.vfd, .events = POLLIN }, { .fd = r.cfd, .events = POLLIN },
+                                { .fd = r.afd, .events = POLLIN } };
+        poll(pf, 3, r.hw_on && r.hw.fed > r.hw.decoded ? 4 : 20);
+        uint64_t recv_us = clock_us(CLOCK_MONOTONIC);
+        now = now_ms();
+
+        for (int k = 0; k < 512 && r.vfd >= 0; k++) { /* everything waiting, before decoding anything */
+            struct sockaddr_in from;
+            socklen_t fl = sizeof from;
+            ssize_t n = recvfrom(r.vfd, pkt, 65536, 0, (struct sockaddr *)&from, &fl);
+            if (n < 0)
+                break;
+            if (!rtp_from_ok(o, &from))
+                continue;
+            stat_packets++;
+            if (!last_video || now - last_video > 1000) { /* the sender (again) */
+                char a[INET_ADDRSTRLEN] = "";
+                inet_ntop(AF_INET, &from.sin_addr, a, sizeof a);
+                snprintf(from_s, sizeof from_s, "%s:%d", a, ntohs(from.sin_port));
+                if (!got)
+                    status_set(o, "connecting", src, from_s, "");
+            }
+            last_video = now;
+            int res;
+            while ((res = depack_packet(&r.dp, pkt, (size_t)n)) != RTP_NONE) {
+                struct rtp_depack *dp = &r.dp;
+                int64_t sent = rtp_sent(&r, dp->ts);
+                if (dp->new_sps) {
+                    int w, h;
+                    if (sps_size(dp->sps, dp->sps_len, &w, &h) && (w != r.w || h != r.h)) {
+                        LOG("rtp: output %d: %dx%d H.264 from %s", o->n, w, h, from_s);
+                        r.w = w;
+                        r.h = h;
+                        snprintf(vid, sizeof vid, "%dx%d", w, h); /* the frame rate follows */
+                    }
+                    dp->new_sps = false;
+                }
+                /* The decoder: the hardware one (Pi 3/4) if this display can show its pictures, else
+                 * libavcodec. Chosen at the first keyframe, when the size is known. */
+                if (!r.chosen && dp->key && r.w) {
+                    r.chosen = true;
+                    if (!*dev)
+                        hwdec_scan(dev, sizeof dev); /* its driver may have loaded after the player started */
+                    if (*dev && o->has_nv12 && !r.hw_failed)
+                        r.hw_on = hwdec_open(o, &r.hw, dev, r.w, r.h);
+                    if (!r.hw_on)
+                        r.sw_on = swdec_open(o, &r.sw);
+                    char buf[512], path[64];
+                    snprintf(buf, sizeof buf, "source=%s\ncodec=%s\n", src,
+                             r.hw_on ? "H.264 RTP, hardware decoded" : r.sw_on ? "H.264 RTP, software decoded"
+                                                                       : "H.264 RTP (cannot be decoded here)");
+                    snprintf(path, sizeof path, RUN_DIR "/out%d.codec", o->n);
+                    write_file_atomic(path, buf);
+                    if (!r.hw_on && !r.sw_on)
+                        LOG("rtp: output %d: no H.264 decoder (no hardware decoder, no libavcodec)", o->n);
+                }
+                bool shown = true;
+                if (r.hw_on) {
+                    r.hw.aspect = (double)r.w / r.h;
+                    if (!hwdec_queue(o, &r.hw, NULL, 0, dp->au, dp->len, dp->key, sent, recv_us)) {
+                        hwdec_close(o, &r.hw); /* software decoding from the next keyframe */
+                        r.hw_on = r.chosen = false;
+                        r.hw_failed = true;
+                        dp->resync = true;
+                    }
+                } else if (r.sw_on) {
+                    shown = swdec_decode(o, &r.sw, dp->au, dp->len, sent, recv_us);
+                }
+                if (r.hw_on || r.sw_on) {
+                    pictures++;
+                    fps_pictures++;
+                    if (!got)
+                        LOG("rtp: output %d: first picture after %llu ms", o->n, (unsigned long long)(now - start));
+                    got = true;
+                    splash_at = 0;
+                    status_set(o, shown ? "playing" : "cannot display (format)", src, from_s, vid);
+                } else {
+                    status_set(o, "cannot decode H.264 here", src, from_s, "");
+                }
+                if (res == RTP_AU)
+                    break;
+            }
+        }
+        if (r.hw_on)
+            hwdec_poll(o, &r.hw, 0);
+        if (r.cfd >= 0 && (pf[1].revents & POLLIN))
+            for (int k = 0; k < 16; k++) {
+                struct sockaddr_in from;
+                socklen_t fl = sizeof from;
+                ssize_t n = recvfrom(r.cfd, pkt, 65536, 0, (struct sockaddr *)&from, &fl);
+                if (n < 0)
+                    break;
+                if (rtp_from_ok(o, &from))
+                    rtp_rtcp(&r, pkt, (size_t)n);
+            }
+        if (r.afd >= 0 && (pf[2].revents & POLLIN))
+            rtp_audio(o, &r, abuf, ACAP);
+        if (audio_on && got && o->au.last_frame + 3000 < now && now - start > 3000 && o->au.pcm) {
+            audio_close(o);
+            audio_info(o, "no audio in this stream");
+        }
+
+        if (now - last_fps >= 2000) { /* the frame rate as received */
+            snprintf(vid, sizeof vid, "%dx%d %.2f fps", r.w, r.h, fps_pictures * 1000.0 / (double)(now - last_fps));
+            fps_pictures = 0;
+            last_fps = now;
+            pthread_mutex_lock(&share_mu);
+            snprintf(o->share_url, sizeof o->share_url, "%s", from_s);
+            snprintf(o->share_video, sizeof o->share_video, "%s", vid);
+            pthread_mutex_unlock(&share_mu);
+        }
+        if (got && now - last_video > RTP_LOST_MS) {
+            LOG("rtp: output %d: lost %s", o->n, src);
+            got = false;
+            r.dp.resync = true;
+            r.hw.need_key = true;
+            request_splash(o);
+            audio_close(o);
+            if (audio_on)
+                audio_info(o, "");
+            status_set(o, "searching", "", "", "");
+        }
+        if (stats_ms > 0 && now - last_stats >= (uint64_t)stats_ms) {
+            LOG("rtp: output %d: %llu packets, %llu lost, %llu pictures in %.0f s%s", o->n,
+                (unsigned long long)stat_packets, (unsigned long long)r.dp.lost,
+                (unsigned long long)(pictures - stat_pictures), (now - last_stats) / 1000.0,
+                (r.hw_on && r.hw.need_key) || r.dp.resync ? ", waiting for a keyframe" : "");
+            stat_packets = 0;
+            r.dp.lost = 0;
+            stat_pictures = pictures;
+            last_stats = now;
+        }
+    }
+    rtp_rx_close(o, &r);
+    audio_close(o);
+    free(r.dp.buf);
+    free(abuf);
+    free(pkt);
+    return ret;
+}
+
 static void *receiver(void *arg)
 {
     struct output *o = arg;
@@ -3149,6 +3957,7 @@ static void *receiver(void *arg)
     bool following = false; /* showing another output's receiver (decode once) */
     uint64_t codec_copy_at = 0;
     char codec_copied[512] = ""; /* the leader's out<n>.codec as last copied to ours */
+    int rtp_probe = -1; /* display in standby, RTP stream: a socket to notice its packets */
 
     while (running) {
         uint64_t now = now_ms();
@@ -3241,6 +4050,37 @@ static void *receiver(void *arg)
         pthread_mutex_lock(&o->lock);
         standby = !usable && o->standby;
         pthread_mutex_unlock(&o->lock);
+        uint32_t rtp_group;
+        int rtp_port;
+        bool rtp = rtp_url(o->target, &rtp_group, &rtp_port);
+        if ((!standby || !rtp) && rtp_probe >= 0) {
+            close(rtp_probe);
+            rtp_probe = -1;
+        }
+        if (standby && rtp) { /* an RTP stream: wake as soon as its packets arrive */
+            if (rtp_probe < 0)
+                rtp_probe = rtp_socket(rtp_group, rtp_port);
+            status_set(o, "standby (display off)", "", "", "");
+            struct pollfd pf = { .fd = rtp_probe, .events = POLLIN };
+            bool found = false;
+            if (rtp_probe >= 0 && poll(&pf, 1, 500) > 0) {
+                struct sockaddr_in from;
+                socklen_t fl = sizeof from;
+                uint8_t b[2048];
+                while (recvfrom(rtp_probe, b, sizeof b, 0, (struct sockaddr *)&from, &fl) >= 0)
+                    found |= rtp_from_ok(o, &from);
+            } else if (rtp_probe < 0) {
+                usleep(500000);
+            }
+            if (found) {
+                pthread_mutex_lock(&o->lock);
+                o->wake_request = true;
+                pthread_mutex_unlock(&o->lock);
+                wake();
+                usleep(500000);
+            }
+            continue;
+        }
         if (standby) {
             if (!find) { /* discovery may have been restarted just before the display went off */
                 NDIlib_find_create_t fc = { .show_local_sources = true, .p_groups = NULL,
@@ -3403,6 +4243,40 @@ static void *receiver(void *arg)
                 audio_close(o);
                 continue;
             }
+        }
+
+        if (!recv && rtp) { /* H.264 over RTP, not NDI */
+            struct output *L = share_claim(o, o->target, "", -1);
+            if (L) {
+                LOG("rtp: output %d: %s is already received by output %d, showing it from there (decoded once)",
+                    o->n, o->target, L->n);
+                following = true;
+                on_backup = false;
+                search_since = 0;
+                splash_at = 0;
+                continue;
+            }
+            int sw = rtp_play(o, &switch_seen, find, audio_on, stats_ms, splash_at);
+            share_release(o);
+            now = now_ms();
+            if (audio_on)
+                audio_info(o, "");
+            splash_at = 0;
+            if (sw) {
+                splash_at = now + 6000; /* keep the picture until the new stream's first frame */
+                search_since = now;
+                failed_src[0] = 0;
+                status_set(o, "searching", "", "", "");
+                if (sw == 2 && find) {
+                    snprintf(extra_ips, sizeof extra_ips, "%s%s%s", extra, *o->source_ip && *extra ? "," : "",
+                             o->source_ip);
+                    ndi->find_destroy(find);
+                    find = NULL;
+                }
+            } else {
+                request_splash(o);
+            }
+            continue;
         }
 
         if (!recv) {
@@ -3611,7 +4485,7 @@ static void *receiver(void *arg)
             if (hx_leave)
                 hwdec_close(o, &hw);
             NDIlib_recv_instance_t r2 = NULL;
-            if (to_hx && !hwdec_open(o, &hw, last_w, last_h))
+            if (to_hx && !hwdec_open(o, &hw, hw_dev, last_w, last_h))
                 snprintf(hw_failed, sizeof hw_failed, "%s", cur_src);
             else
                 r2 = ndi->recv_create_v3(&rc);
@@ -3721,6 +4595,8 @@ static void *receiver(void *arg)
     share_release(o);
     share_leave(o);
     hwdec_close(o, &hw);
+    if (rtp_probe >= 0)
+        close(rtp_probe);
     if (recv)
         ndi->recv_destroy(recv);
     audio_close(o);
@@ -4014,10 +4890,9 @@ static bool load_ndi(void)
     if (hx)
         dlclose(hx);
     hx_decode = hx != NULL;
-    if (hx_decode) {
+    if (hx_decode)
         ndi_request_keyframe = (void (*)(NDIlib_recv_instance_t))dlsym(lib, "NDIlib_recv_request_keyframe");
-        hwdec_find();
-    }
+    hwdec_find(); /* for NDI|HX and H.264 RTP */
     char buf[256];
     snprintf(buf, sizeof buf, "version=%s\nhx_receive=%d\n", ndi->version ? ndi->version() : "", hx != NULL);
     write_file_atomic(RUN_DIR "/ndi", buf);
