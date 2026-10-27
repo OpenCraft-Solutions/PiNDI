@@ -2497,6 +2497,15 @@ static void sources_publish(const NDIlib_source_t *srcs, uint32_t count)
     pthread_mutex_unlock(&sources_lock);
 }
 
+/* The output that keeps the visible-sources list for the web UI: the lowest-numbered enabled one. */
+static bool sources_owner(const struct output *o)
+{
+    for (int i = 0; i < nout; i++)
+        if (!outs[i].disabled)
+            return &outs[i] == o;
+    return false;
+}
+
 /* ------------------------------------------------------------------ audio (receiver thread) */
 
 static void audio_info(struct output *o, const char *fmt, ...)
@@ -2952,7 +2961,7 @@ static int local_play(struct output *o, const char *path, uint64_t *switch_seen,
             if ((ret = switch_poll(o, switch_seen)))
                 break;
         }
-        if (find && o->n == 1 && now - last_sources >= 2000) {
+        if (find && sources_owner(o) && now - last_sources >= 2000) {
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
             sources_publish(srcs, count);
@@ -3837,7 +3846,7 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             if ((ret = switch_poll(o, switch_seen)))
                 break;
         }
-        if (find && o->n == 1 && now - last_sources >= 2000) {
+        if (find && sources_owner(o) && now - last_sources >= 2000) {
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
             sources_publish(srcs, count);
@@ -4739,7 +4748,7 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             if ((ret = switch_poll(o, switch_seen)))
                 break;
         }
-        if (find && o->n == 1 && now - last_sources >= 2000) {
+        if (find && sources_owner(o) && now - last_sources >= 2000) {
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
             sources_publish(srcs, count);
@@ -5237,7 +5246,7 @@ static void *receiver(void *arg)
             status_set(o, "standby (display off)", "", "", "");
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
-            if (o->n == 1)
+            if (sources_owner(o))
                 sources_publish(srcs, count);
             bool found = find_primary(o, srcs, count, "", "") != NULL;
             for (uint32_t i = 0; i < count && !found && *o->backup; i++)
@@ -5263,6 +5272,22 @@ static void *receiver(void *arg)
                     audio_info(o, "");
             }
             status_set(o, "no monitor", "", "", "");
+            /* Still discover for the web UI's source list, so a stream can be picked before a monitor is
+             * plugged in. */
+            if (sources_owner(o) && !access("/run/avahi-daemon/socket", F_OK)) {
+                if (!find) {
+                    NDIlib_find_create_t fc = { .show_local_sources = true, .p_groups = NULL,
+                                                .p_extra_ips = *extra_ips ? extra_ips : NULL };
+                    find = ndi->find_create_v2(&fc);
+                    find_created = last_match = now;
+                }
+                if (find && now - last_sources >= 2000) {
+                    uint32_t count = 0;
+                    const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
+                    sources_publish(srcs, count);
+                    last_sources = now;
+                }
+            }
             usleep(300000);
             continue;
         }
@@ -5333,7 +5358,7 @@ static void *receiver(void *arg)
         if (recv && now - last_sources >= 2000) {
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
-            if (o->n == 1)
+            if (sources_owner(o))
                 sources_publish(srcs, count);
             last_sources = now;
             /* The sender restarted and our stream now has another address (its inputs can come back on
@@ -5457,7 +5482,7 @@ static void *receiver(void *arg)
             uint32_t count = 0;
             const NDIlib_source_t *srcs = ndi->find_get_current_sources(find, &count);
             sources_publish(srcs, count);
-            if (count != last_count && o->n == 1) {
+            if (count != last_count && sources_owner(o)) {
                 LOG("ndi: %u source(s) visible", count);
                 for (uint32_t i = 0; i < count && i < 20; i++)
                     LOG("ndi:   %s", srcs[i].p_ndi_name);
