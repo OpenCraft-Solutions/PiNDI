@@ -202,10 +202,19 @@ function sources() {
       for (const s of map.values()) {
         if (s.ip === d.status.device.ip && s.stream.toLowerCase() === i.name.toLowerCase()) s.pindi = true;
       }
+      // An input sent as H.264 RTP to a multicast group: any output can join it (rtp://group:port). Unicast
+      // RTP goes to one fixed receiver, so it can't be routed from here.
+      if (i.enabled && i.codec === 'rtp' && isMulticast(i.rtp_dest)) {
+        const stream = 'rtp://' + i.rtp_dest, ip = d.status.device.ip;
+        map.set(stream + '\t' + ip, { name: `${d.status.device.ndi_name || devName(d)} (${i.name})`, stream, ip,
+          pindi: true, rtp: true });
+      }
     }
   }
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
+
+const isMulticast = dest => { const a = Number(/^(\d+)\./.exec(dest || '')?.[1]); return a >= 224 && a <= 239; };
 
 function renderMatrix() {
   const outs = devices.filter(d => d.status).flatMap(d => (d.status.outputs || []).map(o => ({ d, o })));
@@ -241,10 +250,11 @@ function renderMatrix() {
   // "HOST (STREAM)": the host ends at the first " (" (a bridge's stream names have brackets of their own).
   const host = s => { const m = /^(.*?) \((.*)\)$/.exec(s.name); return m ? m[1] : s.name; };
   html += srcs.map(s => `<tr><th class="src">${esc(s.stream)}${s.pindi ? '<span class="tag">PiNDI</span>' : ''}` +
-    `<span class="sub">${esc(host(s))} · ${esc(s.ip)}</span></th>` +
+    `${s.rtp ? '<span class="tag">H.264 RTP</span>' : ''}<span class="sub">${esc(s.rtp ? s.name : host(s))} · ${esc(s.ip)}</span></th>` +
     outs.map(({ d, o }) => {
       const routed = !!o.stream && o.target.toLowerCase() === s.stream.toLowerCase() && (!o.source_ip || o.source_ip === s.ip);
-      return cell(d, o, s, routed, routed && playing(o) && o.source === s.name);
+      // An RTP output's source is the rtp:// address it receives.
+      return cell(d, o, s, routed, routed && playing(o) && o.source === (s.rtp ? s.stream : s.name));
     }).join('') + '</tr>').join('');
   if (!srcs.length) {
     html += `<tr><td class="muted" colspan="${outs.length + 1}">${filter ? 'No source matches the filter.' : 'No NDI sources seen yet.'}</td></tr>`;

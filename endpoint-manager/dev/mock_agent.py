@@ -43,6 +43,19 @@ class Device:
     def own_sources(self):
         return [("%s (IN_%s)" % (self.name.upper(), self.serial), "127.0.0.1")]
 
+    def inputs(self):
+        """Input 1 is sent over NDI; odd-numbered devices also send input 2 as H.264 RTP multicast."""
+        ins = [{"slot": 1, "device": "/dev/v4l/by-id/usb-MOCK", "present": True, "enabled": True,
+                "name": "IN_%s" % self.serial, "state": "ON AIR", "mode": "MJPG 1920x1080@30", "fps": "30.0",
+                "audio": "48 kHz stereo", "on_air": True, "codec": "speedhq", "rtp_dest": ""}]
+        if self.n % 2:
+            dest = "239.255.0.%d:5004" % self.n
+            ins.append({"slot": 2, "device": "/dev/v4l/by-id/usb-MOCK2", "present": True, "enabled": True,
+                        "name": "IN_%s_2" % self.serial, "state": "sending H.264 RTP to %s (30 fps)" % dest,
+                        "mode": "MJPG 1920x1080@30", "fps": "30.0", "audio": "48 kHz stereo", "on_air": False,
+                        "codec": "rtp", "rtp_dest": dest})
+        return ins
+
     def tick(self):
         with self.lock:
             self.temp = min(85, max(35, self.temp + random.uniform(-0.8, 0.8)))
@@ -61,12 +74,18 @@ class Device:
         outs = []
         for o in self.outputs:
             target = o["stream"] or ("OUT_%s" % self.serial if o["n"] == 1 else "OUT_%s_%d" % (self.serial, o["n"]))
-            match = next((s for s in all_sources if s[0].lower().endswith("(%s)" % target.lower()) and
-                          (not o["source_ip"] or s[1] == o["source_ip"])), None)
+            if target.lower().startswith("rtp://"):  # an RTP output's source is the address it receives
+                match = next(((target, "127.0.0.1") for d in DEVICES for i in d.inputs()
+                              if i["codec"] == "rtp" and "rtp://" + i["rtp_dest"] == target), None)
+                fmt = "H.264 RTP, hardware decoded"
+            else:
+                match = next((s for s in all_sources if s[0].lower().endswith("(%s)" % target.lower()) and
+                              (not o["source_ip"] or s[1] == o["source_ip"])), None)
+                fmt = "Full NDI (SpeedHQ)"
             outs.append({"n": o["n"], "connector": o["connector"], "enabled": True,
                          "state": "playing" if match else "waiting for %s" % target, "target": target,
                          "source": match[0] if match else "", "video": "1920x1080 59.94p" if match else "",
-                         "format": "Full NDI (SpeedHQ)" if match else "", "audio": "", "latency": "2 frames" if match else "",
+                         "format": fmt if match else "", "audio": "", "latency": "2 frames" if match else "",
                          "stream": o["stream"], "source_ip": o["source_ip"], "backup": "",
                          "display": {"link": "connected", "mode": "1920x1080@60"}})
         up = int(time.time() - self.started)
@@ -81,9 +100,7 @@ class Device:
                                        "throttled": 0, "rx_bps": int(self.rx), "tx_bps": int(self.tx), "link_mbps": 1000},
                            "update": self.update["state"]},
                 "outputs": outs,
-                "inputs": [{"slot": 1, "device": "/dev/v4l/by-id/usb-MOCK", "present": True, "enabled": True,
-                            "name": "IN_%s" % self.serial, "state": "ON AIR", "mode": "MJPG 1920x1080@30",
-                            "fps": "30.0", "audio": "48 kHz stereo", "on_air": True}],
+                "inputs": self.inputs(),
                 "sources": [{"name": s[0], "stream": re.match(r"^.*? \((.*)\)$", s[0]).group(1), "ip": s[1]}
                             for s in all_sources]}
 
