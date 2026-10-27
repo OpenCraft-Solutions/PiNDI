@@ -1,5 +1,5 @@
 /*
- * pindi-sender - PiNDI outgoing NDI (or H.264 RTP) streams from USB (UVC) HDMI capture devices and
+ * pindi-sender - PiNDI outgoing NDI (or H.264 RTP, SRT) streams from USB (UVC) HDMI capture devices and
  * CSI-2 HDMI bridges (TC358743 on a camera connector).
  *
  * Nothing is sent unless configured (web UI "Configure Outgoing Streams"):
@@ -11,9 +11,13 @@
  *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default), or off
  *   PINDI_IN<n>_AUDIO_SYNC=off                 send the audio as the device's clock delivers it (default:
  *                                              kept in step with this Pi's clock)
- *   PINDI_IN<n>_CODEC=speedhq                  Full NDI (default), hx (NDI|HX) or rtp (H.264 over RTP, no NDI)
+ *   PINDI_IN<n>_CODEC=speedhq                  Full NDI (default), hx (NDI|HX), rtp (H.264 over RTP, no NDI)
+ *                                              or srt (H.264 in MPEG-TS over SRT, no NDI)
  *   PINDI_IN<n>_RTP_DEST=239.255.0.1:5004      rtp: where to send it (unicast or multicast address and port)
- *   PINDI_IN<n>_RTP_KBPS=                      rtp: video bit rate in kbit/s (default: about 6 Mbit/s at 1080p30)
+ *   PINDI_IN<n>_SRT_URL=srt://:9000            srt: listen on that port, or srt://host:port to call a receiver;
+ *                                              ?passphrase=...&latency=<ms>&streamid=... (as for ffmpeg)
+ *   PINDI_IN<n>_KBPS=                          rtp, srt: video bit rate in kbit/s (default: about 6 Mbit/s at
+ *                                              1080p30)
  *
  * One thread per input: V4L2 capture -> decode workers (MJPEG decode straight to YUV, two threads
  * at HD) -> NDI send, and one for its audio: ALSA capture (48 kHz stereo) -> NDI send.
@@ -30,10 +34,12 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,6 +76,7 @@
 #define MAX_IN 8
 #define NCAP 4
 #define RUN_DIR "/run/pindi"
+#define AUDIO_RATE 48000
 
 static const NDIlib_v6 *ndi;
 static volatile sig_atomic_t running = 1;
@@ -976,6 +983,686 @@ static void rtp_send_audio(struct rtp_out *r, const int16_t *s, int n)
         rtcp_sr(r, &r->a, 3, r->a.last_100ns, r->a.last_ts);
 }
 
+/* ------------------------------------------------------------------ H.264 over SRT */
+
+/* With PINDI_IN<n>_CODEC=srt the hardware encoder's H.264 and the audio go out as an MPEG transport
+ * stream over SRT (Secure Reliable Transport): lost packets are sent again within the latency, so it
+ * also crosses Wi-Fi, routed networks and the internet, optionally encrypted (AES, with a passphrase).
+ * Any SRT receiver plays it: another PiNDI, VLC, ffmpeg, OBS, hardware decoders. PINDI_IN<n>_SRT_URL:
+ *   srt://:9000              listener: receivers call this device on port 9000 (up to SRT_MAX_PEERS)
+ *   srt://192.168.1.60:9000  caller: this device calls that receiver, and calls again when it drops
+ * with ?passphrase=...&latency=<ms>&streamid=... as ffmpeg and VLC write them. The audio is 48 kHz
+ * stereo PCM as SMPTE 302M (uncompressed, as over NDI and RTP). Timestamps are the capture times (UTC,
+ * 90 kHz), and the service provider "PiNDI" (SDT) tells a PiNDI receiver so: its latency figure. The
+ * encoder runs only while someone receives, and a new receiver gets a keyframe at once. libsrt is
+ * loaded at run time. The video is muxed by the encoder thread, the audio by the audio thread: each
+ * has its own message buffer and continuity counters; sending to the receivers is shared (mu). */
+#define SRT_MAX_PEERS 8
+#define TS_MSG 7                /* TS packets per SRT message: 1316 bytes, the live mode's payload */
+#define TS_PID_PMT 0x1000
+#define TS_PID_SDT 0x11
+#define TS_PID_VIDEO 0x100
+#define TS_PID_AUDIO 0x101
+#define TS_PCR_DELAY 13500      /* the PCR runs 150 ms behind the capture clock: room for capture and encoding */
+#define TS_AUDIO_MAX 960        /* frames per audio PES (20 ms) */
+#define SRT_EAGAIN_MAJOR 6      /* SRT_EASYNCSND, SRT_ECONGEST...: the send buffer is full, nothing broke */
+enum { SRTS_CONNECTED = 5, SRTO_SNDSYN = 1, SRTO_LATENCY = 23, SRTO_PASSPHRASE = 26, SRTO_IPTOS = 30,
+       SRTO_CONNTIMEO = 36, SRTO_STREAMID = 46, SRT_EPOLL_IN = 1, SRT_EPOLL_ERR = 8 };
+
+struct srt_url {
+    bool listen;
+    char host[128];
+    int port;
+    char passphrase[80];
+    int latency; /* ms, -1: libsrt's default (120) */
+    char streamid[128];
+};
+
+static int hexval(int c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* "srt://[host]:port[?key=value&...]": no host (or "@", "0.0.0.0") listens, a host is called; mode=listener
+ * or caller says so explicitly. Values may be %-encoded. Other keys (ffmpeg has many) are ignored. */
+static bool srt_parse(const char *s, struct srt_url *u, const char **err)
+{
+    memset(u, 0, sizeof *u);
+    u->latency = -1;
+    *err = "not an srt:// address";
+    if (strncasecmp(s, "srt://", 6))
+        return false;
+    s += 6;
+    if (*s == '@')
+        s++;
+    const char *q = strchr(s, '?');
+    size_t hl = q ? (size_t)(q - s) : strlen(s);
+    const char *colon = memrchr(s, ':', hl);
+    *err = "no port (srt://host:port, or srt://:port to listen)";
+    if (!colon || (size_t)(colon - s) >= sizeof u->host)
+        return false;
+    memcpy(u->host, s, (size_t)(colon - s));
+    u->host[colon - s] = 0;
+    char *end;
+    long port = strtol(colon + 1, &end, 10);
+    if (end != s + hl || port < 1 || port > 65535)
+        return false;
+    u->port = (int)port;
+    u->listen = !*u->host || !strcmp(u->host, "0.0.0.0");
+    for (const char *p = q ? q + 1 : NULL; p && *p;) {
+        const char *amp = strchr(p, '&'), *eq = strchr(p, '=');
+        size_t kl = (size_t)((amp ? amp : p + strlen(p)) - p);
+        char key[24], val[160];
+        size_t vn = 0;
+        if (eq && eq < p + kl && (size_t)(eq - p) < sizeof key) {
+            memcpy(key, p, (size_t)(eq - p));
+            key[eq - p] = 0;
+            for (const char *v = eq + 1; v < p + kl && vn + 1 < sizeof val; v++) {
+                if (*v == '%' && v + 2 < p + kl + 1 && hexval(v[1]) >= 0 && hexval(v[2]) >= 0) {
+                    val[vn++] = (char)(hexval(v[1]) * 16 + hexval(v[2]));
+                    v += 2;
+                } else {
+                    val[vn++] = *v;
+                }
+            }
+            val[vn] = 0;
+            if (!strcasecmp(key, "passphrase")) {
+                *err = "the passphrase must be 10 to 79 characters";
+                if (vn < 10 || vn > 79)
+                    return false;
+                memcpy(u->passphrase, val, vn + 1);
+            } else if (!strcasecmp(key, "latency")) {
+                long l = strtol(val, &end, 10);
+                *err = "the latency must be 20 to 8000 ms";
+                if (*end || l < 20 || l > 8000)
+                    return false;
+                u->latency = (int)l;
+            } else if (!strcasecmp(key, "streamid")) {
+                snprintf(u->streamid, sizeof u->streamid, "%.127s", val);
+            } else if (!strcasecmp(key, "mode")) {
+                *err = "mode must be listener or caller";
+                if (strcasecmp(val, "listener") && strcasecmp(val, "caller"))
+                    return false;
+                u->listen = !strcasecmp(val, "listener");
+            }
+        }
+        p = amp ? amp + 1 : NULL;
+    }
+    *err = "a caller needs the receiver's address (srt://host:port)";
+    if (!u->listen && !*u->host)
+        return false;
+    return true;
+}
+
+/* libsrt, loaded at run time: SRT is optional (install.sh installs it when it can). */
+static struct {
+    bool tried, ok;
+    char name[32];
+    int (*startup)(void);
+    int (*create_socket)(void);
+    int (*setsockflag)(int s, int opt, const void *val, int len);
+    int (*bind)(int s, const struct sockaddr *a, int len);
+    int (*listen)(int s, int backlog);
+    int (*accept)(int s, struct sockaddr *a, int *len);
+    int (*connect)(int s, const struct sockaddr *a, int len);
+    int (*sendmsg2)(int s, const char *buf, int len, void *mctrl);
+    int (*close)(int s);
+    int (*getsockstate)(int s);
+    const char *(*getlasterror_str)(void);
+    int (*getlasterror)(int *errno_loc);
+    int (*epoll_create)(void);
+    int (*epoll_add_usock)(int eid, int s, const int *events);
+    int (*epoll_wait)(int eid, int *rd, int *rn, int *wr, int *wn, int64_t ms, int *lrd, int *lrn, int *lwr,
+                      int *lwn);
+    int (*epoll_release)(int eid);
+    void (*setloglevel)(int level);
+} srt;
+static pthread_mutex_t srt_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static bool srt_load(void)
+{
+    pthread_mutex_lock(&srt_mu);
+    if (!srt.tried) {
+        srt.tried = true;
+        static const char *const libs[] = { "libsrt-gnutls.so.1.5", "libsrt.so.1.5", "libsrt-openssl.so.1.5",
+                                            "libsrt-gnutls.so.1.4", "libsrt.so.1.4" };
+        void *lib = NULL;
+        for (size_t i = 0; i < sizeof libs / sizeof *libs && !lib; i++)
+            if ((lib = dlopen(libs[i], RTLD_NOW | RTLD_LOCAL)))
+                snprintf(srt.name, sizeof srt.name, "%s", libs[i]);
+#define SRT_SYM(f) (*(void **)&srt.f = lib ? dlsym(lib, "srt_" #f) : NULL)
+        srt.ok = SRT_SYM(startup) && SRT_SYM(create_socket) && SRT_SYM(setsockflag) && SRT_SYM(bind) &&
+                 SRT_SYM(listen) && SRT_SYM(accept) && SRT_SYM(connect) && SRT_SYM(sendmsg2) && SRT_SYM(close) &&
+                 SRT_SYM(getsockstate) && SRT_SYM(getlasterror_str) && SRT_SYM(getlasterror) &&
+                 SRT_SYM(epoll_create) && SRT_SYM(epoll_add_usock) && SRT_SYM(epoll_wait) &&
+                 SRT_SYM(epoll_release) && SRT_SYM(setloglevel);
+#undef SRT_SYM
+        if (srt.ok) {
+            srt.setloglevel(3); /* LOG_ERR */
+            srt.ok = srt.startup() >= 0;
+        }
+        LOG("SRT %s%s", srt.ok ? "with " : "not available (no libsrt)", srt.ok ? srt.name : "");
+    }
+    bool ok = srt.ok;
+    pthread_mutex_unlock(&srt_mu);
+    return ok;
+}
+
+struct ts_msg {
+    uint8_t b[TS_MSG * 188];
+    int n; /* packets in b */
+};
+
+struct srt_out {
+    int n;                      /* the input */
+    struct srt_url u;
+    char shown[200];            /* the address for logs and status: without the passphrase */
+    char name[128];
+    bool audio;
+    pthread_t thr;
+    bool thr_on;
+    volatile bool quit;
+    pthread_mutex_t mu;         /* the fields below up to state */
+    int lsock;                  /* listener: its socket, -1 */
+    int peer[SRT_MAX_PEERS], npeers;
+    char peer_s[SRT_MAX_PEERS][48];
+    bool joined;                /* a receiver came: force a keyframe */
+    uint64_t dropped;           /* messages a receiver's full send buffer didn't take */
+    char state[128];            /* why nothing is sent (caller: not connected) */
+    struct ts_msg vm, am;       /* the video's, the audio's */
+    uint8_t cc_pat, cc_pmt, cc_sdt, cc_v, cc_a;
+    uint64_t psi_ms;
+    uint8_t *pes;               /* the video PES being sent */
+    size_t pes_cap;
+    int64_t a_base;             /* audio: capture time (100 ns UTC) of a_frames' frame 0 */
+    uint64_t a_frames;
+};
+
+static uint32_t crc32_mpeg(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xffffffff;
+    while (n--) {
+        c ^= (uint32_t)*p++ << 24;
+        for (int k = 0; k < 8; k++)
+            c = c & 0x80000000 ? c << 1 ^ 0x04c11db7 : c << 1;
+    }
+    return c;
+}
+
+static void srt_drop_peer(struct srt_out *s, int i, const char *why)
+{
+    LOG("input %d: SRT: receiver %s left (%s)", s->n, s->peer_s[i], why);
+    srt.close(s->peer[i]);
+    s->npeers--;
+    s->peer[i] = s->peer[s->npeers];
+    memcpy(s->peer_s[i], s->peer_s[s->npeers], sizeof s->peer_s[i]);
+}
+
+/* The message's packets to every receiver. Sockets don't block: a receiver that can't keep up loses
+ * what doesn't fit its send buffer (live mode), the others carry on. */
+static void srt_flush(struct srt_out *s, struct ts_msg *m)
+{
+    if (!m->n)
+        return;
+    pthread_mutex_lock(&s->mu);
+    for (int i = 0; i < s->npeers;) {
+        if (srt.sendmsg2(s->peer[i], (const char *)m->b, m->n * 188, NULL) < 0) {
+            if (srt.getlasterror(NULL) / 1000 == SRT_EAGAIN_MAJOR) {
+                s->dropped++;
+            } else {
+                srt_drop_peer(s, i, srt.getlasterror_str());
+                continue;
+            }
+        }
+        i++;
+    }
+    pthread_mutex_unlock(&s->mu);
+    m->n = 0;
+}
+
+/* One TS packet: up to n bytes of p (returns how many), with an adaptation field for af_flags (0x40 random
+ * access, 0x10 with the PCR pcr) or to fill the packet. */
+static size_t ts_packet(struct srt_out *s, struct ts_msg *m, uint16_t pid, uint8_t *cc, bool start, int af_flags,
+                        int64_t pcr, const uint8_t *p, size_t n)
+{
+    uint8_t *t = m->b + m->n * 188;
+    size_t hdr = af_flags ? (af_flags & 0x10 ? 7 : 1) : 0; /* flags byte, PCR */
+    size_t room = 184 - (hdr ? 1 + hdr : 0);
+    size_t take = n < room ? n : room, left = room - take;
+    size_t af = hdr ? 1 + hdr + left : left; /* adaptation field bytes, its length byte included */
+    t[0] = 0x47;
+    t[1] = (uint8_t)((start ? 0x40 : 0) | pid >> 8);
+    t[2] = (uint8_t)pid;
+    t[3] = (uint8_t)((af ? 0x30 : 0x10) | (*cc & 15));
+    (*cc)++;
+    if (af) {
+        t[4] = (uint8_t)(af - 1);
+        if (af >= 2) {
+            t[5] = (uint8_t)af_flags;
+            size_t at = 6;
+            if (af_flags & 0x10) {
+                uint64_t b = (uint64_t)pcr & 0x1ffffffffULL;
+                t[6] = (uint8_t)(b >> 25);
+                t[7] = (uint8_t)(b >> 17);
+                t[8] = (uint8_t)(b >> 9);
+                t[9] = (uint8_t)(b >> 1);
+                t[10] = (uint8_t)((b & 1) << 7 | 0x7e);
+                t[11] = 0;
+                at = 12;
+            }
+            memset(t + at, 0xff, 4 + af - at);
+        }
+    }
+    memcpy(t + 4 + af, p, take);
+    if (++m->n == TS_MSG)
+        srt_flush(s, m);
+    return take;
+}
+
+/* A PSI section in one packet (pointer field first, 0xFF after). */
+static void ts_section(struct srt_out *s, uint16_t pid, uint8_t *cc, uint8_t *sec, size_t len)
+{
+    uint32_t crc = crc32_mpeg(sec, len);
+    put32(sec + len, crc);
+    uint8_t p[184];
+    memset(p, 0xff, sizeof p);
+    p[0] = 0;
+    memcpy(p + 1, sec, len + 4);
+    ts_packet(s, &s->vm, pid, cc, true, 0, 0, p, sizeof p);
+}
+
+/* PAT, PMT and SDT: before each keyframe, and every half second. */
+static void ts_psi(struct srt_out *s)
+{
+    uint8_t sec[180];
+    static const uint8_t pat[] = { 0x00, 0xb0, 13, 0, 1, 0xc1, 0, 0, 0, 1, 0xe0 | TS_PID_PMT >> 8, TS_PID_PMT & 0xff };
+    memcpy(sec, pat, sizeof pat);
+    ts_section(s, 0, &s->cc_pat, sec, sizeof pat);
+
+    size_t n = 0;
+    uint8_t *p = sec;
+    p[n++] = 0x02;
+    n += 2; /* section length */
+    p[n++] = 0;
+    p[n++] = 1; /* program 1 */
+    p[n++] = 0xc1;
+    p[n++] = 0;
+    p[n++] = 0;
+    p[n++] = 0xe0 | TS_PID_VIDEO >> 8; /* PCR PID */
+    p[n++] = TS_PID_VIDEO & 0xff;
+    p[n++] = 0xf0;
+    p[n++] = 0; /* no program descriptors */
+    p[n++] = 0x1b; /* H.264 */
+    p[n++] = 0xe0 | TS_PID_VIDEO >> 8;
+    p[n++] = TS_PID_VIDEO & 0xff;
+    p[n++] = 0xf0;
+    p[n++] = 0;
+    if (s->audio) {
+        static const uint8_t a[] = { 0x06, 0xe0 | TS_PID_AUDIO >> 8, TS_PID_AUDIO & 0xff, 0xf0, 6,
+                                     0x05, 4, 'B', 'S', 'S', 'D' }; /* registration: SMPTE 302M */
+        memcpy(p + n, a, sizeof a);
+        n += sizeof a;
+    }
+    p[1] = (uint8_t)(0xb0 | (n + 4 - 3) >> 8);
+    p[2] = (uint8_t)(n + 4 - 3);
+    ts_section(s, TS_PID_PMT, &s->cc_pmt, sec, n);
+
+    size_t nl = strlen(s->name) > 64 ? 64 : strlen(s->name);
+    n = 0;
+    p[n++] = 0x42; /* SDT, this stream */
+    n += 2;
+    p[n++] = 0;
+    p[n++] = 1;
+    p[n++] = 0xc1;
+    p[n++] = 0;
+    p[n++] = 0;
+    p[n++] = 0xff;
+    p[n++] = 0x01; /* original network */
+    p[n++] = 0xff;
+    p[n++] = 0;
+    p[n++] = 1; /* service 1 */
+    p[n++] = 0xfc;
+    size_t dl = 2 + 3 + 5 + nl;
+    p[n++] = (uint8_t)(0x80 | dl >> 8); /* running */
+    p[n++] = (uint8_t)dl;
+    p[n++] = 0x48; /* service descriptor */
+    p[n++] = (uint8_t)(dl - 2);
+    p[n++] = 0x01; /* digital television */
+    p[n++] = 5;
+    memcpy(p + n, "PiNDI", 5);
+    n += 5;
+    p[n++] = (uint8_t)nl;
+    memcpy(p + n, s->name, nl);
+    n += nl;
+    p[1] = (uint8_t)(0xf0 | (n + 4 - 3) >> 8);
+    p[2] = (uint8_t)(n + 4 - 3);
+    ts_section(s, TS_PID_SDT, &s->cc_sdt, sec, n);
+    s->psi_ms = now_ms();
+}
+
+static void pes_pts(uint8_t *p, int64_t pts)
+{
+    uint64_t v = (uint64_t)pts & 0x1ffffffffULL;
+    p[0] = (uint8_t)(0x21 | (v >> 29 & 0x0e));
+    p[1] = (uint8_t)(v >> 22);
+    p[2] = (uint8_t)(v >> 14 | 1);
+    p[3] = (uint8_t)(v >> 7);
+    p[4] = (uint8_t)(v << 1 | 1);
+}
+
+/* A PES packet (header, then d) as TS packets. The video's PES length is given whenever it fits 16 bits,
+ * so a receiver knows the picture is complete without waiting for the next one. */
+static void ts_pes(struct srt_out *s, struct ts_msg *m, uint16_t pid, uint8_t *cc, uint8_t sid, int64_t pts90,
+                   int af_flags, int64_t pcr, const uint8_t *d, size_t n)
+{
+    uint8_t h[14] = { 0, 0, 1, sid, 0, 0, 0x84, 0x80, 5 }; /* data aligned, a PTS */
+    size_t len = n + 8;
+    if (len <= 0xffff) {
+        h[4] = (uint8_t)(len >> 8);
+        h[5] = (uint8_t)len;
+    }
+    pes_pts(h + 9, pts90);
+    /* The first packet: the header and what fits after it. */
+    uint8_t first[184];
+    size_t room = 184 - (af_flags ? (af_flags & 0x10 ? 8 : 2) : 0) - sizeof h;
+    size_t k = n < room ? n : room;
+    memcpy(first, h, sizeof h);
+    memcpy(first + sizeof h, d, k);
+    ts_packet(s, m, pid, cc, true, af_flags, pcr, first, sizeof h + k);
+    for (size_t at = k; at < n;)
+        at += ts_packet(s, m, pid, cc, false, 0, 0, d + at, n - at);
+    srt_flush(s, m); /* the whole picture or sound out now: no waiting for the next one */
+}
+
+static int64_t ts90(int64_t t100ns)
+{
+    return t100ns * 9 / 1000;
+}
+
+static int srt_peers(struct srt_out *s)
+{
+    pthread_mutex_lock(&s->mu);
+    int n = s->npeers;
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+/* Did a receiver come since the last call? (Then a keyframe is wanted.) */
+static bool srt_take_joined(struct srt_out *s)
+{
+    pthread_mutex_lock(&s->mu);
+    bool j = s->joined;
+    s->joined = false;
+    pthread_mutex_unlock(&s->mu);
+    return j;
+}
+
+/* One encoded picture (Annex B), captured at t (100 ns UTC). */
+static void srt_send_video(struct srt_out *s, const uint8_t *data, size_t len, int64_t t, bool key)
+{
+    if (!srt_peers(s))
+        return;
+    if (key || now_ms() - s->psi_ms >= 500)
+        ts_psi(s);
+    /* An access unit delimiter first (H.222.0 asks for one in each access unit), unless it has one. */
+    static const uint8_t aud[] = { 0, 0, 0, 1, 0x09, 0xf0 };
+    size_t at = 0;
+    const uint8_t *nal = NULL;
+    size_t nlen = 0;
+    bool has_aud = annexb_next(data, len, &at, &nal, &nlen) && nlen && (nal[0] & 0x1f) == 9;
+    size_t need = len + (has_aud ? 0 : sizeof aud);
+    if (s->pes_cap < need) {
+        free(s->pes);
+        s->pes_cap = need + 65536;
+        if (!(s->pes = malloc(s->pes_cap))) {
+            s->pes_cap = 0;
+            return;
+        }
+    }
+    size_t n = 0;
+    if (!has_aud) {
+        memcpy(s->pes, aud, sizeof aud);
+        n = sizeof aud;
+    }
+    memcpy(s->pes + n, data, len);
+    n += len;
+    ts_pes(s, &s->vm, TS_PID_VIDEO, &s->cc_v, 0xe0, ts90(t), 0x10 | (key ? 0x40 : 0), ts90(now_100ns()) - TS_PCR_DELAY,
+           s->pes, n);
+}
+
+static uint8_t rev8(uint8_t b)
+{
+    b = (uint8_t)((b & 0xf0) >> 4 | (b & 0x0f) << 4);
+    b = (uint8_t)((b & 0xcc) >> 2 | (b & 0x33) << 2);
+    return (uint8_t)((b & 0xaa) >> 1 | (b & 0x55) << 1);
+}
+
+/* n frames of 48 kHz stereo audio as SMPTE 302M: 4-byte header, then each frame as two 20-bit AES3
+ * subframes (16-bit sample, then the V, U, C and F bits; F starts each 192-frame block), bit-reversed. */
+static void srt_send_audio(struct srt_out *s, const int16_t *smp, int n)
+{
+    if (!srt_peers(s))
+        return;
+    /* The first frame's capture time: they end about now. Kept on a frame count, so the PTS run evenly,
+     * and taken again if that drifts from the clock by more than 40 ms. */
+    int64_t now = now_100ns(), start = now - (int64_t)n * 10000000 / AUDIO_RATE;
+    int64_t expect = s->a_base + (int64_t)(s->a_frames * 10000000 / AUDIO_RATE);
+    if (!s->a_base || llabs(expect - start) > 400000) {
+        s->a_base = start;
+        s->a_frames = 0;
+    }
+    uint8_t buf[4 + TS_AUDIO_MAX * 5];
+    for (int at = 0; at < n; at += TS_AUDIO_MAX) {
+        int k = n - at < TS_AUDIO_MAX ? n - at : TS_AUDIO_MAX;
+        put32(buf, (uint32_t)(k * 5) << 16); /* payload size; 2 channels, 16 bits */
+        uint8_t *o = buf + 4;
+        for (int i = 0; i < k; i++, o += 5) {
+            uint16_t l = (uint16_t)smp[(at + i) * 2], r = (uint16_t)smp[(at + i) * 2 + 1];
+            uint8_t f = (s->a_frames + (uint64_t)i) % 192 ? 0 : 0x10;
+            o[0] = rev8((uint8_t)l);
+            o[1] = rev8((uint8_t)(l >> 8));
+            o[2] = (uint8_t)(rev8((uint8_t)((r & 0x0f) << 4)) | f);
+            o[3] = rev8((uint8_t)(r >> 4));
+            o[4] = rev8((uint8_t)(r >> 12));
+        }
+        int64_t t = s->a_base + (int64_t)(s->a_frames * 10000000 / AUDIO_RATE);
+        ts_pes(s, &s->am, TS_PID_AUDIO, &s->cc_a, 0xbd, ts90(t), 0, 0, buf, 4 + (size_t)k * 5);
+        s->a_frames += (uint64_t)k;
+    }
+}
+
+/* SRT options both ends must agree on; set before connecting (inherited by a listener's receivers). */
+static bool srt_options(struct srt_out *s, int sock)
+{
+    int tos = 0x88; /* DSCP AF41, as for RTP */
+    srt.setsockflag(sock, SRTO_IPTOS, &tos, sizeof tos);
+    if (s->u.latency >= 0 && srt.setsockflag(sock, SRTO_LATENCY, &s->u.latency, sizeof s->u.latency) < 0)
+        return false;
+    if (*s->u.passphrase &&
+        srt.setsockflag(sock, SRTO_PASSPHRASE, s->u.passphrase, (int)strlen(s->u.passphrase)) < 0)
+        return false;
+    if (*s->u.streamid && !s->u.listen &&
+        srt.setsockflag(sock, SRTO_STREAMID, s->u.streamid, (int)strlen(s->u.streamid)) < 0)
+        return false;
+    return true;
+}
+
+static void srt_set_state(struct srt_out *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void srt_set_state(struct srt_out *s, const char *fmt, ...)
+{
+    char buf[sizeof s->state];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    pthread_mutex_lock(&s->mu);
+    if (strcmp(buf, s->state)) {
+        if (*buf)
+            LOG("input %d: SRT: %s", s->n, buf);
+        snprintf(s->state, sizeof s->state, "%s", buf);
+    }
+    pthread_mutex_unlock(&s->mu);
+}
+
+static void srt_add_peer(struct srt_out *s, int sock, const struct sockaddr_in *a)
+{
+    bool no = false;
+    srt.setsockflag(sock, SRTO_SNDSYN, &no, sizeof no);
+    pthread_mutex_lock(&s->mu);
+    if (s->npeers == SRT_MAX_PEERS) {
+        pthread_mutex_unlock(&s->mu);
+        LOG("input %d: SRT: refused a receiver: already %d", s->n, SRT_MAX_PEERS);
+        srt.close(sock);
+        return;
+    }
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip);
+    snprintf(s->peer_s[s->npeers], sizeof s->peer_s[0], "%s:%d", ip, ntohs(a->sin_port));
+    s->peer[s->npeers++] = sock;
+    s->joined = true;
+    LOG("input %d: SRT: receiver %s connected (%d now)", s->n, s->peer_s[s->npeers - 1], s->npeers);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Connections: a listener accepts receivers; a caller calls its receiver, again when it drops. Receivers
+ * whose connection broke are let go here too (a send to them may not fail at once). */
+static void *srt_thread(void *arg)
+{
+    struct srt_out *s = arg;
+    int eid = -1;
+    uint64_t next_try = 0;
+    while (!s->quit) {
+        uint64_t now = now_ms();
+        if (s->u.listen && s->lsock < 0 && now >= next_try) {
+            int l = srt.create_socket();
+            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)s->u.port) };
+            if (l >= 0 && srt_options(s, l) && !srt.bind(l, (struct sockaddr *)&a, sizeof a) &&
+                !srt.listen(l, SRT_MAX_PEERS)) {
+                s->lsock = l;
+                eid = srt.epoll_create();
+                int ev = SRT_EPOLL_IN | SRT_EPOLL_ERR;
+                srt.epoll_add_usock(eid, l, &ev);
+                srt_set_state(s, "waiting for receivers on port %d", s->u.port);
+            } else {
+                srt_set_state(s, "cannot listen on port %d: %s (trying again)", s->u.port, srt.getlasterror_str());
+                if (l >= 0)
+                    srt.close(l);
+                next_try = now + 5000;
+            }
+        }
+        if (s->lsock >= 0) {
+            int rd[2], rn = 2;
+            if (srt.epoll_wait(eid, rd, &rn, NULL, NULL, 300, NULL, NULL, NULL, NULL) > 0) {
+                struct sockaddr_in a;
+                int al = sizeof a;
+                int c = srt.accept(s->lsock, (struct sockaddr *)&a, &al);
+                if (c >= 0)
+                    srt_add_peer(s, c, &a);
+            }
+        } else if (!s->u.listen && !srt_peers(s) && now >= next_try) {
+            /* Called again every 2 s: the address is looked up each time (it may be a name, or change). */
+            struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *ai = NULL;
+            char port[8];
+            snprintf(port, sizeof port, "%d", s->u.port);
+            int c = -1;
+            next_try = now + 2000;
+            if (getaddrinfo(s->u.host, port, &hints, &ai) || !ai) {
+                srt_set_state(s, "calling %s: unknown address (trying again)", s->shown);
+            } else if ((c = srt.create_socket()) >= 0 && srt_options(s, c) &&
+                       !srt.connect(c, ai->ai_addr, (int)ai->ai_addrlen)) {
+                srt_add_peer(s, c, (struct sockaddr_in *)ai->ai_addr);
+                srt_set_state(s, "%s", "");
+                c = -1;
+            } else {
+                srt_set_state(s, "calling %s: %s (trying again)", s->shown,
+                              c < 0 ? "cannot make a socket" : srt.getlasterror_str());
+            }
+            if (c >= 0)
+                srt.close(c);
+            if (ai)
+                freeaddrinfo(ai);
+        } else {
+            usleep(200000);
+        }
+        pthread_mutex_lock(&s->mu);
+        for (int i = 0; i < s->npeers;) {
+            if (srt.getsockstate(s->peer[i]) > SRTS_CONNECTED)
+                srt_drop_peer(s, i, "connection closed");
+            else
+                i++;
+        }
+        pthread_mutex_unlock(&s->mu);
+    }
+    if (eid >= 0)
+        srt.epoll_release(eid);
+    return NULL;
+}
+
+/* PINDI_IN<n>_SRT_URL for input n. False (state: why) if it can't be sent. */
+static bool srt_open(struct srt_out *s, int n, const char *url, const char *name, bool audio)
+{
+    memset(s, 0, sizeof *s);
+    pthread_mutex_init(&s->mu, NULL);
+    s->n = n;
+    s->lsock = -1;
+    s->audio = audio;
+    snprintf(s->name, sizeof s->name, "%s", name);
+    const char *err;
+    if (!srt_parse(url, &s->u, &err)) {
+        LOG("input %d: SRT: \"%s\": %s", n, url, err);
+        snprintf(s->state, sizeof s->state, "not sent: the SRT address is not valid (%s)", err);
+        return false;
+    }
+    int k = snprintf(s->shown, sizeof s->shown, "srt://%s:%d", s->u.listen ? "" : s->u.host, s->u.port);
+    if (s->u.latency >= 0 && k > 0 && (size_t)k < sizeof s->shown)
+        k += snprintf(s->shown + k, sizeof s->shown - (size_t)k, "?latency=%d", s->u.latency);
+    if (*s->u.passphrase && k > 0 && (size_t)k < sizeof s->shown)
+        snprintf(s->shown + k, sizeof s->shown - (size_t)k, " (encrypted)");
+    if (!srt_load()) {
+        snprintf(s->state, sizeof s->state, "not sent: SRT needs libsrt (run install.sh with internet access)");
+        return false;
+    }
+    LOG("input %d: H.264 SRT %s %s", n, s->u.listen ? "listening at" : "calling", s->shown);
+    s->thr_on = !pthread_create(&s->thr, NULL, srt_thread, s);
+    return s->thr_on;
+}
+
+static void srt_close(struct srt_out *s)
+{
+    if (s->thr_on) {
+        s->quit = true;
+        pthread_join(s->thr, NULL);
+        s->thr_on = false;
+    }
+    pthread_mutex_lock(&s->mu);
+    while (s->npeers)
+        srt_drop_peer(s, 0, "stopped");
+    if (s->lsock >= 0)
+        srt.close(s->lsock);
+    s->lsock = -1;
+    pthread_mutex_unlock(&s->mu);
+    free(s->pes);
+    s->pes = NULL;
+    s->pes_cap = 0;
+}
+
+/* The status line while sending. */
+static void srt_status(struct srt_out *s, char *buf, size_t n, double fps)
+{
+    pthread_mutex_lock(&s->mu);
+    if (s->npeers == 1 && !s->u.listen)
+        snprintf(buf, n, "sending H.264 SRT to %.80s (%.0f fps)", s->shown, fps);
+    else if (s->npeers)
+        snprintf(buf, n, "sending H.264 SRT to %d receiver%s on port %d (%.0f fps)", s->npeers,
+                 s->npeers == 1 ? "" : "s", s->u.port, fps);
+    else if (s->u.listen)
+        snprintf(buf, n, "ready: SRT receivers can connect on port %d%s", s->u.port,
+                 *s->u.passphrase ? " (encrypted)" : "");
+    else
+        snprintf(buf, n, "%.120s", *s->state ? s->state : "calling");
+    pthread_mutex_unlock(&s->mu);
+}
+
 /* ------------------------------------------------------------------ input thread */
 
 struct input {
@@ -986,8 +1673,11 @@ struct input {
     bool hx; /* PINDI_IN<n>_CODEC=hx: NDI|HX through the hardware H.264 encoder */
     bool rtp; /* PINDI_IN<n>_CODEC=rtp: H.264 over RTP through the hardware encoder; no NDI sender */
     char rtp_dest[64];
-    int rtp_kbps;
     struct rtp_out r; /* open while sending (r.fd >= 0) */
+    bool srt; /* PINDI_IN<n>_CODEC=srt: H.264 over SRT through the hardware encoder; no NDI sender */
+    char srt_url[256];
+    struct srt_out s; /* s.thr_on while it can send */
+    int kbps; /* rtp, srt: PINDI_IN<n>_KBPS, 0 = automatic */
     bool video_range; /* PINDI_IN<n>_RANGE=video: the device's JPEG is already 16-235 (else converted) */
     pthread_t thr, athr;
     NDIlib_send_instance_t send;
@@ -1187,8 +1877,10 @@ static void enc_ctrl(int fd, uint32_t id, int value)
     xioctl(fd, VIDIOC_S_CTRL, &c);
 }
 
-/* send: the NDI sender (NDI|HX), NULL for RTP. kbps: the bit rate asked for, 0 = automatic. */
-static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instance_t send, int n, int kbps)
+/* send: the NDI sender (NDI|HX), NULL for RTP and SRT (what: their name). kbps: the bit rate asked for,
+ * 0 = automatic. */
+static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instance_t send, const char *what, int n,
+                       int kbps)
 {
     memset(e, 0, sizeof *e);
     e->fd = open(enc_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -1269,7 +1961,7 @@ static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instan
     if (xioctl(e->fd, VIDIOC_STREAMON, &t))
         goto fail;
     e->frame_100ns = (int64_t)(10000000.0 * m->num / m->den);
-    LOG("input %d: %s: hardware H.264 encoder %s, %.1f Mbit/s", n, send ? "NDI|HX" : "H.264 RTP", enc_dev, bps / 1e6);
+    LOG("input %d: %s: hardware H.264 encoder %s, %.1f Mbit/s", n, what, enc_dev, bps / 1e6);
     return true;
 fail:
     LOG("input %d: hardware H.264 encoder: %s - %s", n, strerror(errno), send ? "sending Full NDI" : "not sent");
@@ -1380,8 +2072,9 @@ struct pipeline {
     NDIlib_video_frame_v2_t pframe;
     pthread_t ndi_thr;
     int frames, damaged, ndi_sent; /* published / skipped / sent over NDI since the last status (mu) */
-    bool hx;          /* H.264 through enc (NDI|HX, or RTP); out[] are its input buffers */
+    bool hx;          /* H.264 through enc (NDI|HX, RTP or SRT); out[] are its input buffers */
     bool rtp;         /* the H.264 goes out as RTP (in->r), not to NDI */
+    bool srt;         /* the H.264 goes out over SRT (in->s), not to NDI */
     struct hwenc enc;
     int out_stride;   /* bytes per UYVY line in out[] */
 };
@@ -1391,7 +2084,7 @@ struct pipeline {
 static void hx_step(struct pipeline *pl, int i, int wait_ms)
 {
     struct hwenc *e = &pl->enc;
-    if (i >= 0 && !pl->rtp) {
+    if (i >= 0 && pl->send) {
         /* A new receiver can't start before a keyframe: send one now (NDI|HX: within 100 ms). The
          * SDK's own request is checked too, but it never fired with these compressed frames. (RTP
          * receivers join at the next regular keyframe, at most a second away.) */
@@ -1401,6 +2094,9 @@ static void hx_step(struct pipeline *pl, int i, int wait_ms)
             e->forced++;
         }
         e->conns = conns;
+    } else if (i >= 0 && pl->srt && srt_take_joined(&pl->in->s)) { /* the same for a new SRT receiver */
+        enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1);
+        e->forced++;
     }
     if (i >= 0) {
         struct v4l2_plane p = { .bytesused = (uint32_t)e->in_len[i], .length = (uint32_t)e->in_len[i] };
@@ -1445,6 +2141,9 @@ static void hx_step(struct pipeline *pl, int i, int wait_ms)
                 bool key = b.flags & V4L2_BUF_FLAG_KEYFRAME;
                 if (pl->rtp) {
                     rtp_send_video(&pl->in->r, data, len, tc ? tc : now_100ns());
+                    e->keys += key;
+                } else if (pl->srt) {
+                    srt_send_video(&pl->in->s, data, len, tc ? tc : now_100ns(), key);
                     e->keys += key;
                 } else {
                     hwenc_send(e, pl->send, &pl->m, data, len, key, tc ? tc : NDIlib_send_timecode_synthesize);
@@ -1842,26 +2541,32 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     streaming = true;
 
     pl.m = m;
-    const char *rtp_why = NULL; /* why an RTP input sends nothing */
-    if (in->rtp) {
-        if (in->r.fps != (double)m.den / m.num) { /* the SDP gives the frame rate: write it again */
+    const char *why = NULL; /* why an RTP or SRT input sends nothing */
+    if (in->rtp || in->srt) {
+        const char *what = in->rtp ? "H.264 RTP" : "H.264 SRT";
+        if (in->rtp && in->r.fps != (double)m.den / m.num) { /* the SDP gives the frame rate: write it again */
             in->r.fps = (double)m.den / m.num;
             in->r.sps_len = 0;
         }
         if (!*enc_dev)
-            rtp_why = "not sent: H.264 RTP needs the hardware H.264 encoder of a Pi 3 or 4";
-        else if (in->r.fd < 0)
-            rtp_why = "not sent: the RTP destination is not a valid address and port";
-        else if (!(pl.hx = pl.rtp = hwenc_open(&pl.enc, &m, NULL, in->n, in->rtp_kbps)))
-            rtp_why = "not sent: the hardware H.264 encoder failed (see the log)";
-        if (rtp_why)
-            LOG("input %d: %s", in->n, rtp_why);
+            why = in->rtp ? "not sent: H.264 RTP needs the hardware H.264 encoder of a Pi 3 or 4"
+                          : "not sent: H.264 SRT needs the hardware H.264 encoder of a Pi 3 or 4";
+        else if (in->rtp && in->r.fd < 0)
+            why = "not sent: the RTP destination is not a valid address and port";
+        else if (in->srt && !in->s.thr_on)
+            why = in->s.state;
+        else if (!(pl.hx = hwenc_open(&pl.enc, &m, NULL, what, in->n, in->kbps)))
+            why = "not sent: the hardware H.264 encoder failed (see the log)";
+        pl.rtp = pl.hx && in->rtp;
+        pl.srt = pl.hx && in->srt;
+        if (why)
+            LOG("input %d: %s", in->n, why);
     } else if (in->hx && !*enc_dev) {
         LOG("input %d: NDI|HX needs the Pi's hardware H.264 encoder (none here) - sending Full NDI", in->n);
     } else if (in->hx && !ndi_target_bit_rate) {
         LOG("input %d: NDI|HX needs the NDI Advanced SDK - sending Full NDI", in->n);
     } else if (in->hx) {
-        pl.hx = hwenc_open(&pl.enc, &m, send, in->n, 0);
+        pl.hx = hwenc_open(&pl.enc, &m, send, "NDI|HX", in->n, 0);
     }
     pl.out_stride = pl.hx ? pl.enc.bpl : m.w * 2;
     pl.nw = m.fourcc == V4L2_PIX_FMT_MJPEG && m.w * m.h >= 1280 * 720 ? (pl.hx ? 3 : 2) : 1;
@@ -1885,6 +2590,9 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     if (in->rtp)
         LOG("input %d: %s from %s as H.264 RTP to %s (%d decoding thread%s)", in->n, mode_desc, in->device,
             in->rtp_dest, pl.nw, pl.nw == 1 ? "" : "s");
+    else if (in->srt)
+        LOG("input %d: %s from %s as H.264 SRT, %s (%d decoding thread%s)", in->n, mode_desc, in->device,
+            in->s.shown, pl.nw, pl.nw == 1 ? "" : "s");
     else
         LOG("input %d: %s from %s as NDI%s \"%s\" (%d decoding thread%s)", in->n, mode_desc, in->device,
             pl.hx ? "|HX" : "", in->name, pl.nw, pl.nw == 1 ? "" : "s");
@@ -1936,7 +2644,8 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             conns_checked = tnow;
         }
         local = local_wanted(in->lf);
-        bool sending = conns > 0 || pl.rtp; /* RTP is sent whether or not anyone receives it */
+        /* RTP is sent whether or not anyone receives it; SRT knows its receivers. */
+        bool sending = conns > 0 || pl.rtp || (pl.srt && srt_peers(&in->s));
         if (!sending && !local) {
             xioctl(fd, VIDIOC_QBUF, &b);
             idle = true;
@@ -1981,11 +2690,16 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             double secs = (now - t0) / 1000.0;
             if (conns)
                 ndi->send_get_tally(send, &tally, 0); /* a switcher (vMix, TriCaster...) has it on program/preview */
-            if (rtp_why)
-                snprintf(st, sizeof st, "%s%s", rtp_why, local ? " (shown on this device)" : "");
-            else if (pl.rtp)
+            if (why) {
+                snprintf(st, sizeof st, "%s%s", why, local ? " (shown on this device)" : "");
+            } else if (pl.rtp) {
                 snprintf(st, sizeof st, "sending H.264 RTP to %s (%.0f fps)%s", in->rtp_dest, sent / secs,
                          local ? ", also shown on this device" : "");
+            } else if (pl.srt) {
+                char ss[128];
+                srt_status(&in->s, ss, sizeof ss, sent / secs);
+                snprintf(st, sizeof st, "%s%s", ss, local ? ", also shown on this device" : "");
+            }
             else if (in->hx && ndi_eval_over)
                 snprintf(st, sizeof st, "NDI|HX video stopped: 30-minute limit of the NDI Advanced SDK evaluation "
                                         "(sound goes on)");
@@ -2008,11 +2722,20 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         if (now - t_log >= 60000) {
             double secs = (now - t_log) / 1000.0;
             LOG("input %d: last %.0f s: camera %.1f fps, decoded %.1f fps, %s %.1f fps, %d damaged frame%s skipped",
-                in->n, secs, log_cam / secs, log_sent / secs, pl.rtp ? "RTP" : "NDI", log_ndi / secs, log_damaged,
-                log_damaged == 1 ? "" : "s");
+                in->n, secs, log_cam / secs, log_sent / secs, pl.rtp ? "RTP" : pl.srt ? "SRT" : "NDI", log_ndi / secs,
+                log_damaged, log_damaged == 1 ? "" : "s");
             if (pl.rtp) {
                 LOG("input %d: H.264 RTP: %d keyframes", in->n, pl.enc.keys);
                 pl.enc.keys = 0;
+            } else if (pl.srt) {
+                pthread_mutex_lock(&in->s.mu);
+                uint64_t dropped = in->s.dropped;
+                in->s.dropped = 0;
+                pthread_mutex_unlock(&in->s.mu);
+                LOG("input %d: H.264 SRT: %d keyframes, %d forced for new receivers, %llu messages dropped "
+                    "(a receiver's send buffer was full)", in->n, pl.enc.keys, pl.enc.forced,
+                    (unsigned long long)dropped);
+                pl.enc.keys = pl.enc.forced = 0;
             } else if (pl.hx) {
                 LOG("input %d: NDI|HX: %d keyframes, %d forced for new receivers", in->n, pl.enc.keys, pl.enc.forced);
                 pl.enc.keys = pl.enc.forced = 0;
@@ -2083,7 +2806,6 @@ static int audio_card_for(const char *video_dev)
     return -1;
 }
 
-#define AUDIO_RATE 48000
 #define AUDIO_PERIOD 960 /* 20 ms */
 
 /* 48 kHz stereo, 20 ms periods, 500 ms buffer. Set explicitly: with snd_pcm_set_params()'s choice
@@ -2137,7 +2859,7 @@ static void levels_append(struct input *in, int peak, double rms)
     fclose(f);
 }
 
-/* Hand n frames to this device's own display and to NDI (or RTP). */
+/* Hand n frames to this device's own display and to NDI (or RTP, SRT). */
 static void audio_out(struct input *in, const int16_t *s, int n)
 {
     struct local_feed *lf = in->lf;
@@ -2153,6 +2875,11 @@ static void audio_out(struct input *in, const int16_t *s, int n)
     if (in->rtp) {
         if (in->r.fd >= 0)
             rtp_send_audio(&in->r, s, n);
+        return;
+    }
+    if (in->srt) {
+        if (in->s.thr_on && *enc_dev)
+            srt_send_audio(&in->s, s, n);
         return;
     }
     /* Nobody listening: drop, as for the video. */
@@ -2366,8 +3093,8 @@ static void *audio_thread(void *arg)
 static void *input_thread(void *arg)
 {
     struct input *in = arg;
-    NDIlib_send_instance_t send = in->send; /* made by main, in input order (none for RTP) */
-    if (!send && !in->rtp) {
+    NDIlib_send_instance_t send = in->send; /* made by main, in input order (none for RTP and SRT) */
+    if (!send && !in->rtp && !in->srt) {
         LOG("input %d: cannot create NDI sender \"%s\"", in->n, in->name);
         status(in, "cannot create NDI sender", NULL, 0, 0, 0);
         return NULL;
@@ -2375,6 +3102,8 @@ static void *input_thread(void *arg)
     in->r.fd = -1;
     if (in->rtp) /* before the audio thread, which sends on it too */
         rtp_open(&in->r, in->n, in->rtp_dest, in->name, in->audio_on, 0);
+    if (in->srt)
+        srt_open(&in->s, in->n, in->srt_url, in->name, in->audio_on);
     bool athr = in->audio_on && !pthread_create(&in->athr, NULL, audio_thread, in);
     if (!in->audio_on)
         set_audio_status(in, "off");
@@ -2390,6 +3119,8 @@ static void *input_thread(void *arg)
     if (athr)
         pthread_join(in->athr, NULL);
     rtp_close(&in->r);
+    if (in->srt)
+        srt_close(&in->s);
     if (send)
         ndi->send_destroy(send);
     return NULL;
@@ -2476,12 +3207,14 @@ int main(void)
         const char *codec = icfg(n, "CODEC", "speedhq");
         in->hx = !strcasecmp(codec, "hx");
         in->rtp = !strcasecmp(codec, "rtp");
+        in->srt = !strcasecmp(codec, "srt");
         snprintf(in->rtp_dest, sizeof in->rtp_dest, "%s", icfg(n, "RTP_DEST", ""));
-        in->rtp_kbps = atoi(icfg(n, "RTP_KBPS", "0"));
-        if (in->rtp_kbps < 0)
-            in->rtp_kbps = 0;
-        if (in->rtp_kbps > 25000) /* the encoder's limit */
-            in->rtp_kbps = 25000;
+        snprintf(in->srt_url, sizeof in->srt_url, "%s", icfg(n, "SRT_URL", ""));
+        in->kbps = atoi(icfg(n, "KBPS", "0"));
+        if (in->kbps < 0)
+            in->kbps = 0;
+        if (in->kbps > 25000) /* the encoder's limit */
+            in->kbps = 25000;
         in->video_range = !strcasecmp(icfg(n, "RANGE", "full"), "video");
         pthread_mutex_init(&in->lock, NULL);
     }
@@ -2491,7 +3224,7 @@ int main(void)
     }
     bool need_ndi = false;
     for (int i = 0; i < nin; i++)
-        need_ndi |= !ins[i].rtp;
+        need_ndi |= !ins[i].rtp && !ins[i].srt;
 
     /* The NDI Advanced SDK's library is libndi_advanced.so.6 (its soname). */
     void *lib = dlopen(NDILIB_LIBRARY_NAME, RTLD_NOW | RTLD_LOCAL);
@@ -2506,7 +3239,7 @@ int main(void)
         return 1;
     }
     if (!ndi)
-        LOG("NDI not available: sending H.264 RTP only");
+        LOG("NDI not available: sending H.264 RTP and SRT only");
     ndi_target_bit_rate = !lib ? NULL : (int (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
         lib, "NDIlib_send_get_target_bit_rate");
     ndi_keyframe_required = !lib ? NULL : (bool (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
@@ -2514,12 +3247,12 @@ int main(void)
     hwenc_find();
     /* The senders are made one after another in input order, not by the input threads as they start:
      * each takes the next free port, so input 1 gets the lower port every time (receivers that remember
-     * a stream's address are less likely to find another input there after a restart). RTP inputs have
-     * none. */
+     * a stream's address are less likely to find another input there after a restart). RTP and SRT
+     * inputs have none. */
     for (int i = 0; i < nin; i++) {
         NDIlib_send_create_t sc = { .p_ndi_name = ins[i].name, .p_groups = NULL, .clock_video = false,
                                     .clock_audio = false };
-        ins[i].send = ins[i].rtp ? NULL : ndi->send_create(&sc);
+        ins[i].send = ins[i].rtp || ins[i].srt ? NULL : ndi->send_create(&sc);
     }
     for (int i = 0; i < nin; i++)
         pthread_create(&ins[i].thr, NULL, input_thread, &ins[i]);
