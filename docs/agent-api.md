@@ -22,6 +22,7 @@ The API every PiNDI device serves, and that the endpoint manager is built agains
 | 1 | ≤ 1.2 | status, output source, identify, restart |
 | 2 | 1.3.0 | `api_version`, `device.metrics`, `device.update`; reboot, update, update log, thumbnails, token from a sign-in |
 | 3 | 1.4.0 | shutdown |
+| 4 | 1.7.0 | H.264 RTP and SRT: `rtp://` and `srt://` output streams, the inputs' `codec`, `rtp_dest` and `srt_url`, their SDP files |
 
 ## Requests
 
@@ -39,7 +40,7 @@ in 10 minutes). The token is the device's single API token, the same one shown i
 
 ```jsonc
 {
- "api_version": 3,
+ "api_version": 4,
  "device": {
   "name": "Lobby left", "ndi_name": "LOBBY-LEFT", "serial": "10000000abcd1234", "model": "Raspberry Pi 4 Model B",
   "version": "1.3.0", "ip": "192.168.1.50",
@@ -57,7 +58,7 @@ in 10 minutes). The token is the device's single API token, the same one shown i
   "n": 1, "connector": "HDMI-A-1", "enabled": true,
   "state": "playing",                  // or "waiting for <stream>", "player not running", ...
   "target": "CAM 2",                   // the stream it shows (OUT_<serial>[_n] by default)
-  "stream": "CAM 2",                   // the setting: "" = the default
+  "stream": "CAM 2",                   // the setting: "" = the default (an SRT stream without its passphrase)
   "source_ip": "192.168.1.21",         // "" = any sender
   "backup": "", "source": "STUDIO-A (CAM 2)", "video": "1920x1080 59.94p", "format": "Full NDI (SpeedHQ)",
   "audio": "48 kHz stereo", "latency": "2 frames",
@@ -65,7 +66,13 @@ in 10 minutes). The token is the device's single API token, the same one shown i
  }],
  "inputs": [{
   "slot": 1, "device": "/dev/v4l/by-id/...", "present": true, "enabled": true, "name": "IN_10000000abcd1234",
-  "state": "ON AIR", "mode": "MJPG 1920x1080@30", "fps": "30.0", "audio": "48 kHz stereo", "on_air": true
+  "state": "ON AIR", "mode": "MJPG 1920x1080@30", "fps": "30.0", "audio": "48 kHz stereo", "on_air": true,
+  "codec": "speedhq",                  // "speedhq" (Full NDI), "hx" (NDI|HX), "rtp" (H.264 RTP) or "srt" (H.264
+                                       // SRT; API version 4)
+  "rtp_dest": "",                      // codec "rtp": where it is sent, "239.255.0.1:5004" (multicast or unicast)
+  "srt_url": ""                        // codec "srt": "srt://:9000" (it listens: receivers call it there) or
+                                       // "srt://192.168.1.60:9000" (it calls that receiver); never with the
+                                       // passphrase: "srt://:9000 (encrypted)" instead
  }],
  "sources": [                          // every NDI source this device sees
   {"name": "STUDIO-A (CAM 2)", "stream": "CAM 2", "ip": "192.168.1.21"}
@@ -85,6 +92,23 @@ Any subset. The output switches live and the setting is saved. A stream is match
 name in brackets, case-insensitively. With `source_ip`, only from that sender. `"stream": ""` is the default
 stream, `OUT_<serial>[_n]`. → `200 {"ok": true, "output": 1, "stream": "CAM 2", "source_ip": "...", "backup": ""}`,
 `404` for an unknown output, `400` for an invalid name or address.
+
+An H.264 RTP stream instead of NDI (API version 4): `"stream": "rtp://239.255.0.1:5004"` joins that multicast
+group, `"rtp://:5004"` receives what is sent to the device's own address on that port (ports 1024-65532; the
+next three carry RTCP and audio). `source_ip` then accepts packets from that sender only. The backup must be
+an NDI stream.
+
+An SRT stream (API version 4): `"stream": "srt://192.168.1.21:9000"` calls that sender (a PiNDI input whose
+`srt_url` is `srt://:9000`, OBS, an encoder...), `"srt://:9000"` waits for a sender to call the device
+(`source_ip` then accepts that sender only). Add `?passphrase=...&latency=<ms>` as for ffmpeg and VLC; spaces,
+dollar signs, quotes, backslashes and backticks are written %-encoded (`400` otherwise). At most 159 characters.
+The status shows the stream without its passphrase.
+
+### `GET /api/v1/inputs/<n>/stream.sdp`
+
+The session description of input *n* when it is sent as H.264 RTP (API version 4), as `application/sdp`: open
+it in VLC, ffmpeg (`-protocol_whitelist file,udp,rtp -i stream.sdp`) or OBS to receive the stream. It is
+written with the first keyframe, so `404` until the input is sending.
 
 ### `GET /api/v1/outputs/<n>/thumb.jpg`
 

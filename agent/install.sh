@@ -104,6 +104,17 @@ PACKAGES=(gcc libc6-dev pkg-config
 if [ -f "$SRC/Install_NDI_Advanced_SDK_v6_Linux.tar.gz" ]; then
     PACKAGES+=(libavcodec61)
 fi
+# Installed when apt is used, not required offline (an update package can't add them): boards without
+# a hardware H.264 decoder (Pi 5) decode H.264 RTP and SRT streams with libavcodec, also loaded at run
+# time; SRT streams need libsrt (1.5 in Bookworm and Trixie, 1.4 in Bullseye).
+OPTIONAL_PACKAGES=()
+OPTIONAL_WHY=()
+if grep -qE "Raspberry Pi (5|500)|Compute Module 5" /proc/device-tree/model 2>/dev/null; then
+    OPTIONAL_PACKAGES+=("libavcodec61|libavcodec62|libavcodec60|libavcodec59")  # the OS release's: 59 in Bookworm
+    OPTIONAL_WHY+=("H.264 RTP and SRT streams can't be shown on this device")
+fi
+OPTIONAL_PACKAGES+=("libsrt1.5-gnutls|libsrt1.4-gnutls")
+OPTIONAL_WHY+=("SRT streams can't be sent or received")
 if [ "$OFFLINE" -eq 1 ]; then
     step "Checking packages (offline)"
     MISSING=()
@@ -124,6 +135,15 @@ else
         apt-get "${APT_OPTS[@]}" full-upgrade
     fi
     apt-get "${APT_OPTS[@]}" install --no-install-recommends "${PACKAGES[@]}"
+    for i in "${!OPTIONAL_PACKAGES[@]}"; do # one at a time: one that is missing doesn't stop the others
+        pkg=""
+        for p in ${OPTIONAL_PACKAGES[$i]//|/ }; do # the first this release has
+            if apt-cache show "$p" >/dev/null 2>&1; then pkg=$p; break; fi
+        done
+        if [ -z "$pkg" ] || ! apt-get "${APT_OPTS[@]}" install --no-install-recommends "$pkg"; then
+            echo "Could not install ${pkg:-${OPTIONAL_PACKAGES[$i]}}: ${OPTIONAL_WHY[$i]}." >&2
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------- NDI runtime
@@ -548,17 +568,12 @@ if ! grep -qE "Raspberry Pi (4|5|400|500|Compute Module (4|5))" /proc/device-tre
 fi
 
 # Camera / ISP drivers are never used; they cost boot time. The Pi 3/4 hardware H.264
-# decoder (bcm2835_codec and what it needs) is kept when the NDI Advanced SDK is
-# installed: the player uses it for NDI|HX.
+# encoder and decoder (bcm2835_codec and what it needs) are kept: NDI|HX and H.264 RTP
+# use them, and RTP needs no NDI Advanced SDK.
 {
     echo "# Installed by PiNDI: unused camera, ISP and V4L2 codec drivers."
     echo "blacklist bcm2835_v4l2"
     echo "blacklist bcm2835_isp"
-    if [ ! -e /usr/local/lib/libndi_advanced.so ]; then
-        echo "blacklist bcm2835_codec"
-        echo "blacklist bcm2835_mmal_vchiq"
-        echo "blacklist vc_sm_cma"
-    fi
     echo "blacklist rpi_hevc_dec"
 } > /etc/modprobe.d/pindi-blacklist.conf
 

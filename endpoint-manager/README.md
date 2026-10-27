@@ -5,8 +5,9 @@ A web GUI for many PiNDI devices ([agent/](../agent/)) at once:
 - **Monitoring:** devices online, outputs showing a stream, streams on air and alerts; graphs of CPU
   temperature, load, network traffic and memory for the last hour; tables of every device, display output
   and outgoing stream.
-- **Video matrix:** every NDI source your PiNDI devices can see (rows) against every PiNDI display output
-  (columns). Click a crosspoint to switch that output live. Optional previews show what each output shows.
+- **Video matrix:** every NDI source your PiNDI devices can see, and their H.264 RTP multicast and SRT streams (rows),
+  against every PiNDI display output (columns). Click a crosspoint to switch that output live. Optional previews
+  show what each output shows.
 - **Admin:** find Raspberry Pis on the network and install PiNDI on them; select devices, then identify,
   restart video, reboot, shut down (agent 1.4.0 or newer; a Pi that is shut down stays off until its power is
   cycled), install a software update or remove them; trust a device's new certificate; change
@@ -114,6 +115,17 @@ Pi's line from `known_hosts` after reinstalling its SD card).
 The manager has no NDI library of its own. The source list is every source that any managed device sees
 (each device's `/api/v1/status` lists them), so it covers NDI Discovery Servers and other subnets wherever
 your devices see them. Sources sent by managed devices are tagged *PiNDI*.
+
+Inputs that managed devices send as **H.264 RTP to a multicast group** are listed too (tagged *H.264 RTP*):
+routing one sets the output's stream to `rtp://<group>:<port>`, and the output joins the group. RTP sent to a
+single address (unicast) goes to one receiver chosen on the sending device, so it isn't offered here.
+
+Inputs sent as **H.264 SRT** that listen for receivers (`srt://:<port>`) are listed as well (tagged *H.264 SRT*):
+routing one sets the output's stream to `srt://<device>:<port>`, and the output calls the sending device (up to
+8 outputs per input). Encrypted ones aren't offered, because devices don't give their passphrase out, and
+neither are inputs that call one receiver themselves: set those on the device.
+
+RTP and SRT crosspoints are disabled for outputs on devices older than PiNDI 1.7.0, which can't show them.
 
 Switching sends `POST /api/v1/outputs/<n>/source` to the device. With **Lock to the sender's IP** (the default),
 the output only accepts that stream from that sender, so two senders with the same stream name can't be

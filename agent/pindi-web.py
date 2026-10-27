@@ -1038,10 +1038,8 @@ def mbit(bps):
 TRAFFIC = NetTraffic()
 
 
-def hx_send_available():
-    """Sending NDI|HX needs the NDI Advanced SDK and the Pi's hardware H.264 encoder (Pi 3/4)."""
-    if not os.path.exists("/usr/local/lib/libndi_advanced.so"):
-        return False
+def h264_encoder():
+    """The Pi's hardware H.264 encoder (Pi 3/4) is there."""
     base = "/sys/class/video4linux"
     try:
         return any(read_text(os.path.join(base, d, "name")).strip() == "bcm2835-codec-encode"
@@ -1050,7 +1048,160 @@ def hx_send_available():
         return False
 
 
-CODECS = [("speedhq", "Full NDI (SpeedHQ)"), ("hx", "NDI|HX (H.264, hardware encoder)")]
+def hx_send_available():
+    """Sending NDI|HX needs the NDI Advanced SDK and the Pi's hardware H.264 encoder (Pi 3/4)."""
+    return os.path.exists("/usr/local/lib/libndi_advanced.so") and h264_encoder()
+
+
+CODECS = [("speedhq", "Full NDI (SpeedHQ)"), ("hx", "NDI|HX (H.264, hardware encoder)"),
+          ("rtp", "H.264 RTP (hardware encoder, no NDI)"), ("srt", "H.264 SRT (hardware encoder, no NDI)")]
+H264_CODECS = ("rtp", "srt")  # sent by this device itself, through the hardware encoder
+
+
+def srt_available():
+    """libsrt is installed (install.sh adds it when it can): SRT streams can be sent and shown."""
+    return any(os.path.exists(os.path.join(d, n)) for d in ("/usr/lib/aarch64-linux-gnu", "/usr/lib/arm-linux-gnueabihf",
+                                                            "/usr/lib/x86_64-linux-gnu", "/usr/lib")
+               for n in ("libsrt-gnutls.so.1.5", "libsrt.so.1.5", "libsrt-openssl.so.1.5", "libsrt-gnutls.so.1.4",
+                         "libsrt.so.1.4"))
+
+
+def srt_url(s, caller_needs_host=True):
+    """The parts of "srt://[host]:port[?passphrase=..&latency=..&streamid=..&mode=..]" as a dict (listen: no host,
+    "@" or 0.0.0.0, or mode=listener), None if s isn't srt://. ValueError for one the programs can't use. As
+    srt_parse() in pindi-player.c and pindi-sender.c."""
+    if not s.lower().startswith("srt://"):
+        return None
+    if any(c in s for c in "$\"\\`' ") or any(ord(c) < 32 for c in s):
+        # Stored in the settings file systemd reads: these (and spaces) are written %-encoded, e.g. %24 for $.
+        raise ValueError("Write spaces and the characters $ \" \\ ` ' in an SRT address %-encoded (%20, %24, %22, "
+                         "%5C, %60, %27).")
+    rest = s[7:] if s[6:7] == "@" else s[6:]
+    hostport, _, query = rest.partition("?")
+    m = re.match(r"^([A-Za-z0-9.\-]*):(\d{1,5})$", hostport)
+    if not m or not 1 <= int(m.group(2)) <= 65535:
+        raise ValueError("An SRT address is srt://<host>:<port> to call a sender (or receiver), or srt://:<port> "
+                         "to listen.")
+    u = {"host": m.group(1), "port": int(m.group(2)), "passphrase": "", "latency": None, "streamid": ""}
+    u["listen"] = u["host"] in ("", "0.0.0.0")
+    for part in filter(None, query.split("&")):
+        key, eq, val = part.partition("=")
+        if not eq:
+            continue
+        val = urllib.parse.unquote(val)
+        key = key.lower()
+        if key == "passphrase":
+            if not 10 <= len(val) <= 79:
+                raise ValueError("The SRT passphrase must be 10 to 79 characters.")
+            u["passphrase"] = val
+        elif key == "latency":
+            if not (val.isdigit() and 20 <= int(val) <= 8000):
+                raise ValueError("The SRT latency must be 20 to 8000 ms.")
+            u["latency"] = int(val)
+        elif key == "streamid":
+            u["streamid"] = val[:127]
+        elif key == "mode":
+            if val.lower() not in ("listener", "caller"):
+                raise ValueError("The SRT mode must be listener or caller.")
+            u["listen"] = val.lower() == "listener"
+    if not u["listen"] and not u["host"]:
+        raise ValueError("To call, an SRT address needs the host: srt://<host>:<port>.")
+    return u
+
+
+def srt_shown(s):
+    """An SRT address without its passphrase (status, API, logs). As stream_shown() in pindi-player.c."""
+    if not s.lower().startswith("srt://") or "?" not in s:
+        return s
+    base, _, query = s.partition("?")
+    parts = [p for p in query.split("&") if p]
+    keep = [p for p in parts if not p.lower().startswith("passphrase=")]
+    return base + ("?" + "&".join(keep) if keep else "") + (" (encrypted)" if len(keep) < len(parts) else "")
+
+
+def rtp_url(s):
+    """(group, port) of an output stream "rtp://[group]:port" ("" for no group: sent to this device), None if
+    the stream isn't RTP. ValueError for an rtp:// stream the player can't use. As rtp_url() in pindi-player.c."""
+    if not s.lower().startswith("rtp://"):
+        return None
+    m = re.match(r"^@?([0-9.]*):(\d{1,5})$", s[6:])
+    if not m:
+        raise ValueError("An RTP stream is rtp://<multicast group>:<port>, or rtp://:<port> for a stream sent to "
+                         "this device.")
+    host, port = m.group(1), int(m.group(2))
+    if host:
+        try:
+            host = str(ipaddress.IPv4Address(host))
+        except ValueError:
+            raise ValueError("%s is not an IPv4 address." % host)
+    if not 1024 <= port <= 65532:
+        raise ValueError("The RTP port must be between 1024 and 65532 (the next three carry RTCP and audio).")
+    return (host if host and ipaddress.IPv4Address(host).is_multicast else ""), port
+
+
+def check_stream(s, backup=False):
+    """An error message for an output's stream (NDI name, rtp:// or srt:// address), or None. The backup
+    stream is NDI only: the player switches to it while searching for an NDI stream."""
+    if not valid_name(s) or len(s) > 159:  # the player keeps 159 characters
+        return "Invalid stream name." if len(s) <= 159 else "The stream is too long (at most 159 characters)."
+    try:
+        if (rtp_url(s) or srt_url(s)) and backup:
+            return "The backup stream must be an NDI stream."
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def own_ports(s):
+    """The UDP ports of this device an RTP or SRT stream receives on (RTP: the port, RTCP and audio), else
+    an empty set: an NDI stream, a multicast group (each group has its own socket) or an SRT call."""
+    try:
+        r = rtp_url(s)
+        if r and not r[0]:
+            return set(range(r[1], r[1] + 4))
+        u = srt_url(s)
+        if u and u["listen"]:
+            return {u["port"]}
+    except ValueError:
+        pass
+    return set()
+
+
+def port_clash(env, n, stream, source_ip):
+    """An error if output n's stream would receive on a port another enabled output or SRT input already
+    has: Linux gives a port's RTP to one socket only, and one SRT listener has a port. Outputs with the
+    same stream and source IP share one receiver, so they may."""
+    mine = own_ports(stream)
+    if not mine:
+        return None
+    for m in range(1, 9):
+        if m == n or out_setting(env, m, "ENABLED") == "0" or not out_setting(env, m, "STREAM"):
+            continue
+        other, ip = out_setting(env, m, "STREAM"), out_setting(env, m, "SOURCE_IP")
+        if mine & own_ports(other) and (other != stream or ip != source_ip):
+            return ("Output %d already receives on this port (%s): use another port, or the same stream and "
+                    "source IP to share it." % (m, srt_shown(other)))
+    for slot, s in configured_inputs(env).items():
+        if s.get("ENABLED") == "1" and s.get("CODEC") == "srt" and mine & own_ports(s.get("SRT_URL", "")):
+            return "Input %d already sends SRT on this port: use another port." % slot
+    return None
+
+
+def rtp_dest(s):
+    """A sender's RTP destination "ip:port" (unicast or multicast), normalized; ValueError if invalid."""
+    m = re.match(r"^\s*([0-9.]+):(\d{1,5})\s*$", s)
+    if not m:
+        raise ValueError("The RTP destination is an IPv4 address and port, e.g. 239.255.0.1:5004.")
+    try:
+        ip = ipaddress.IPv4Address(m.group(1))
+    except ValueError:
+        raise ValueError("%s is not an IPv4 address." % m.group(1))
+    port = int(m.group(2))
+    if not 1024 <= port <= 65532:
+        raise ValueError("The RTP port must be between 1024 and 65532 (the next three carry RTCP and audio).")
+    if ip.is_unspecified or ip.is_loopback or str(ip) == "255.255.255.255":
+        raise ValueError("%s can't receive a stream." % ip)
+    return "%s:%d" % (ip, port)
 AUDIO_SYNCS = [("on", "In step with this Pi's clock (recommended)"), ("off", "As the device delivers it")]
 RANGES = [("full", "Normal (most capture cards and webcams)"), ("video", "Already video range (16-235)")]
 
@@ -1410,7 +1561,11 @@ def outputs():
             # Without the HX decoder the SDK can only have negotiated SpeedHQ with the sender. With it,
             # the player checks the codec once per stream (out<n>.codec).
             codec = read_kv("%s/out%d.codec" % (RUN_DIR, n))
-            if not hx:
+            src = st.get("source", "").lower()
+            if src.startswith("rtp://") or src.startswith("srt://"):
+                kind = "H.264 RTP" if src.startswith("rtp://") else "H.264 SRT"
+                fmt = codec.get("codec", kind) if codec.get("source") == st.get("source") else kind
+            elif not hx:
                 fmt = "Full NDI (SpeedHQ)"
             elif codec.get("source") == st.get("source") and codec.get("codec"):
                 fmt = codec["codec"]
@@ -1649,7 +1804,8 @@ def configured_inputs(env):
     """{slot: settings} from PINDI_IN<n>_* keys."""
     slots = {}
     for key, val in env.items():
-        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE|AUDIO|CODEC)$", key)
+        m = re.match(r"^PINDI_IN(\d+)_(DEVICE|ENABLED|NAME|MODE|AUDIO|AUDIO_SYNC|CODEC|RANGE|RTP_DEST|SRT_URL|KBPS)$",
+                     key)
         if m:
             slots.setdefault(int(m.group(1)), {})[m.group(2)] = val
     return {n: s for n, s in slots.items() if s.get("DEVICE")}
@@ -1667,7 +1823,8 @@ def inputs():
         out.append(dict(d, slot=slot, present=True, enabled=s.get("ENABLED") == "1",
                         name=s.get("NAME", ""), mode=s.get("MODE", ""), audio_setting=s.get("AUDIO", "auto"),
                         audio_sync=s.get("AUDIO_SYNC", "on"), codec=s.get("CODEC", "speedhq"),
-                        range=s.get("RANGE", "full")))
+                        range=s.get("RANGE", "full"), rtp_dest=s.get("RTP_DEST", ""),
+                        srt_url=s.get("SRT_URL", ""), kbps=s.get("KBPS", "")))
     for dev, slot in by_dev.items():
         s = conf[slot]
         cam = ""
@@ -1678,10 +1835,13 @@ def inputs():
                     "present": False, "enabled": s.get("ENABLED") == "1", "name": s.get("NAME", ""),
                     "mode": s.get("MODE", ""), "audio_setting": s.get("AUDIO", "auto"),
                     "audio_sync": s.get("AUDIO_SYNC", "on"), "codec": s.get("CODEC", "speedhq"),
-                    "range": s.get("RANGE", "full")})
+                    "range": s.get("RANGE", "full"), "rtp_dest": s.get("RTP_DEST", ""),
+                    "srt_url": s.get("SRT_URL", ""), "kbps": s.get("KBPS", "")})
     for i in out:
         st = read_kv("%s/in%d.status" % (RUN_DIR, i["slot"])) if i["slot"] else {}
         i["state"] = st.get("state", "") if i["enabled"] else "off"
+        i["sdp"] = bool(i["slot"] and i["enabled"] and i["codec"] == "rtp" and
+                        os.path.exists("%s/in%d.sdp" % (RUN_DIR, i["slot"])))
         i["live_mode"] = st.get("mode", "")
         i["fps"] = st.get("fps", "")
         i["cam_fps"] = st.get("cam_fps", "")
@@ -1807,7 +1967,7 @@ input[type=text],input[type=password],input[type=number],input[type=time],select
 background:#0d1319;color:var(--text);font:inherit}
 option:disabled{color:var(--muted)}
 input:focus{outline:2px solid var(--accent2);border-color:var(--accent2)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}[hidden]{display:none!important}
 .radio{display:flex;gap:18px;margin:4px 0 4px}.radio label{display:flex;gap:6px;align-items:center;margin:0;color:var(--text);font-size:15px}
 button{margin-top:14px;padding:9px 16px;border:0;border-radius:7px;background:var(--accent2);color:#fff;font:inherit;cursor:pointer}
 button:hover{filter:brightness(1.15)}button.secondary{background:#2a3644}button.danger{background:#8e2c27}
@@ -1861,7 +2021,11 @@ FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect wi
 JS = """
 function sync(){var s=document.getElementById('mode-static');if(!s)return;
 document.getElementById('static-fields').style.display=s.checked?'block':'none';}
-document.addEventListener('change',function(e){if(e.target.name==='mode')sync();});
+function codecs(){document.querySelectorAll('select[name=codec]').forEach(function(s){
+s.form.querySelectorAll('.rtp-only').forEach(function(el){el.hidden=s.value!=='rtp';});
+s.form.querySelectorAll('.srt-only').forEach(function(el){el.hidden=s.value!=='srt';});
+s.form.querySelectorAll('.h264-only').forEach(function(el){el.hidden=s.value!=='rtp'&&s.value!=='srt';});});}
+document.addEventListener('change',function(e){if(e.target.name==='mode')sync();if(e.target.name==='codec')codecs();});
 document.addEventListener('click',function(e){var b=e.target.closest('[data-stream]');if(!b)return;
 var n=b.dataset.out,s=document.getElementById('stream-'+n);s.value=b.dataset.stream;
 document.getElementById('source_ip-'+n).value=b.dataset.ip;
@@ -1872,7 +2036,7 @@ var k=el.dataset.k;if(!(k in d))return;var v=d[k];el.textContent=v||'-';
 if(/state$/.test(k))el.className='state'+(/ON AIR/.test(v||'')?' onair':/^(playing|sending)/.test(v||'')?' playing':'');
 if(k==='power')el.className=v==='OK'?'':'warn';});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
-sync();if(document.querySelector('[data-k]'))setInterval(poll,3000);
+sync();codecs();if(document.querySelector('[data-k]'))setInterval(poll,3000);
 setInterval(function(){document.querySelectorAll('img[data-thumb]').forEach(function(i){
 if(document.hidden)return;var n=new Image();n.onload=function(){i.src=n.src;i.classList.remove('none');};
 n.onerror=function(){i.classList.add('none');};n.src='/thumb/'+i.dataset.thumb+'.jpg?'+Date.now();});},2000);
@@ -2054,7 +2218,7 @@ def dashboard(session):
             '<span class="hint">(off: no NDI is received and this HDMI port is switched off)</span></label>'
             '<h3 class="group">Source</h3><div class="row">'
             '<div><label>Stream name</label><input type="text" id="stream-%d" name="stream" '
-            'value="%s" placeholder="%s" maxlength="200"></div><div><label>Source IP</label>'
+            'value="%s" placeholder="%s" maxlength="159"></div><div><label>Source IP</label>'
             '<input type="text" id="source_ip-%d" name="source_ip" value="%s" placeholder="Any" maxlength="15">'
             '</div><div><label>Backup stream (optional)</label><input type="text" name="backup" value="%s" '
             'placeholder="None" maxlength="200"></div>'
@@ -2062,7 +2226,12 @@ def dashboard(session):
             '<p class="hint">Empty stream name = %s, empty IP = any host (a source IP is also searched '
             'directly, so senders on other subnets work). The backup plays while the main stream is '
             'unavailable. The low-bandwidth preview is a small (typically 640&times;360) stream every sender '
-            'provides, for slow networks.</p>'
+            'provides, for slow networks. An H.264 RTP stream instead of NDI: '
+            '<code>rtp://&lt;multicast group&gt;:&lt;port&gt;</code>, or <code>rtp://:&lt;port&gt;</code> for one '
+            'sent to this device. An SRT stream: <code>srt://&lt;sender&gt;:&lt;port&gt;</code> calls the sender '
+            '(another PiNDI, OBS, ffmpeg, an encoder), <code>srt://:&lt;port&gt;</code> waits for it to call; add '
+            '<code>?passphrase=...</code> if it is encrypted, <code>&amp;latency=&lt;ms&gt;</code> for a slow '
+            'network. Backup and receive quality are for NDI only.</p>'
             '<h3 class="group">Picture</h3><div class="row">'
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
@@ -2112,17 +2281,77 @@ def dashboard(session):
     # Outgoing streams (capture devices)
     used = {i["slot"] for i in ins if i["slot"]}
     free_slots = [n for n in range(1, 9) if n not in used]
-    hx_ok = hx_send_available()
+    hx_ok, rtp_ok, srt_ok = hx_send_available(), h264_encoder(), srt_available()
+    my_ip = live_network()["address"]
 
     def codec_field(i):
-        """Codec choice, only where NDI|HX can be sent (else Full NDI, nothing to choose)."""
-        if not hx_ok:
+        """Codec choice, only where H.264 can be sent (else Full NDI, nothing to choose)."""
+        if not rtp_ok:
             return ""
-        warn = (' <strong>Without an NDI Advanced SDK licence (Device settings) the video of an NDI|HX stream '
-                'stops after 30 minutes; the sound goes on.</strong>' if ndi_evaluation() else "")
-        return ('<div><label>Codec</label><select name="codec">%s</select><span class="hint block">NDI|HX: '
-                'H.264 from the Pi&#39;s hardware encoder &ndash; far less CPU and bandwidth; receivers need NDI|HX '
-                'support (NDI Tools, vMix, OBS...).%s</span></div>' % (options(CODECS, i.get("codec", "speedhq")), warn))
+        codec = i.get("codec", "speedhq")
+        choices = [c for c in CODECS if (c[0] != "hx" or hx_ok or codec == "hx") and
+                   (c[0] != "srt" or srt_ok or codec == "srt")]
+        hint = ""
+        if hx_ok:
+            hint = ('NDI|HX: H.264 from the Pi&#39;s hardware encoder &ndash; far less CPU and bandwidth; receivers '
+                    'need NDI|HX support (NDI Tools, vMix, OBS...).')
+            if ndi_evaluation():
+                hint += (' <strong>Without an NDI Advanced SDK licence (Device settings) the video of an NDI|HX '
+                         'stream stops after 30 minutes; the sound goes on.</strong>')
+            hint += ' '
+        hint += ('H.264 RTP: the same hardware H.264, as a standard RTP stream instead of NDI &ndash; no licence, '
+                 'low delay, a few Mbit/s, for a wired local network. H.264 SRT: the same over SRT, which sends '
+                 'lost packets again &ndash; for Wi-Fi, other networks and the internet, optionally encrypted. '
+                 'Neither is found by NDI discovery: see the address below.')
+        if not srt_ok:
+            hint += (' <strong>SRT needs libsrt: run install.sh on this device with internet access.</strong>')
+        return ('<div><label>Codec</label><select name="codec">%s</select><span class="hint block">%s</span></div>'
+                '<div class="rtp-only"><label>RTP destination</label><input type="text" name="rtp_dest" value="%s" '
+                'placeholder="e.g. 239.255.0.1:5004" maxlength="21"><span class="hint block">A multicast group '
+                '(239.x.x.x:port) that any number of receivers join, or one receiver&#39;s address. Another PiNDI '
+                'shows it with the stream <code>rtp://239.255.0.1:5004</code> (<code>rtp://:5004</code> when sent '
+                'to its own address). Audio goes to port + 2.</span></div>'
+                '<div class="srt-only"><label>SRT address</label><input type="text" name="srt_url" value="%s" '
+                'placeholder="srt://:9000" maxlength="255"><span class="hint block"><code>srt://:9000</code>: '
+                'receivers call this device on port 9000 (up to 8; another PiNDI shows it with the stream '
+                '<code>srt://%s:9000</code>, VLC opens the same address). <code>srt://&lt;receiver&gt;:9000</code>: '
+                'this device calls that receiver. Add <code>?passphrase=&lt;10-79 characters&gt;</code> to encrypt, '
+                '<code>&amp;latency=&lt;ms&gt;</code> for a slow or far network (default 120).</span></div>'
+                '<div class="h264-only"><label>Bit rate (kbit/s)</label><input type="number" name="kbps" '
+                'min="500" max="25000" step="100" value="%s" placeholder="Automatic"><span class="hint block">'
+                'Automatic: about 6 Mbit/s at 1080p30.</span></div>' %
+                (options(choices, codec), hint, esc(i.get("rtp_dest", "")), esc(i.get("srt_url", "")),
+                 esc(my_ip) if my_ip else "&lt;this device&gt;", esc(i.get("kbps", ""))))
+
+    def watch_line(i):
+        """Where receivers find an RTP or SRT input (NDI ones are found by name): the address to open."""
+        if not (i["enabled"] and i["slot"]) or i.get("codec") not in ("rtp", "srt"):
+            return ""
+        links = []
+        if i["codec"] == "rtp":
+            m = re.match(r"^(\d+)\.[\d.]+:(\d+)$", i.get("rtp_dest", ""))
+            if i.get("sdp"):
+                links.append('<a href="/in%d.sdp">SDP file</a> for VLC, ffmpeg or OBS' % i["slot"])
+            if m:
+                multicast = 224 <= int(m.group(1)) <= 239
+                url = "rtp://%s" % i["rtp_dest"] if multicast else "rtp://:%s" % m.group(2)
+                links.append("another PiNDI: <code>%s</code>%s" % (
+                    esc(url), "" if multicast else " on %s" % esc(i["rtp_dest"].rsplit(":", 1)[0])))
+        else:
+            try:
+                u = srt_url(i.get("srt_url", ""))
+            except ValueError:
+                u = None
+            if not u or not u["listen"]:
+                return ""  # it calls the receiver, which listens: nothing to open
+            url = "srt://%s:%d" % (my_ip, u["port"]) if my_ip else ""
+            if url and u["streamid"]:
+                url += "?streamid=" + urllib.parse.quote(u["streamid"], safe="")
+            links.append("%s in VLC, ffmpeg, OBS or another PiNDI%s" % (
+                '<a href="%s">%s</a>' % (esc(url), esc(url)) if url else
+                "<code>srt://&lt;this device&gt;:%d</code>" % u["port"],
+                " (encrypted: give the receiver the passphrase)" if u["passphrase"] else ""))
+        return "<p>Watch it: %s</p>" % " &middot; ".join(links) if links else ""
 
     cards = []
     for i in ins:
@@ -2166,16 +2395,16 @@ def dashboard(session):
                  options(AUDIO_SYNCS, i["audio_sync"]), options(RANGES, i["range"])))
         cards.append(
             '<div class="sub"><h3>%s <span class="badge%s">%s</span></h3>'
-            '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>'
+            '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>%s'
             '<form method="post" action="/outgoing">%s<input type="hidden" name="device" value="%s">'
             '<input type="hidden" name="slot" value="%d">'
-            '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input over NDI</label>'
-            '<div class="row"><div><label>NDI stream name</label><input type="text" name="name" value="%s" '
+            '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input</label>'
+            '<div class="row"><div><label>Stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div>%s</div>'
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
-             esc(state), live, hidden,
+             esc(state), live, watch_line(i), hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
              fields, remove))
     body = "".join(cards) if cards else (
@@ -2203,8 +2432,8 @@ def dashboard(session):
                 '<form method="post" action="/reboot" data-confirm="Reboot the device now?">%s<button '
                 'class="secondary">Reboot now</button></form>' % hidden if restart else "")) + body
     parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
-                 '<p class="hint">Nothing is sent until you enable it here. The stream appears on the network as '
-                 '"%s (name)".</p>%s</section>' % (esc(ndi_host_name()), body))
+                 '<p class="hint">Nothing is sent until you enable it here. An NDI stream appears on the network '
+                 'as "%s (name)".</p>%s</section>' % (esc(ndi_host_name()), body))
 
     # Device settings
     env = read_env()
@@ -2468,13 +2697,17 @@ def act_output(form):
         if mode and not re.match(r"^\d{3,4}x\d{3,4}@\d{2,3}$", mode):
             return ("err", "Invalid display mode.")
         backup = form.get("backup", "").strip()
-        if not valid_name(stream) or not valid_name(backup):
-            return ("err", "Invalid stream name.")
+        err = check_stream(stream) or check_stream(backup, backup=True)
+        if err:
+            return ("err", err)
         if source_ip:
             try:
                 source_ip = str(ipaddress.IPv4Address(source_ip))
             except ValueError:
                 return ("err", "Source IP must be an IPv4 address, or empty for any host.")
+        err = enabled and port_clash(read_env(), n, stream, source_ip)
+        if err:
+            return ("err", err)
         brightness = form.get("brightness", "0")
         pacing = form.get("pacing", "fast")
         if (rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS) or
@@ -2513,19 +2746,21 @@ def act_output(form):
     if changed and changed <= source_keys and o["enabled"] and o["state"] != "player not running":
         # Only the source changed: switch live, without restarting the player.
         write_switch(n, o["stream"], o["source_ip"], o["backup"])
-        log("output %d: switching to %s from %s" % (n, o["stream"] or default_out_stream(n), o["source_ip"] or "any"))
+        shown = srt_shown(o["stream"]) or default_out_stream(n)
+        log("output %d: switching to %s from %s" % (n, shown, o["source_ip"] or "any"))
         return ("ok", "Output %d is switching to %s%s." % (
-            n, o["stream"] or default_out_stream(n), " from " + o["source_ip"] if o["source_ip"] else ""))
+            n, shown, " from " + o["source_ip"] if o["source_ip"] else ""))
     if not changed:
         return ("ok", "Output %d: nothing changed." % n)
     later(0.5, run, "systemctl", "restart", "pindi.service")
     if not o["enabled"]:
         log("output %d: disabled" % n)
         return ("ok", "Output %d disabled. The player is restarting." % n)
+    shown = srt_shown(o["stream"]) or default_out_stream(n)
     log("output %d: stream=%s ip=%s rotate=%s mirror=%s bandwidth=%s" % (
-        n, o["stream"] or default_out_stream(n), o["source_ip"] or "any", o["rotate"], o["mirror"], o["bandwidth"]))
+        n, shown, o["source_ip"] or "any", o["rotate"], o["mirror"], o["bandwidth"]))
     return ("ok", "Output %d saved: %s from %s, rotation %s°, mirror %s, %s. The player is restarting." % (
-        n, o["stream"] or default_out_stream(n), o["source_ip"] or "any host", o["rotate"], o["mirror"],
+        n, shown, o["source_ip"] or "any host", o["rotate"], o["mirror"],
         dict(BANDWIDTHS)[o["bandwidth"]].lower()))
 
 
@@ -2544,7 +2779,7 @@ def act_outgoing(form):
     elif not 1 <= slot <= 8 or slot in configured_inputs(read_env()):
         return ("err", "No free slot for another outgoing stream.")
     keys = ["PINDI_IN%d_%s" % (slot, k) for k in ("ENABLED", "DEVICE", "NAME", "MODE", "AUDIO", "CODEC", "RANGE",
-                                                   "AUDIO_SYNC")]
+                                                   "AUDIO_SYNC", "RTP_DEST", "SRT_URL", "KBPS")]
     if form.get("remove"):
         write_env({k: "" for k in keys})
         msg = "Forgot %s." % inp["label"]
@@ -2563,8 +2798,43 @@ def act_outgoing(form):
         if audio not in ("auto", "off"):
             return ("err", "Invalid audio setting.")
         codec = form.get("codec", "speedhq")
-        if codec not in dict(CODECS) or (codec == "hx" and not hx_send_available()):
+        if codec not in dict(CODECS) or (codec == "hx" and not hx_send_available()) or (
+                codec in H264_CODECS and not h264_encoder()) or (codec == "srt" and not srt_available()):
             return ("err", "Invalid codec.")
+        # The RTP and SRT fields are checked for their codec only; with another codec, valid values are kept
+        # for switching back.
+        dest, srt, kbps = (form.get("rtp_dest", "").strip(), form.get("srt_url", "").strip(),
+                           form.get("kbps", "").strip())
+        try:
+            dest = rtp_dest(dest) if dest or codec == "rtp" else ""
+        except ValueError as e:
+            if codec == "rtp":
+                return ("err", str(e))
+            dest = ""
+        try:
+            if codec == "srt" and not srt:
+                raise ValueError("The SRT address is missing: srt://:<port> to listen, or srt://<receiver>:<port>.")
+            if len(srt) > 255:
+                raise ValueError("The SRT address is too long.")
+            if srt and not srt_url(srt):
+                raise ValueError("The SRT address starts with srt://.")
+        except ValueError as e:
+            if codec == "srt":
+                return ("err", str(e))
+            srt = ""
+        mine = own_ports(srt) if enabled and codec == "srt" else set()
+        env = read_env()
+        for m in range(1, 9):
+            if mine and out_setting(env, m, "ENABLED") != "0" and mine & own_ports(out_setting(env, m, "STREAM")):
+                return ("err", "Output %d already receives on this port: use another port." % m)
+        for other, s in configured_inputs(env).items():
+            if (mine and other != slot and s.get("ENABLED") == "1" and s.get("CODEC") == "srt" and
+                    mine & own_ports(s.get("SRT_URL", ""))):
+                return ("err", "Input %d already sends SRT on this port: use another port." % other)
+        if kbps and not (kbps.isdigit() and 500 <= int(kbps) <= 25000):
+            if codec in H264_CODECS:
+                return ("err", "The bit rate must be between 500 and 25000 kbit/s, or empty for automatic.")
+            kbps = ""
         rng = form.get("range", "full")
         if rng not in dict(RANGES):
             return ("err", "Invalid picture levels.")
@@ -2574,9 +2844,18 @@ def act_outgoing(form):
         write_env(dict(zip(keys, ["1" if enabled else "0", device,
                                   "" if name == default_in_stream(slot) else name, mode,
                                   "" if audio == "auto" else audio, "" if codec == "speedhq" else codec,
-                                  "" if rng == "full" else rng, "" if audio_sync == "on" else audio_sync])))
-        msg = ("%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))) if enabled \
-            else ("%s is not sent." % inp["label"])
+                                  "" if rng == "full" else rng, "" if audio_sync == "on" else audio_sync,
+                                  dest, srt, kbps])))
+        if not enabled:
+            msg = "%s is not sent." % inp["label"]
+        elif codec == "rtp":
+            msg = "%s will be sent as H.264 RTP to %s." % (inp["label"], dest)
+        elif codec == "srt":
+            u = srt_url(srt)
+            msg = "%s will be sent as H.264 SRT: %s." % (
+                inp["label"], "receivers can call port %d" % u["port"] if u["listen"] else "calling " + srt_shown(srt))
+        else:
+            msg = "%s will be sent as \"%s\"." % (inp["label"], name or default_in_stream(slot))
     log("outgoing: slot %d %s" % (slot, msg))
     later(0.5, run, "systemctl", "restart", "pindi-sender.service")
     return ("ok", msg)
@@ -2724,7 +3003,9 @@ API_TOKEN_FILE = "/etc/pindi/api-token"
 # Raised when the API gains something clients may check for (all still under /api/v1/, nothing removed):
 # 2 = metrics and update state in the status, reboot, update, update log, thumbnails, token from a sign-in.
 # 3 = shutdown.
-API_VERSION = 3
+# 4 = H.264 RTP and SRT: rtp:// and srt:// output streams, the inputs' codec, RTP destination and SRT address,
+#     their SDP files.
+API_VERSION = 4
 
 
 def api_token(create=True):
@@ -2743,6 +3024,7 @@ def api_status():
     for o in outputs():
         outs.append({k: o[k] for k in ("n", "connector", "enabled", "state", "target", "source", "video",
                                         "format", "audio", "latency", "stream", "source_ip", "backup")})
+        outs[-1]["stream"] = srt_shown(o["stream"])  # an SRT passphrase isn't given out
         outs[-1]["display"] = {"link": o["link"], "mode": o["mode"]}
     # Configured inputs and their status files only: no device enumeration (control systems poll this).
     ins = []
@@ -2753,7 +3035,9 @@ def api_status():
                     "enabled": enabled, "name": conf.get("NAME") or default_in_stream(slot),
                     "state": st.get("state", "starting") if enabled else "off", "mode": st.get("mode", ""),
                     "fps": st.get("fps", ""), "audio": st.get("audio", ""),
-                    "on_air": "ON AIR" in st.get("state", "")})
+                    "on_air": "ON AIR" in st.get("state", ""), "codec": conf.get("CODEC") or "speedhq",
+                    "rtp_dest": conf.get("RTP_DEST", "") if conf.get("CODEC") == "rtp" else "",
+                    "srt_url": srt_shown(conf.get("SRT_URL", "")) if conf.get("CODEC") == "srt" else ""})
     return {"api_version": API_VERSION,
             "device": {"name": device_name(), "ndi_name": ndi_host_name(), "serial": SERIAL, "model": MODEL,
                        "version": version(), "ip": live_network()["address"], "health": hl, "power": hw,
@@ -2774,20 +3058,24 @@ def api_post(path, data):
             stream = str(data.get("stream", out_setting(base, n, "STREAM"))).strip()
             source_ip = str(data.get("source_ip", out_setting(base, n, "SOURCE_IP"))).strip()
             backup = str(data.get("backup", out_setting(base, n, "BACKUP_STREAM"))).strip()
-            if not valid_name(stream) or not valid_name(backup):
-                return 400, {"error": "invalid stream name"}
+            err = check_stream(stream) or check_stream(backup, backup=True)
+            if err:
+                return 400, {"error": err}
             if source_ip:
                 try:
                     source_ip = str(ipaddress.IPv4Address(source_ip))
                 except ValueError:
                     return 400, {"error": "source_ip must be an IPv4 address or empty"}
+            err = port_clash(base, n, stream, source_ip)
+            if err:
+                return 400, {"error": err}
             keys = {"PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
                     "PINDI_OUT%d_SOURCE_IP" % n: source_ip, "PINDI_OUT%d_BACKUP_STREAM" % n: backup}
             if n == 1:
                 keys.update({"PINDI_STREAM": "", "PINDI_SOURCE_IP": ""})
             write_env(keys)
         write_switch(n, keys["PINDI_OUT%d_STREAM" % n], source_ip, backup)
-        log("api: output %d -> %s from %s" % (n, stream or default_out_stream(n), source_ip or "any"))
+        log("api: output %d -> %s from %s" % (n, srt_shown(stream) or default_out_stream(n), source_ip or "any"))
         return 200, {"ok": True, "output": n, "stream": stream or default_out_stream(n), "source_ip": source_ip,
                      "backup": backup}
     if path == "/api/v1/identify":
@@ -3073,7 +3361,8 @@ def diagnostics_text(wifi):
             run("systemctl", "status", "--no-pager", "-n", "0", "pindi", "pindi-sender", "pindi-web").stdout,
             "---- log (last 2000 lines)", journal(2000), "---- kernel (last 200 lines)",
             run("journalctl", "-k", "-b", "--no-pager", "-n", "200", "-o", "short-iso").stdout]
-    return "\n".join(out)
+    # SRT addresses in the settings (and in log lines of older versions) may hold their passphrase.
+    return re.sub(r"(passphrase=)[^&\s\"']*", r"\1(removed)", "\n".join(out), flags=re.I)
 
 
 UPDATE_DIR = "/var/lib/pindi/update"
@@ -3821,6 +4110,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return self.send(404, "", "text/plain")
 
+    def sdp(self, n):
+        """Input n's session description (H.264 RTP), written by the sender with the first keyframe."""
+        try:
+            with open("%s/in%d.sdp" % (RUN_DIR, n), "rb") as f:
+                return self.send(200, f.read(), "application/sdp", [
+                    ("Content-Disposition", 'attachment; filename="pindi-%s-in%d.sdp"' % (SERIAL, n))])
+        except OSError:
+            return self.send(404, "No SDP file: input %d isn't sending H.264 RTP (yet)." % n, "text/plain")
+
     def api_data(self, raw):
         """An API request body (JSON or form data) as a dict, or None (and a 400 sent)."""
         raw = raw.decode("utf-8", "replace")
@@ -3859,6 +4157,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.match(r"^/api/v1/outputs/(\d)/thumb\.jpg$", path)
             if m:
                 return self.thumb(int(m.group(1)))
+            m = re.match(r"^/api/v1/inputs/(\d)/stream\.sdp$", path)
+            if m:
+                return self.sdp(int(m.group(1)))
             return self.send(404, json.dumps({"error": "unknown endpoint"}), "application/json")
         s = self.session(pop_flash=path == "/", with_secrets=path in ("/", "/diagnostics"))
         if path == "/login":
@@ -3879,6 +4180,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/thumb/(\d)\.jpg$", path)
         if m:
             return self.thumb(int(m.group(1)))
+        m = re.match(r"^/in(\d)\.sdp$", path)
+        if m:
+            return self.sdp(int(m.group(1)))
         stamp = time.strftime("%Y%m%d-%H%M")
         if path == "/diagnostics":
             return self.send(200, diagnostics_text(s["secrets"]["wifi"]), "text/plain; charset=utf-8", [
