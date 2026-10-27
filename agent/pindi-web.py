@@ -1152,6 +1152,41 @@ def check_stream(s, backup=False):
     return None
 
 
+def own_ports(s):
+    """The UDP ports of this device an RTP or SRT stream receives on (RTP: the port, RTCP and audio), else
+    an empty set: an NDI stream, a multicast group (each group has its own socket) or an SRT call."""
+    try:
+        r = rtp_url(s)
+        if r and not r[0]:
+            return set(range(r[1], r[1] + 4))
+        u = srt_url(s)
+        if u and u["listen"]:
+            return {u["port"]}
+    except ValueError:
+        pass
+    return set()
+
+
+def port_clash(env, n, stream, source_ip):
+    """An error if output n's stream would receive on a port another enabled output or SRT input already
+    has: Linux gives a port's RTP to one socket only, and one SRT listener has a port. Outputs with the
+    same stream and source IP share one receiver, so they may."""
+    mine = own_ports(stream)
+    if not mine:
+        return None
+    for m in range(1, 9):
+        if m == n or out_setting(env, m, "ENABLED") == "0" or not out_setting(env, m, "STREAM"):
+            continue
+        other, ip = out_setting(env, m, "STREAM"), out_setting(env, m, "SOURCE_IP")
+        if mine & own_ports(other) and (other != stream or ip != source_ip):
+            return ("Output %d already receives on this port (%s): use another port, or the same stream and "
+                    "source IP to share it." % (m, srt_shown(other)))
+    for slot, s in configured_inputs(env).items():
+        if s.get("ENABLED") == "1" and s.get("CODEC") == "srt" and mine & own_ports(s.get("SRT_URL", "")):
+            return "Input %d already sends SRT on this port: use another port." % slot
+    return None
+
+
 def rtp_dest(s):
     """A sender's RTP destination "ip:port" (unicast or multicast), normalized; ValueError if invalid."""
     m = re.match(r"^\s*([0-9.]+):(\d{1,5})\s*$", s)
@@ -2670,6 +2705,9 @@ def act_output(form):
                 source_ip = str(ipaddress.IPv4Address(source_ip))
             except ValueError:
                 return ("err", "Source IP must be an IPv4 address, or empty for any host.")
+        err = enabled and port_clash(read_env(), n, stream, source_ip)
+        if err:
+            return ("err", err)
         brightness = form.get("brightness", "0")
         pacing = form.get("pacing", "fast")
         if (rotate not in dict(ROTATIONS) or mirror not in dict(MIRRORS) or bandwidth not in dict(BANDWIDTHS) or
@@ -2708,19 +2746,21 @@ def act_output(form):
     if changed and changed <= source_keys and o["enabled"] and o["state"] != "player not running":
         # Only the source changed: switch live, without restarting the player.
         write_switch(n, o["stream"], o["source_ip"], o["backup"])
-        log("output %d: switching to %s from %s" % (n, o["stream"] or default_out_stream(n), o["source_ip"] or "any"))
+        shown = srt_shown(o["stream"]) or default_out_stream(n)
+        log("output %d: switching to %s from %s" % (n, shown, o["source_ip"] or "any"))
         return ("ok", "Output %d is switching to %s%s." % (
-            n, o["stream"] or default_out_stream(n), " from " + o["source_ip"] if o["source_ip"] else ""))
+            n, shown, " from " + o["source_ip"] if o["source_ip"] else ""))
     if not changed:
         return ("ok", "Output %d: nothing changed." % n)
     later(0.5, run, "systemctl", "restart", "pindi.service")
     if not o["enabled"]:
         log("output %d: disabled" % n)
         return ("ok", "Output %d disabled. The player is restarting." % n)
+    shown = srt_shown(o["stream"]) or default_out_stream(n)
     log("output %d: stream=%s ip=%s rotate=%s mirror=%s bandwidth=%s" % (
-        n, o["stream"] or default_out_stream(n), o["source_ip"] or "any", o["rotate"], o["mirror"], o["bandwidth"]))
+        n, shown, o["source_ip"] or "any", o["rotate"], o["mirror"], o["bandwidth"]))
     return ("ok", "Output %d saved: %s from %s, rotation %s°, mirror %s, %s. The player is restarting." % (
-        n, o["stream"] or default_out_stream(n), o["source_ip"] or "any host", o["rotate"], o["mirror"],
+        n, shown, o["source_ip"] or "any host", o["rotate"], o["mirror"],
         dict(BANDWIDTHS)[o["bandwidth"]].lower()))
 
 
@@ -2782,6 +2822,15 @@ def act_outgoing(form):
             if codec == "srt":
                 return ("err", str(e))
             srt = ""
+        mine = own_ports(srt) if enabled and codec == "srt" else set()
+        env = read_env()
+        for m in range(1, 9):
+            if mine and out_setting(env, m, "ENABLED") != "0" and mine & own_ports(out_setting(env, m, "STREAM")):
+                return ("err", "Output %d already receives on this port: use another port." % m)
+        for other, s in configured_inputs(env).items():
+            if (mine and other != slot and s.get("ENABLED") == "1" and s.get("CODEC") == "srt" and
+                    mine & own_ports(s.get("SRT_URL", ""))):
+                return ("err", "Input %d already sends SRT on this port: use another port." % other)
         if kbps and not (kbps.isdigit() and 500 <= int(kbps) <= 25000):
             if codec in H264_CODECS:
                 return ("err", "The bit rate must be between 500 and 25000 kbit/s, or empty for automatic.")
@@ -3017,13 +3066,16 @@ def api_post(path, data):
                     source_ip = str(ipaddress.IPv4Address(source_ip))
                 except ValueError:
                     return 400, {"error": "source_ip must be an IPv4 address or empty"}
+            err = port_clash(base, n, stream, source_ip)
+            if err:
+                return 400, {"error": err}
             keys = {"PINDI_OUT%d_STREAM" % n: "" if stream == default_out_stream(n) else stream,
                     "PINDI_OUT%d_SOURCE_IP" % n: source_ip, "PINDI_OUT%d_BACKUP_STREAM" % n: backup}
             if n == 1:
                 keys.update({"PINDI_STREAM": "", "PINDI_SOURCE_IP": ""})
             write_env(keys)
         write_switch(n, keys["PINDI_OUT%d_STREAM" % n], source_ip, backup)
-        log("api: output %d -> %s from %s" % (n, stream or default_out_stream(n), source_ip or "any"))
+        log("api: output %d -> %s from %s" % (n, srt_shown(stream) or default_out_stream(n), source_ip or "any"))
         return 200, {"ok": True, "output": n, "stream": stream or default_out_stream(n), "source_ip": source_ip,
                      "backup": backup}
     if path == "/api/v1/identify":
@@ -3309,7 +3361,8 @@ def diagnostics_text(wifi):
             run("systemctl", "status", "--no-pager", "-n", "0", "pindi", "pindi-sender", "pindi-web").stdout,
             "---- log (last 2000 lines)", journal(2000), "---- kernel (last 200 lines)",
             run("journalctl", "-k", "-b", "--no-pager", "-n", "200", "-o", "short-iso").stdout]
-    return "\n".join(out)
+    # SRT addresses in the settings (and in log lines of older versions) may hold their passphrase.
+    return re.sub(r"(passphrase=)[^&\s\"']*", r"\1(removed)", "\n".join(out), flags=re.I)
 
 
 UPDATE_DIR = "/var/lib/pindi/update"

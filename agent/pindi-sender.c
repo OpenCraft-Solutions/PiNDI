@@ -1609,7 +1609,7 @@ static bool srt_open(struct srt_out *s, int n, const char *url, const char *name
     snprintf(s->name, sizeof s->name, "%s", name);
     const char *err;
     if (!srt_parse(url, &s->u, &err)) {
-        LOG("input %d: SRT: \"%s\": %s", n, url, err);
+        LOG("input %d: SRT address not valid: %s", n, err); /* not the address: it may hold the passphrase */
         snprintf(s->state, sizeof s->state, "not sent: the SRT address is not valid (%s)", err);
         return false;
     }
