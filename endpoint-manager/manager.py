@@ -27,6 +27,7 @@ import html
 import http.client
 import http.cookies
 import http.server
+import io
 import ipaddress
 import json
 import mimetypes
@@ -37,9 +38,12 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VERSION = open(os.path.join(HERE, "VERSION")).read().strip()
@@ -810,6 +814,266 @@ class Installer:
         self._say(ip, "Done.", "done")
 
 
+# ---------------------------------------------------------------- updates from the GitHub repository
+
+DEFAULT_REPO, DEFAULT_BRANCH = "https://github.com/OpenCraft-Solutions/PiNDI", "main"
+ROOT = os.path.dirname(HERE)  # the repository: endpoint-manager/ next to agent/ (what new Pis get)
+GITHUB_TIMEOUT = 20
+SOURCE_MAX = 64 * 1024 * 1024
+SOURCE_DIRS = ("endpoint-manager/", "agent/", "docs/")  # what a download (not a git checkout) replaces
+
+
+class UpdateError(Exception):
+    pass
+
+
+def github_repo(url):
+    """(owner, name) of a GitHub repository address: https://github.com/<owner>/<name>[.git] or git@github.com:..."""
+    m = re.match(r"^\s*(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?\s*$",
+                 url or "")
+    if not m or {m.group(1), m.group(2)} & {".", ".."}:
+        raise UpdateError("the repository must be a GitHub address, e.g. %s" % DEFAULT_REPO)
+    return m.group(1), m.group(2)
+
+
+def check_branch(branch):
+    if not re.match(r"^(?!-)[A-Za-z0-9._/-]{1,100}$", branch) or ".." in branch:
+        raise UpdateError("not a valid branch name")
+    return branch
+
+
+def version_key(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
+def git(*args, timeout=60):
+    """git in the repository; never asks for a password (it would wait for ever)."""
+    return subprocess.run(["git", "-C", ROOT] + list(args), capture_output=True, text=True, timeout=timeout,
+                          env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+
+
+def git_checkout():
+    """Does the manager run from a git checkout of the repository (and is git installed)?"""
+    try:
+        r = git("rev-parse", "--show-toplevel", timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    same = os.path.normcase(os.path.realpath(r.stdout.strip())) == os.path.normcase(os.path.realpath(ROOT))
+    return r.returncode == 0 and same
+
+
+def fetch(url, limit, accept="application/vnd.github+json"):
+    """GET over HTTPS (certificate checked), at most limit bytes."""
+    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "PiNDI-Manager/" + VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=GITHUB_TIMEOUT) as r:
+            data = r.read(limit + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise UpdateError("not found on GitHub: check the repository and branch")
+        if e.code in (403, 429):
+            raise UpdateError("GitHub refused the request (its limit is 60 an hour): try again later")
+        raise UpdateError("GitHub answered HTTP %d" % e.code)
+    except (urllib.error.URLError, OSError) as e:
+        raise UpdateError("cannot reach GitHub: %s" % getattr(e, "reason", e))
+    if len(data) > limit:
+        raise UpdateError("the download is too large")
+    return data
+
+
+def restart():
+    """Run the (updated) manager again with the same arguments."""
+    log("restarting")
+    args = [sys.executable] + sys.argv
+    os.environ["PINDI_MANAGER_RESTART"] = "1"  # the new one waits for the port
+    if os.name == "nt":  # no real exec on Windows
+        subprocess.Popen(args)
+        os._exit(0)
+    os.execv(sys.executable, args)
+
+
+class Updates:
+    """Agent releases (signed update packages for the devices) and the manager's own code, from a GitHub
+    repository: the official one, or a fork. Settings in settings.json."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = read_json(path, {})
+        self.lock = threading.Lock()
+        self.job = {"state": "", "log": "", "t": 0}  # updating the manager
+        self.origin = None
+        self.checkout = git_checkout()
+        if self.checkout:  # a fork's checkout defaults to the fork
+            try:
+                self.origin = "https://github.com/%s/%s" % github_repo(git("remote", "get-url", "origin").stdout)
+            except (UpdateError, OSError, subprocess.TimeoutExpired):
+                pass
+
+    def settings(self):
+        return {"repo": self.data.get("repo") or self.origin or DEFAULT_REPO,
+                "branch": self.data.get("branch") or DEFAULT_BRANCH,
+                "default_repo": self.origin or DEFAULT_REPO}
+
+    def set(self, repo, branch):
+        """Empty values go back to the defaults."""
+        repo = "https://github.com/%s/%s" % github_repo(repo) if repo.strip() else ""
+        branch = check_branch(branch.strip()) if branch.strip() else ""
+        with self.lock:
+            self.data.update(repo=repo, branch=branch)
+            write_json(self.path, self.data)
+
+    def local(self):
+        info = {"version": VERSION, "git": None}
+        if self.checkout:
+            try:
+                info["git"] = {"branch": git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+                               "head": git("rev-parse", "HEAD").stdout.strip(),
+                               "dirty": bool(git("status", "--porcelain", "--untracked-files=no").stdout.strip())}
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return dict(info, job=self.job)
+
+    def _api(self, path, limit=4 << 20):
+        owner, name = github_repo(self.settings()["repo"])
+        return json.loads(fetch("https://api.github.com/repos/%s/%s/%s" % (owner, name, path), limit))
+
+    @staticmethod
+    def _package(release):
+        return next((a for a in release.get("assets", [])
+                     if re.match(r"^pindi-update-[0-9.]+\.tar\.gz$", a.get("name", ""))), None)
+
+    def latest_agent(self):
+        """The newest agent release with an update package, or None."""
+        best = None
+        for r in self._api("releases?per_page=50"):
+            tag = str(r.get("tag_name", ""))
+            if r.get("draft") or r.get("prerelease") or not tag.startswith("agent-v") or not self._package(r):
+                continue
+            if best is None or version_key(tag) > version_key(best["tag"]):
+                best = {"version": tag[7:], "tag": tag, "url": r.get("html_url", ""),
+                        "published": r.get("published_at", ""), "asset": self._package(r)["name"]}
+        return best
+
+    def remote_manager(self):
+        s = self.settings()
+        owner, name = github_repo(s["repo"])
+        c = self._api("commits/" + urllib.parse.quote(s["branch"], safe=""))
+        out = {"commit": c["sha"], "message": c["commit"]["message"].split("\n")[0][:120],
+               "date": c["commit"]["committer"]["date"], "version": ""}
+        try:
+            out["version"] = fetch("https://raw.githubusercontent.com/%s/%s/%s/endpoint-manager/VERSION" % (
+                owner, name, c["sha"]), 64, "text/plain").decode().strip()
+        except UpdateError:
+            pass  # a repository without the manager: the commit still says whether there is news
+        g = self.local()["git"]
+        if g and g["head"] == c["sha"]:
+            out["state"] = "current"
+        elif g and git("merge-base", "--is-ancestor", c["sha"], "HEAD").returncode == 0:
+            out["state"] = "ahead"  # this checkout has the remote's code and more
+        else:
+            out["state"] = "behind" if g or version_key(out["version"]) != version_key(VERSION) else "unknown"
+        return out
+
+    def check(self):
+        out = {}
+        for key, fn in (("agent", self.latest_agent), ("manager", self.remote_manager)):
+            try:
+                out[key] = fn()
+            except (UpdateError, KeyError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+                out[key] = {"error": str(e) or "unexpected answer from GitHub"}
+        return out
+
+    def agent_package(self, tag):
+        """The update package of the release tagged tag, checked against GitHub's SHA-256 when it gives one
+        (the devices check its signature anyway)."""
+        if not re.match(r"^agent-v[0-9.]+$", tag or ""):
+            raise UpdateError("not an agent release")
+        asset = self._package(self._api("releases/tags/" + tag))
+        if not asset:
+            raise UpdateError("the release %s has no update package" % tag)
+        data = fetch(asset["browser_download_url"], UPDATE_MAX, "application/octet-stream")
+        digest = asset.get("digest") or ""
+        if digest.startswith("sha256:") and hashlib.sha256(data).hexdigest() != digest[7:].lower():
+            raise UpdateError("the download of %s is damaged (SHA-256 differs)" % asset["name"])
+        return data
+
+    # The manager's own code: git pull in a checkout, else the branch downloaded over the folder.
+
+    def update_manager(self):
+        with self.lock:
+            if self.job["state"] == "running":
+                raise UpdateError("the manager is already updating")
+            self.job = {"state": "running", "log": "", "t": time.time()}
+        threading.Thread(target=self._update_manager, daemon=True).start()
+
+    def _say(self, text):
+        self.job["log"] += text.rstrip() + "\n"
+        log("manager update: " + text.rstrip())
+
+    def _update_manager(self):
+        s = self.settings()
+        try:
+            changed = self._git_pull(s) if git_checkout() else self._download(s)
+        except (UpdateError, OSError, subprocess.TimeoutExpired, tarfile.TarError) as e:
+            self._say("Failed: %s" % e)
+            self.job["state"] = "failed"
+            return
+        if not changed:
+            self._say("Already up to date.")
+            self.job["state"] = "done"
+            return
+        self._say("Restarting the manager: sign in again in a few seconds.")
+        self.job["state"] = "restarting"
+        threading.Timer(1.0, restart).start()
+
+    def _git_pull(self, s):
+        branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        if branch != s["branch"]:
+            raise UpdateError("this checkout is on the branch %s, not %s: switch to %s, or set the branch to %s"
+                              % (branch, s["branch"], s["branch"], branch))
+        before = git("rev-parse", "HEAD").stdout.strip()
+        url = "https://github.com/%s/%s.git" % github_repo(s["repo"])
+        self._say("git pull --ff-only %s %s" % (url, s["branch"]))
+        r = git("pull", "--ff-only", url, s["branch"], timeout=300)
+        self._say((r.stdout + r.stderr).strip() or "(no output)")
+        if r.returncode:
+            raise UpdateError("git pull failed: local changes in the way, or the branch went another way than "
+                              "this checkout")
+        return git("rev-parse", "HEAD").stdout.strip() != before
+
+    def _download(self, s):
+        owner, name = github_repo(s["repo"])
+        url = "https://codeload.github.com/%s/%s/tar.gz/refs/heads/%s" % (owner, name, urllib.parse.quote(s["branch"]))
+        self._say("Not a git checkout: downloading %s" % url)
+        files = {}
+        with tarfile.open(fileobj=io.BytesIO(fetch(url, SOURCE_MAX, "*/*")), mode="r:gz") as tar:
+            for m in tar.getmembers():
+                rel = m.name.split("/", 1)[1] if "/" in m.name else ""  # under "<name>-<branch>/"
+                if not m.isfile() or not rel.startswith(SOURCE_DIRS):
+                    continue
+                if rel.startswith("/") or ".." in rel.split("/") or "\\" in rel:
+                    raise UpdateError("unsafe path in the download: %s" % rel)
+                files[rel] = tar.extractfile(m).read()
+        if "endpoint-manager/manager.py" not in files:
+            raise UpdateError("the download has no endpoint-manager/manager.py: not a PiNDI repository")
+        changed = 0
+        for rel, data in sorted(files.items()):
+            path = os.path.join(ROOT, *rel.split("/"))
+            try:
+                with open(path, "rb") as f:
+                    if f.read() == data:
+                        continue
+            except FileNotFoundError:
+                pass
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+            changed += 1
+        self._say("%d file(s) updated." % changed)
+        return changed > 0
+
+
 # ---------------------------------------------------------------- the manager's own sign-in
 
 class Auth:
@@ -869,7 +1133,7 @@ class Auth:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "PiNDI-Manager/" + VERSION
-    fleet = auth = scanner = installer = None
+    fleet = auth = scanner = installer = updates = None
 
     def log_message(self, fmt, *args):
         pass
@@ -946,6 +1210,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    "agent_dir": self.installer.agent_dir})
         if url.path == "/api/install-log":
             return self.send(200, {"log": self.installer.log_of(q.get("ip", ""))})
+        if url.path == "/api/updates":
+            return self.send(200, {"settings": self.updates.settings(), "local": self.updates.local()})
         self.send(404, {"error": "unknown"})
 
     def do_POST(self):
@@ -1013,7 +1279,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.installer.start(ips, str(data.get("user", "")), str(data.get("password", "")),
                                      bool(data.get("skip_upgrade")))
                 return self.send(202, {"ok": True})
-        except (DeviceError, KeyError, ValueError, TypeError) as e:
+            if url.path == "/api/updates/settings":
+                self.updates.set(str(data.get("repo", "")), str(data.get("branch", "")))
+                return self.send(200, {"ok": True, "settings": self.updates.settings()})
+            if url.path == "/api/updates/check":
+                return self.send(200, self.updates.check())
+            if url.path == "/api/updates/agent":
+                if not ids:
+                    return self.send(400, {"error": "select the devices to update first"})
+                package = self.updates.agent_package(str(data.get("tag", "")))
+                run_bulk(self.fleet, "update", ids, package, data.get("downgrade") is True,
+                         (str(data.get("user", "")), str(data.get("password", ""))))
+                return self.send(202, {"ok": True})
+            if url.path == "/api/updates/manager":
+                self.updates.update_manager()
+                return self.send(202, {"ok": True})
+        except (DeviceError, UpdateError, KeyError, ValueError, TypeError) as e:
             return self.send(400, {"error": str(e) or "bad request"})
         self.send(404, {"error": "unknown"})
 
@@ -1072,12 +1353,19 @@ def main():
     Handler.auth = Auth(os.path.join(args.data, "auth.json"))
     Handler.scanner = Scanner(Handler.fleet)
     Handler.installer = Installer(Handler.fleet, os.path.realpath(args.agent), os.path.join(args.data, "known_hosts"))
+    Handler.updates = Updates(os.path.join(args.data, "settings.json"))
     log("data in %s (this user only)" % args.data)
     threading.Thread(target=Handler.fleet.poll_loop, daemon=True).start()
-    try:
-        srv = Server((args.host, args.port), Handler)
-    except OSError as e:
-        sys.exit("cannot listen on %s:%d (%s): is the manager already running?" % (args.host, args.port, e))
+    # After an update the old manager may still hold the port for a moment.
+    tries = 40 if os.environ.pop("PINDI_MANAGER_RESTART", "") else 1
+    for i in range(tries):
+        try:
+            srv = Server((args.host, args.port), Handler)
+            break
+        except OSError as e:
+            if i == tries - 1:
+                sys.exit("cannot listen on %s:%d (%s): is the manager already running?" % (args.host, args.port, e))
+            time.sleep(0.25)
     scheme = "http"
     if args.cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
