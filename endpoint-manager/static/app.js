@@ -204,10 +204,18 @@ function sources() {
       }
       // An input sent as H.264 RTP to a multicast group: any output can join it (rtp://group:port). Unicast
       // RTP goes to one fixed receiver, so it can't be routed from here.
+      const ip = d.status.device.ip, name = `${d.status.device.ndi_name || devName(d)} (${i.name})`;
       if (i.enabled && i.codec === 'rtp' && isMulticast(i.rtp_dest)) {
-        const stream = 'rtp://' + i.rtp_dest, ip = d.status.device.ip;
-        map.set(stream + '\t' + ip, { name: `${d.status.device.ndi_name || devName(d)} (${i.name})`, stream, ip,
-          pindi: true, rtp: true });
+        const stream = 'rtp://' + i.rtp_dest;
+        map.set(stream + '\t' + ip, { name, stream, ip, pindi: true, kind: 'H.264 RTP' });
+      }
+      // An input sent as H.264 SRT that listens: outputs call it (srt://device:port, up to 8 of them). One that
+      // calls its receiver, or is encrypted (the API doesn't give out the passphrase), can't be routed here.
+      const port = i.enabled && i.codec === 'srt' && ip ? srtListenPort(i.srt_url) : null;
+      if (port) {
+        const latency = /[?&]latency=(\d+)/.exec(i.srt_url);
+        const stream = `srt://${ip}:${port}` + (latency ? '?latency=' + latency[1] : '');
+        map.set(stream + '\t' + ip, { name, stream, ip, pindi: true, kind: 'H.264 SRT' });
       }
     }
   }
@@ -215,6 +223,15 @@ function sources() {
 }
 
 const isMulticast = dest => { const a = Number(/^(\d+)\./.exec(dest || '')?.[1]); return a >= 224 && a <= 239; };
+// The port of an input's SRT address if it listens unencrypted ("srt://:9000", "srt://0.0.0.0:9000?mode=listener"),
+// else null. As srt_url() in pindi-web.py.
+const srtListenPort = url => {
+  const m = /^srt:\/\/@?([^:?\s]*):(\d+)(\?\S*)?$/i.exec(url || '');
+  if (!m || / \(encrypted\)$/.test(url)) return null;
+  const mode = /[?&]mode=(\w+)/i.exec(m[3] || '');
+  const listen = mode ? mode[1].toLowerCase() === 'listener' : !m[1] || m[1] === '0.0.0.0';
+  return listen ? Number(m[2]) : null;
+};
 
 function renderMatrix() {
   const outs = devices.filter(d => d.status).flatMap(d => (d.status.outputs || []).map(o => ({ d, o })));
@@ -250,11 +267,11 @@ function renderMatrix() {
   // "HOST (STREAM)": the host ends at the first " (" (a bridge's stream names have brackets of their own).
   const host = s => { const m = /^(.*?) \((.*)\)$/.exec(s.name); return m ? m[1] : s.name; };
   html += srcs.map(s => `<tr><th class="src">${esc(s.stream)}${s.pindi ? '<span class="tag">PiNDI</span>' : ''}` +
-    `${s.rtp ? '<span class="tag">H.264 RTP</span>' : ''}<span class="sub">${esc(s.rtp ? s.name : host(s))} · ${esc(s.ip)}</span></th>` +
+    `${s.kind ? `<span class="tag">${s.kind}</span>` : ''}<span class="sub">${esc(s.kind ? s.name : host(s))} · ${esc(s.ip)}</span></th>` +
     outs.map(({ d, o }) => {
       const routed = !!o.stream && o.target.toLowerCase() === s.stream.toLowerCase() && (!o.source_ip || o.source_ip === s.ip);
-      // An RTP output's source is the rtp:// address it receives.
-      return cell(d, o, s, routed, routed && playing(o) && o.source === (s.rtp ? s.stream : s.name));
+      // An RTP or SRT output's source is the rtp:// or srt:// address it receives.
+      return cell(d, o, s, routed, routed && playing(o) && o.source === (s.kind ? s.stream : s.name));
     }).join('') + '</tr>').join('');
   if (!srcs.length) {
     html += `<tr><td class="muted" colspan="${outs.length + 1}">${filter ? 'No source matches the filter.' : 'No NDI sources seen yet.'}</td></tr>`;
