@@ -1,6 +1,6 @@
 /*
- * pindi-sender - PiNDI outgoing NDI streams from USB (UVC) HDMI capture devices and CSI-2 HDMI
- * bridges (TC358743 on a camera connector).
+ * pindi-sender - PiNDI outgoing NDI (or H.264 RTP) streams from USB (UVC) HDMI capture devices and
+ * CSI-2 HDMI bridges (TC358743 on a camera connector).
  *
  * Nothing is sent unless configured (web UI "Configure Outgoing Streams"):
  *   PINDI_IN<n>_ENABLED=1
@@ -11,6 +11,9 @@
  *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default), or off
  *   PINDI_IN<n>_AUDIO_SYNC=off                 send the audio as the device's clock delivers it (default:
  *                                              kept in step with this Pi's clock)
+ *   PINDI_IN<n>_CODEC=speedhq                  Full NDI (default), hx (NDI|HX) or rtp (H.264 over RTP, no NDI)
+ *   PINDI_IN<n>_RTP_DEST=239.255.0.1:5004      rtp: where to send it (unicast or multicast address and port)
+ *   PINDI_IN<n>_RTP_KBPS=                      rtp: video bit rate in kbit/s (default: about 6 Mbit/s at 1080p30)
  *
  * One thread per input: V4L2 capture -> decode workers (MJPEG decode straight to YUV, two threads
  * at HD) -> NDI send, and one for its audio: ALSA capture (48 kHz stereo) -> NDI send.
@@ -21,11 +24,13 @@
  * over NDI: no NDI encoding and decoding on the same Pi, which a Pi 3 cannot do at 1080p60.
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -37,9 +42,12 @@
 #include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -658,6 +666,316 @@ static void csi_close(struct csi *c, int fd)
     c->sd = -1;
 }
 
+/* ------------------------------------------------------------------ H.264 over RTP */
+
+/* With PINDI_IN<n>_CODEC=rtp the hardware encoder's H.264 is sent as RTP (RFC 6184) to
+ * PINDI_IN<n>_RTP_DEST (ip:port, unicast or multicast) instead of over NDI: no NDI Advanced SDK
+ * licence, and any RTP receiver shows it (another PiNDI, or VLC, ffmpeg, OBS... with the SDP file
+ * /run/pindi/in<n>.sdp). The audio goes to port + 2 as 48 kHz stereo L16; RTCP sender reports on
+ * port + 1 and + 3 tie both to the wall clock, for lip sync and the receiver's latency figure.
+ * The video is sent from the encoder thread, the audio from the audio thread: each stream has
+ * one writer. */
+#define RTP_PAYLOAD 1400       /* bytes per packet: under the Ethernet MTU, with room for VLAN/VPN headers */
+#define RTP_PT_VIDEO 96
+#define RTP_PT_AUDIO 97
+#define RTP_AUDIO_FRAMES 240   /* 5 ms of stereo L16 per packet (960 bytes) */
+#define RTP_TTL 16             /* multicast hops (ffmpeg's default) */
+
+struct rtp_stream {
+    uint16_t seq;
+    uint32_t ssrc, ts_base;
+    uint32_t packets, octets; /* for the sender reports */
+    uint64_t sr_ms;           /* last sender report (monotonic) */
+    uint32_t last_ts;         /* audio: the timestamp after the last packet, and when it was sent */
+    int64_t last_100ns;
+};
+
+struct rtp_out {
+    int fd;
+    struct sockaddr_in dst;
+    char dest[64];            /* "ip:port", as configured */
+    bool multicast;
+    struct rtp_stream v, a;
+    uint64_t samples;         /* audio frames sent */
+    uint8_t sps[128], pps[64];
+    size_t sps_len, pps_len;
+    char sdp_path[64], name[128];
+    bool audio;               /* the SDP announces audio */
+    double fps;
+};
+
+/* Wall clock, 100 ns since 1970 (as NDI timestamps and capture_time()). */
+static int64_t now_100ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 10000000 + ts.tv_nsec / 100;
+}
+
+static bool rtp_parse_dest(const char *s, struct sockaddr_in *a)
+{
+    char ip[32];
+    const char *colon = strrchr(s, ':');
+    char *end;
+    if (!colon || colon - s >= (long)sizeof ip)
+        return false;
+    memcpy(ip, s, (size_t)(colon - s));
+    ip[colon - s] = 0;
+    long port = strtol(colon + 1, &end, 10);
+    memset(a, 0, sizeof *a);
+    a->sin_family = AF_INET;
+    a->sin_port = htons((uint16_t)port);
+    return !*end && port >= 1024 && port <= 65532 && inet_pton(AF_INET, ip, &a->sin_addr) == 1;
+}
+
+static bool rtp_open(struct rtp_out *r, int n, const char *dest, const char *name, bool audio, double fps)
+{
+    memset(r, 0, sizeof *r);
+    r->fd = -1;
+    snprintf(r->dest, sizeof r->dest, "%s", dest);
+    snprintf(r->name, sizeof r->name, "%s", name);
+    snprintf(r->sdp_path, sizeof r->sdp_path, RUN_DIR "/in%d.sdp", n);
+    r->audio = audio;
+    r->fps = fps;
+    if (!rtp_parse_dest(dest, &r->dst)) {
+        LOG("input %d: H.264 RTP: \"%s\" is not an IPv4 address and port (1024-65532)", n, dest);
+        return false;
+    }
+    r->multicast = (ntohl(r->dst.sin_addr.s_addr) >> 28) == 14; /* 224.0.0.0/4 */
+    r->fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (r->fd < 0)
+        return false;
+    int ttl = RTP_TTL, tos = 0x88, sndbuf = 1 << 20; /* DSCP AF41: interactive video */
+    if (r->multicast)
+        setsockopt(r->fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+    setsockopt(r->fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+    setsockopt(r->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
+    uint32_t rnd[6];
+    if (getrandom(rnd, sizeof rnd, 0) != (ssize_t)sizeof rnd)
+        for (int i = 0; i < 6; i++)
+            rnd[i] = (uint32_t)now_us() * 2654435761u + (uint32_t)i * 40503u;
+    r->v.ssrc = rnd[0];
+    r->a.ssrc = rnd[1] == rnd[0] ? rnd[1] + 1 : rnd[1];
+    r->v.ts_base = rnd[2];
+    r->a.ts_base = rnd[3];
+    r->v.seq = (uint16_t)rnd[4];
+    r->a.seq = (uint16_t)rnd[5];
+    unlink(r->sdp_path); /* written with the first keyframe's parameter sets */
+    LOG("input %d: H.264 RTP to %s%s, audio to port %d", n, dest, r->multicast ? " (multicast)" : "",
+        ntohs(r->dst.sin_port) + 2);
+    return true;
+}
+
+static void rtp_close(struct rtp_out *r)
+{
+    if (r->fd >= 0)
+        close(r->fd);
+    r->fd = -1;
+}
+
+/* Datagram to the destination's port + port_add. */
+static void rtp_sendv(struct rtp_out *r, int port_add, struct iovec *iov, int niov)
+{
+    struct sockaddr_in to = r->dst;
+    to.sin_port = htons((uint16_t)(ntohs(r->dst.sin_port) + port_add));
+    struct msghdr m = { .msg_name = &to, .msg_namelen = sizeof to, .msg_iov = iov, .msg_iovlen = (size_t)niov };
+    sendmsg(r->fd, &m, MSG_NOSIGNAL); /* UDP: a lost packet is the receiver's to cope with */
+}
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+/* One RTP packet: 12-byte header, then up to two pieces of payload. */
+static void rtp_packet(struct rtp_out *r, struct rtp_stream *s, int port_add, int pt, bool marker, uint32_t ts,
+                       const void *p1, size_t n1, const void *p2, size_t n2)
+{
+    uint8_t h[12];
+    h[0] = 0x80; /* version 2 */
+    h[1] = (uint8_t)(pt | (marker ? 0x80 : 0));
+    h[2] = (uint8_t)(s->seq >> 8);
+    h[3] = (uint8_t)s->seq;
+    put32(h + 4, ts);
+    put32(h + 8, s->ssrc);
+    struct iovec iov[3] = { { h, sizeof h }, { (void *)p1, n1 }, { (void *)p2, n2 } };
+    rtp_sendv(r, port_add, iov, n2 ? 3 : 2);
+    s->seq++;
+    s->packets++;
+    s->octets += (uint32_t)(n1 + n2);
+}
+
+/* RTCP sender report (RFC 3550): this stream's timestamp at wall-clock time t. */
+static void rtcp_sr(struct rtp_out *r, struct rtp_stream *s, int port_add, int64_t t, uint32_t ts)
+{
+    uint8_t p[28];
+    uint64_t secs = (uint64_t)(t / 10000000) + 2208988800u; /* NTP counts from 1900 */
+    uint32_t frac = (uint32_t)(((uint64_t)(t % 10000000) << 32) / 10000000);
+    p[0] = 0x80;
+    p[1] = 200; /* SR */
+    p[2] = 0;
+    p[3] = 6; /* length in 32-bit words, minus one */
+    put32(p + 4, s->ssrc);
+    put32(p + 8, (uint32_t)secs);
+    put32(p + 12, frac);
+    put32(p + 16, ts);
+    put32(p + 20, s->packets);
+    put32(p + 24, s->octets);
+    struct iovec iov = { p, sizeof p };
+    rtp_sendv(r, port_add, &iov, 1);
+    s->sr_ms = now_ms();
+}
+
+static size_t b64(const uint8_t *s, size_t n, char *d)
+{
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)s[i] << 16 | (i + 1 < n ? (uint32_t)s[i + 1] << 8 : 0) | (i + 2 < n ? s[i + 2] : 0);
+        d[o++] = t[v >> 18 & 63];
+        d[o++] = t[v >> 12 & 63];
+        d[o++] = i + 1 < n ? t[v >> 6 & 63] : '=';
+        d[o++] = i + 2 < n ? t[v & 63] : '=';
+    }
+    d[o] = 0;
+    return o;
+}
+
+/* The session description for RTP receivers (VLC, ffmpeg, OBS...): written when the parameter sets
+ * are first seen or change (another capture mode). */
+static void rtp_write_sdp(struct rtp_out *r)
+{
+    char src[INET_ADDRSTRLEN] = "0.0.0.0", dst[INET_ADDRSTRLEN], sps[180], pps[100], buf[1536];
+    int t = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0); /* this device's address towards the receiver */
+    struct sockaddr_in me;
+    socklen_t ml = sizeof me;
+    if (t >= 0 && !connect(t, (struct sockaddr *)&r->dst, sizeof r->dst) &&
+        !getsockname(t, (struct sockaddr *)&me, &ml))
+        inet_ntop(AF_INET, &me.sin_addr, src, sizeof src);
+    if (t >= 0)
+        close(t);
+    inet_ntop(AF_INET, &r->dst.sin_addr, dst, sizeof dst);
+    b64(r->sps, r->sps_len, sps);
+    b64(r->pps, r->pps_len, pps);
+    int port = ntohs(r->dst.sin_port), len;
+    len = snprintf(buf, sizeof buf,
+                   "v=0\r\no=- %u 1 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s%s\r\nt=0 0\r\na=tool:PiNDI\r\n"
+                   "m=video %d RTP/AVP %d\r\na=rtpmap:%d H264/90000\r\n"
+                   "a=fmtp:%d packetization-mode=1;profile-level-id=%02X%02X%02X;sprop-parameter-sets=%s,%s\r\n"
+                   "a=framerate:%.4g\r\n",
+                   r->v.ssrc, src, r->name, dst, r->multicast ? "/16" : "", port, RTP_PT_VIDEO, RTP_PT_VIDEO,
+                   RTP_PT_VIDEO, r->sps[1], r->sps[2], r->sps[3], sps, pps, r->fps);
+    if (r->audio && len > 0 && len < (int)sizeof buf)
+        snprintf(buf + len, sizeof buf - (size_t)len,
+                 "m=audio %d RTP/AVP %d\r\na=rtpmap:%d L16/48000/2\r\na=ptime:5\r\n", port + 2, RTP_PT_AUDIO,
+                 RTP_PT_AUDIO);
+    write_file_atomic(r->sdp_path, buf);
+}
+
+/* One NAL unit (no start code): as it is if it fits a packet, else in FU-A fragments. */
+static void rtp_send_nal(struct rtp_out *r, const uint8_t *nal, size_t len, uint32_t ts, bool last)
+{
+    if (len <= RTP_PAYLOAD) {
+        rtp_packet(r, &r->v, 0, RTP_PT_VIDEO, last, ts, nal, len, NULL, 0);
+        return;
+    }
+    uint8_t fu[2] = { (uint8_t)((nal[0] & 0xe0) | 28), (uint8_t)(0x80 | (nal[0] & 0x1f)) }; /* FU indicator, start */
+    size_t at = 1; /* the NAL header travels in the FU header */
+    while (at < len) {
+        size_t n = len - at < RTP_PAYLOAD - 2 ? len - at : RTP_PAYLOAD - 2;
+        bool end = at + n == len;
+        if (end)
+            fu[1] |= 0x40;
+        rtp_packet(r, &r->v, 0, RTP_PT_VIDEO, last && end, ts, fu, 2, nal + at, n);
+        fu[1] &= 0x1f; /* neither start nor end */
+        at += n;
+    }
+}
+
+/* Next NAL unit in Annex B data from *at: its start (after the start code) and length; false at the end. */
+static bool annexb_next(const uint8_t *d, size_t len, size_t *at, const uint8_t **nal, size_t *nlen)
+{
+    size_t i = *at;
+    while (i + 3 <= len && !(d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1))
+        i++;
+    if (i + 3 > len)
+        return false;
+    size_t s = i + 3, e = s;
+    while (e + 3 <= len && !(d[e] == 0 && d[e + 1] == 0 && d[e + 2] == 1))
+        e++;
+    if (e + 3 > len)
+        e = len;
+    *at = e;
+    while (e > s && d[e - 1] == 0) /* a 4-byte start code's first zero, or trailing zeros */
+        e--;
+    *nal = d + s;
+    *nlen = e - s;
+    return true;
+}
+
+/* One encoded picture (Annex B), captured at t (100 ns UTC). */
+static void rtp_send_video(struct rtp_out *r, const uint8_t *data, size_t len, int64_t t)
+{
+    uint32_t ts = r->v.ts_base + (uint32_t)(t * 9 / 1000); /* 90 kHz */
+    const uint8_t *nal = NULL, *next = NULL;
+    size_t at = 0, nlen = 0, nnext = 0;
+    bool has = annexb_next(data, len, &at, &nal, &nlen);
+    while (has) {
+        bool more;
+        do /* the next non-empty unit: is this one the picture's last? */
+            more = annexb_next(data, len, &at, &next, &nnext);
+        while (more && !nnext);
+        if (nlen) {
+            int type = nal[0] & 0x1f;
+            bool changed = false;
+            if (type == 7 && nlen <= sizeof r->sps && (nlen != r->sps_len || memcmp(r->sps, nal, nlen))) {
+                memcpy(r->sps, nal, nlen);
+                r->sps_len = nlen;
+                changed = true;
+            } else if (type == 8 && nlen <= sizeof r->pps && (nlen != r->pps_len || memcmp(r->pps, nal, nlen))) {
+                memcpy(r->pps, nal, nlen);
+                r->pps_len = nlen;
+                changed = true;
+            }
+            if (changed && r->sps_len >= 4 && r->pps_len)
+                rtp_write_sdp(r);
+            if (type != 9) /* access unit delimiters are optional; the marker bit ends a picture */
+                rtp_send_nal(r, nal, nlen, ts, !more);
+        }
+        nal = next;
+        nlen = nnext;
+        has = more;
+    }
+    if (now_ms() - r->v.sr_ms >= 1000) {
+        int64_t now = now_100ns();
+        rtcp_sr(r, &r->v, 1, now, r->v.ts_base + (uint32_t)(now * 9 / 1000));
+    }
+}
+
+/* n frames of 48 kHz stereo audio, sent as they are captured. */
+static void rtp_send_audio(struct rtp_out *r, const int16_t *s, int n)
+{
+    uint8_t be[RTP_AUDIO_FRAMES * 4];
+    for (int at = 0; at < n; at += RTP_AUDIO_FRAMES) {
+        int k = n - at < RTP_AUDIO_FRAMES ? n - at : RTP_AUDIO_FRAMES;
+        for (int i = 0; i < k * 2; i++) { /* network byte order */
+            uint16_t v = (uint16_t)s[at * 2 + i];
+            be[i * 2] = (uint8_t)(v >> 8);
+            be[i * 2 + 1] = (uint8_t)v;
+        }
+        uint32_t ts = r->a.ts_base + (uint32_t)r->samples;
+        rtp_packet(r, &r->a, 2, RTP_PT_AUDIO, false, ts, be, (size_t)k * 4, NULL, 0);
+        r->samples += (uint64_t)k;
+    }
+    r->a.last_ts = r->a.ts_base + (uint32_t)r->samples;
+    r->a.last_100ns = now_100ns();
+    if (now_ms() - r->a.sr_ms >= 1000) /* the samples just sent end about now */
+        rtcp_sr(r, &r->a, 3, r->a.last_100ns, r->a.last_ts);
+}
+
 /* ------------------------------------------------------------------ input thread */
 
 struct input {
@@ -666,6 +984,10 @@ struct input {
     bool audio_on;
     bool audio_sync; /* keep the audio in step with this Pi's clock (PINDI_IN<n>_AUDIO_SYNC) */
     bool hx; /* PINDI_IN<n>_CODEC=hx: NDI|HX through the hardware H.264 encoder */
+    bool rtp; /* PINDI_IN<n>_CODEC=rtp: H.264 over RTP through the hardware encoder; no NDI sender */
+    char rtp_dest[64];
+    int rtp_kbps;
+    struct rtp_out r; /* open while sending (r.fd >= 0) */
     bool video_range; /* PINDI_IN<n>_RANGE=video: the device's JPEG is already 16-235 (else converted) */
     pthread_t thr, athr;
     NDIlib_send_instance_t send;
@@ -764,7 +1086,7 @@ struct capbuf { void *start; size_t len; };
  * receivers don't sit on a frozen last frame. Only while someone is connected. */
 static void send_black(struct input *in, NDIlib_send_instance_t send)
 {
-    if (in->w <= 0 || in->h <= 0 || !ndi->send_get_no_connections(send, 0))
+    if (!send || in->w <= 0 || in->h <= 0 || !ndi->send_get_no_connections(send, 0))
         return;
     if (!in->black) {
         size_t n = (size_t)in->w * in->h * 2;
@@ -865,7 +1187,8 @@ static void enc_ctrl(int fd, uint32_t id, int value)
     xioctl(fd, VIDIOC_S_CTRL, &c);
 }
 
-static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instance_t send, int n)
+/* send: the NDI sender (NDI|HX), NULL for RTP. kbps: the bit rate asked for, 0 = automatic. */
+static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instance_t send, int n, int kbps)
 {
     memset(e, 0, sizeof *e);
     e->fd = open(enc_dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -894,7 +1217,7 @@ static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instan
     NDIlib_video_frame_v2_t f = { .xres = m->w, .yres = m->h, .FourCC = (NDIlib_FourCC_video_type_e)NDI_LIB_FOURCC('H', '2', '6', '4'),
                                   .frame_rate_N = (int)m->den, .frame_rate_D = (int)m->num,
                                   .frame_format_type = NDIlib_frame_format_type_progressive };
-    int bps = ndi_target_bit_rate ? ndi_target_bit_rate(send, &f) : 0;
+    int bps = kbps > 0 ? kbps * 1000 : ndi_target_bit_rate && send ? ndi_target_bit_rate(send, &f) : 0;
     if (bps <= 0)
         bps = (int)((double)m->w * m->h * m->den / m->num * 0.1); /* ~12 Mbit/s at 1080p60 */
     if (bps > 25000000)
@@ -946,10 +1269,10 @@ static bool hwenc_open(struct hwenc *e, const struct mode *m, NDIlib_send_instan
     if (xioctl(e->fd, VIDIOC_STREAMON, &t))
         goto fail;
     e->frame_100ns = (int64_t)(10000000.0 * m->num / m->den);
-    LOG("input %d: NDI|HX: hardware H.264 encoder %s, %.1f Mbit/s", n, enc_dev, bps / 1e6);
+    LOG("input %d: %s: hardware H.264 encoder %s, %.1f Mbit/s", n, send ? "NDI|HX" : "H.264 RTP", enc_dev, bps / 1e6);
     return true;
 fail:
-    LOG("input %d: hardware H.264 encoder: %s - sending Full NDI", n, strerror(errno));
+    LOG("input %d: hardware H.264 encoder: %s - %s", n, strerror(errno), send ? "sending Full NDI" : "not sent");
     hwenc_close(e);
     return false;
 }
@@ -1057,7 +1380,8 @@ struct pipeline {
     NDIlib_video_frame_v2_t pframe;
     pthread_t ndi_thr;
     int frames, damaged, ndi_sent; /* published / skipped / sent over NDI since the last status (mu) */
-    bool hx;          /* NDI|HX through enc; out[] are its input buffers */
+    bool hx;          /* H.264 through enc (NDI|HX, or RTP); out[] are its input buffers */
+    bool rtp;         /* the H.264 goes out as RTP (in->r), not to NDI */
     struct hwenc enc;
     int out_stride;   /* bytes per UYVY line in out[] */
 };
@@ -1067,15 +1391,18 @@ struct pipeline {
 static void hx_step(struct pipeline *pl, int i, int wait_ms)
 {
     struct hwenc *e = &pl->enc;
-    if (i >= 0) {
+    if (i >= 0 && !pl->rtp) {
         /* A new receiver can't start before a keyframe: send one now (NDI|HX: within 100 ms). The
-         * SDK's own request is checked too, but it never fired with these compressed frames. */
+         * SDK's own request is checked too, but it never fired with these compressed frames. (RTP
+         * receivers join at the next regular keyframe, at most a second away.) */
         int conns = ndi->send_get_no_connections(pl->send, 0);
         if (conns > e->conns || (ndi_keyframe_required && ndi_keyframe_required(pl->send, &pl->pframe))) {
             enc_ctrl(e->fd, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1);
             e->forced++;
         }
         e->conns = conns;
+    }
+    if (i >= 0) {
         struct v4l2_plane p = { .bytesused = (uint32_t)e->in_len[i], .length = (uint32_t)e->in_len[i] };
         struct v4l2_buffer b = { .index = i, .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, .memory = V4L2_MEMORY_MMAP,
                                  .m.planes = &p, .length = 1 };
@@ -1113,8 +1440,15 @@ static void hx_step(struct pipeline *pl, int i, int wait_ms)
                 break;
             if (p.bytesused && b.index < ENC_OUT_BUFS) {
                 int64_t tc = ((int64_t)b.timestamp.tv_sec * 1000000 + b.timestamp.tv_usec) * 10;
-                hwenc_send(e, pl->send, &pl->m, e->out_map[b.index] + p.data_offset, p.bytesused - p.data_offset,
-                           b.flags & V4L2_BUF_FLAG_KEYFRAME, tc ? tc : NDIlib_send_timecode_synthesize);
+                const uint8_t *data = e->out_map[b.index] + p.data_offset;
+                size_t len = p.bytesused - p.data_offset;
+                bool key = b.flags & V4L2_BUF_FLAG_KEYFRAME;
+                if (pl->rtp) {
+                    rtp_send_video(&pl->in->r, data, len, tc ? tc : now_100ns());
+                    e->keys += key;
+                } else {
+                    hwenc_send(e, pl->send, &pl->m, data, len, key, tc ? tc : NDIlib_send_timecode_synthesize);
+                }
                 pthread_mutex_lock(&pl->mu);
                 pl->ndi_sent++;
                 pthread_mutex_unlock(&pl->mu);
@@ -1508,12 +1842,27 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
     streaming = true;
 
     pl.m = m;
-    if (in->hx && !*enc_dev)
+    const char *rtp_why = NULL; /* why an RTP input sends nothing */
+    if (in->rtp) {
+        if (in->r.fps != (double)m.den / m.num) { /* the SDP gives the frame rate: write it again */
+            in->r.fps = (double)m.den / m.num;
+            in->r.sps_len = 0;
+        }
+        if (!*enc_dev)
+            rtp_why = "not sent: H.264 RTP needs the hardware H.264 encoder of a Pi 3 or 4";
+        else if (in->r.fd < 0)
+            rtp_why = "not sent: the RTP destination is not a valid address and port";
+        else if (!(pl.hx = pl.rtp = hwenc_open(&pl.enc, &m, NULL, in->n, in->rtp_kbps)))
+            rtp_why = "not sent: the hardware H.264 encoder failed (see the log)";
+        if (rtp_why)
+            LOG("input %d: %s", in->n, rtp_why);
+    } else if (in->hx && !*enc_dev) {
         LOG("input %d: NDI|HX needs the Pi's hardware H.264 encoder (none here) - sending Full NDI", in->n);
-    else if (in->hx && !ndi_target_bit_rate)
+    } else if (in->hx && !ndi_target_bit_rate) {
         LOG("input %d: NDI|HX needs the NDI Advanced SDK - sending Full NDI", in->n);
-    else if (in->hx)
-        pl.hx = hwenc_open(&pl.enc, &m, send, in->n);
+    } else if (in->hx) {
+        pl.hx = hwenc_open(&pl.enc, &m, send, in->n, 0);
+    }
     pl.out_stride = pl.hx ? pl.enc.bpl : m.w * 2;
     pl.nw = m.fourcc == V4L2_PIX_FMT_MJPEG && m.w * m.h >= 1280 * 720 ? (pl.hx ? 3 : 2) : 1;
     for (int i = 0; i < NOUT; i++)
@@ -1533,8 +1882,12 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             goto out;
         started++;
     }
-    LOG("input %d: %s from %s as NDI%s \"%s\" (%d decoding thread%s)", in->n, mode_desc, in->device,
-        pl.hx ? "|HX" : "", in->name, pl.nw, pl.nw == 1 ? "" : "s");
+    if (in->rtp)
+        LOG("input %d: %s from %s as H.264 RTP to %s (%d decoding thread%s)", in->n, mode_desc, in->device,
+            in->rtp_dest, pl.nw, pl.nw == 1 ? "" : "s");
+    else
+        LOG("input %d: %s from %s as NDI%s \"%s\" (%d decoding thread%s)", in->n, mode_desc, in->device,
+            pl.hx ? "|HX" : "", in->name, pl.nw, pl.nw == 1 ? "" : "s");
     status(in, "starting", mode_desc, 0, 0, 0);
 
     int timeouts = 0, cam = 0, log_cam = 0, log_sent = 0, log_ndi = 0, log_damaged = 0, conns = 0;
@@ -1578,17 +1931,18 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         /* The SDK encodes (full and preview stream) even with nobody connected: with no receivers,
          * skip decoding and sending altogether. That's most of the CPU (and heat) on a Pi 3. */
         uint64_t tnow = now_ms();
-        if (tnow - conns_checked >= 250) {
+        if (send && tnow - conns_checked >= 250) {
             conns = ndi->send_get_no_connections(send, 0);
             conns_checked = tnow;
         }
         local = local_wanted(in->lf);
-        if (!conns && !local) {
+        bool sending = conns > 0 || pl.rtp; /* RTP is sent whether or not anyone receives it */
+        if (!sending && !local) {
             xioctl(fd, VIDIOC_QBUF, &b);
             idle = true;
         } else {
             if (idle)
-                LOG("input %d: %s, sending", in->n, conns ? "receiver connected" : "shown on this device");
+                LOG("input %d: %s, sending", in->n, sending ? "receiver connected" : "shown on this device");
             idle = false;
             struct worker *wk = &pl.w[seq % pl.nw];
             pthread_mutex_lock(&pl.mu);
@@ -1607,7 +1961,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
                 memcpy(wk->src, cap[b.index].start, wk->len);
             xioctl(fd, VIDIOC_QBUF, &b);
             wk->time = capture_time(&b.timestamp);
-            wk->ndi = conns > 0;
+            wk->ndi = sending;
             wk->local = local;
             pthread_mutex_lock(&pl.mu);
             wk->seq = seq++;
@@ -1627,7 +1981,12 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             double secs = (now - t0) / 1000.0;
             if (conns)
                 ndi->send_get_tally(send, &tally, 0); /* a switcher (vMix, TriCaster...) has it on program/preview */
-            if (in->hx && ndi_eval_over)
+            if (rtp_why)
+                snprintf(st, sizeof st, "%s%s", rtp_why, local ? " (shown on this device)" : "");
+            else if (pl.rtp)
+                snprintf(st, sizeof st, "sending H.264 RTP to %s (%.0f fps)%s", in->rtp_dest, sent / secs,
+                         local ? ", also shown on this device" : "");
+            else if (in->hx && ndi_eval_over)
                 snprintf(st, sizeof st, "NDI|HX video stopped: 30-minute limit of the NDI Advanced SDK evaluation "
                                         "(sound goes on)");
             else if (conns)
@@ -1648,10 +2007,13 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         }
         if (now - t_log >= 60000) {
             double secs = (now - t_log) / 1000.0;
-            LOG("input %d: last %.0f s: camera %.1f fps, decoded %.1f fps, NDI %.1f fps, %d damaged frame%s skipped",
-                in->n, secs, log_cam / secs, log_sent / secs, log_ndi / secs, log_damaged,
+            LOG("input %d: last %.0f s: camera %.1f fps, decoded %.1f fps, %s %.1f fps, %d damaged frame%s skipped",
+                in->n, secs, log_cam / secs, log_sent / secs, pl.rtp ? "RTP" : "NDI", log_ndi / secs, log_damaged,
                 log_damaged == 1 ? "" : "s");
-            if (pl.hx) {
+            if (pl.rtp) {
+                LOG("input %d: H.264 RTP: %d keyframes", in->n, pl.enc.keys);
+                pl.enc.keys = 0;
+            } else if (pl.hx) {
                 LOG("input %d: NDI|HX: %d keyframes, %d forced for new receivers", in->n, pl.enc.keys, pl.enc.forced);
                 pl.enc.keys = pl.enc.forced = 0;
             }
@@ -1775,7 +2137,7 @@ static void levels_append(struct input *in, int peak, double rms)
     fclose(f);
 }
 
-/* Hand n frames to this device's own display and to NDI. */
+/* Hand n frames to this device's own display and to NDI (or RTP). */
 static void audio_out(struct input *in, const int16_t *s, int n)
 {
     struct local_feed *lf = in->lf;
@@ -1787,6 +2149,11 @@ static void audio_out(struct input *in, const int16_t *s, int n)
             lf->audio[at + 1] = s[i * 2 + 1];
         }
         STORE(lf->audio_wr, wr + (uint64_t)n);
+    }
+    if (in->rtp) {
+        if (in->r.fd >= 0)
+            rtp_send_audio(&in->r, s, n);
+        return;
     }
     /* Nobody listening: drop, as for the video. */
     if (!ndi->send_get_no_connections(in->send, 0))
@@ -1999,12 +2366,15 @@ static void *audio_thread(void *arg)
 static void *input_thread(void *arg)
 {
     struct input *in = arg;
-    NDIlib_send_instance_t send = in->send; /* made by main, in input order */
-    if (!send) {
+    NDIlib_send_instance_t send = in->send; /* made by main, in input order (none for RTP) */
+    if (!send && !in->rtp) {
         LOG("input %d: cannot create NDI sender \"%s\"", in->n, in->name);
         status(in, "cannot create NDI sender", NULL, 0, 0, 0);
         return NULL;
     }
+    in->r.fd = -1;
+    if (in->rtp) /* before the audio thread, which sends on it too */
+        rtp_open(&in->r, in->n, in->rtp_dest, in->name, in->audio_on, 0);
     bool athr = in->audio_on && !pthread_create(&in->athr, NULL, audio_thread, in);
     if (!in->audio_on)
         set_audio_status(in, "off");
@@ -2019,7 +2389,9 @@ static void *input_thread(void *arg)
     free(in->black);
     if (athr)
         pthread_join(in->athr, NULL);
-    ndi->send_destroy(send);
+    rtp_close(&in->r);
+    if (send)
+        ndi->send_destroy(send);
     return NULL;
 }
 
@@ -2084,6 +2456,8 @@ int main(void)
         char path[64];
         snprintf(path, sizeof path, RUN_DIR "/in%d.status", n);
         unlink(path);
+        snprintf(path, sizeof path, RUN_DIR "/in%d.sdp", n);
+        unlink(path);
         if (strcmp(icfg(n, "ENABLED", "0"), "1") || !*icfg(n, "DEVICE", ""))
             continue;
         struct input *in = &ins[nin++];
@@ -2099,7 +2473,15 @@ int main(void)
         snprintf(in->mode_s, sizeof in->mode_s, "%s", icfg(n, "MODE", ""));
         in->audio_on = strcasecmp(icfg(n, "AUDIO", "auto"), "off") != 0;
         in->audio_sync = strcasecmp(icfg(n, "AUDIO_SYNC", "on"), "off") != 0;
-        in->hx = !strcasecmp(icfg(n, "CODEC", "speedhq"), "hx");
+        const char *codec = icfg(n, "CODEC", "speedhq");
+        in->hx = !strcasecmp(codec, "hx");
+        in->rtp = !strcasecmp(codec, "rtp");
+        snprintf(in->rtp_dest, sizeof in->rtp_dest, "%s", icfg(n, "RTP_DEST", ""));
+        in->rtp_kbps = atoi(icfg(n, "RTP_KBPS", "0"));
+        if (in->rtp_kbps < 0)
+            in->rtp_kbps = 0;
+        if (in->rtp_kbps > 25000) /* the encoder's limit */
+            in->rtp_kbps = 25000;
         in->video_range = !strcasecmp(icfg(n, "RANGE", "full"), "video");
         pthread_mutex_init(&in->lock, NULL);
     }
@@ -2107,6 +2489,9 @@ int main(void)
         LOG("no outgoing streams configured");
         return 0;
     }
+    bool need_ndi = false;
+    for (int i = 0; i < nin; i++)
+        need_ndi |= !ins[i].rtp;
 
     /* The NDI Advanced SDK's library is libndi_advanced.so.6 (its soname). */
     void *lib = dlopen(NDILIB_LIBRARY_NAME, RTLD_NOW | RTLD_LOCAL);
@@ -2114,27 +2499,33 @@ int main(void)
         lib = dlopen("libndi_advanced.so.6", RTLD_NOW | RTLD_LOCAL);
     const NDIlib_v6 *(*load)(void) = lib ? (const NDIlib_v6 *(*)(void))dlsym(lib, "NDIlib_v6_load") : NULL;
     ndi = load ? load() : NULL;
-    if (!ndi || !ndi->initialize()) {
+    if (ndi && !ndi->initialize())
+        ndi = NULL;
+    if (!ndi && need_ndi) {
         LOG("cannot load/initialise NDI");
         return 1;
     }
-    ndi_target_bit_rate = (int (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
+    if (!ndi)
+        LOG("NDI not available: sending H.264 RTP only");
+    ndi_target_bit_rate = !lib ? NULL : (int (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
         lib, "NDIlib_send_get_target_bit_rate");
-    ndi_keyframe_required = (bool (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
+    ndi_keyframe_required = !lib ? NULL : (bool (*)(NDIlib_send_instance_t, const NDIlib_video_frame_v2_t *))dlsym(
         lib, "NDIlib_send_is_keyframe_required");
     hwenc_find();
     /* The senders are made one after another in input order, not by the input threads as they start:
      * each takes the next free port, so input 1 gets the lower port every time (receivers that remember
-     * a stream's address are less likely to find another input there after a restart). */
+     * a stream's address are less likely to find another input there after a restart). RTP inputs have
+     * none. */
     for (int i = 0; i < nin; i++) {
         NDIlib_send_create_t sc = { .p_ndi_name = ins[i].name, .p_groups = NULL, .clock_video = false,
                                     .clock_audio = false };
-        ins[i].send = ndi->send_create(&sc);
+        ins[i].send = ins[i].rtp ? NULL : ndi->send_create(&sc);
     }
     for (int i = 0; i < nin; i++)
         pthread_create(&ins[i].thr, NULL, input_thread, &ins[i]);
     for (int i = 0; i < nin; i++)
         pthread_join(ins[i].thr, NULL);
-    ndi->destroy();
+    if (ndi)
+        ndi->destroy();
     return 0;
 }
