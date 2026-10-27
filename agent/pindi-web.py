@@ -2270,14 +2270,12 @@ def dashboard(session):
                  'Neither is found by NDI discovery: see the address below.')
         if not srt_ok:
             hint += (' <strong>SRT needs libsrt: run install.sh on this device with internet access.</strong>')
-        sdp = (' <a href="/in%d.sdp">Download the SDP file</a> for VLC, ffmpeg or OBS.' % i["slot"]
-               if i.get("sdp") else "")
         return ('<div><label>Codec</label><select name="codec">%s</select><span class="hint block">%s</span></div>'
                 '<div class="rtp-only"><label>RTP destination</label><input type="text" name="rtp_dest" value="%s" '
                 'placeholder="e.g. 239.255.0.1:5004" maxlength="21"><span class="hint block">A multicast group '
                 '(239.x.x.x:port) that any number of receivers join, or one receiver&#39;s address. Another PiNDI '
                 'shows it with the stream <code>rtp://239.255.0.1:5004</code> (<code>rtp://:5004</code> when sent '
-                'to its own address). Audio goes to port + 2.%s</span></div>'
+                'to its own address). Audio goes to port + 2.</span></div>'
                 '<div class="srt-only"><label>SRT address</label><input type="text" name="srt_url" value="%s" '
                 'placeholder="srt://:9000" maxlength="255"><span class="hint block"><code>srt://:9000</code>: '
                 'receivers call this device on port 9000 (up to 8; another PiNDI shows it with the stream '
@@ -2287,8 +2285,38 @@ def dashboard(session):
                 '<div class="h264-only"><label>Bit rate (kbit/s)</label><input type="number" name="kbps" '
                 'min="500" max="25000" step="100" value="%s" placeholder="Automatic"><span class="hint block">'
                 'Automatic: about 6 Mbit/s at 1080p30.</span></div>' %
-                (options(choices, codec), hint, esc(i.get("rtp_dest", "")), sdp, esc(i.get("srt_url", "")),
+                (options(choices, codec), hint, esc(i.get("rtp_dest", "")), esc(i.get("srt_url", "")),
                  esc(my_ip) if my_ip else "&lt;this device&gt;", esc(i.get("kbps", ""))))
+
+    def watch_line(i):
+        """Where receivers find an RTP or SRT input (NDI ones are found by name): the address to open."""
+        if not (i["enabled"] and i["slot"]) or i.get("codec") not in ("rtp", "srt"):
+            return ""
+        links = []
+        if i["codec"] == "rtp":
+            m = re.match(r"^(\d+)\.[\d.]+:(\d+)$", i.get("rtp_dest", ""))
+            if i.get("sdp"):
+                links.append('<a href="/in%d.sdp">SDP file</a> for VLC, ffmpeg or OBS' % i["slot"])
+            if m:
+                multicast = 224 <= int(m.group(1)) <= 239
+                url = "rtp://%s" % i["rtp_dest"] if multicast else "rtp://:%s" % m.group(2)
+                links.append("another PiNDI: <code>%s</code>%s" % (
+                    esc(url), "" if multicast else " on %s" % esc(i["rtp_dest"].rsplit(":", 1)[0])))
+        else:
+            try:
+                u = srt_url(i.get("srt_url", ""))
+            except ValueError:
+                u = None
+            if not u or not u["listen"]:
+                return ""  # it calls the receiver, which listens: nothing to open
+            url = "srt://%s:%d" % (my_ip, u["port"]) if my_ip else ""
+            if url and u["streamid"]:
+                url += "?streamid=" + urllib.parse.quote(u["streamid"], safe="")
+            links.append("%s in VLC, ffmpeg, OBS or another PiNDI%s" % (
+                '<a href="%s">%s</a>' % (esc(url), esc(url)) if url else
+                "<code>srt://&lt;this device&gt;:%d</code>" % u["port"],
+                " (encrypted: give the receiver the passphrase)" if u["passphrase"] else ""))
+        return "<p>Watch it: %s</p>" % " &middot; ".join(links) if links else ""
 
     cards = []
     for i in ins:
@@ -2332,7 +2360,7 @@ def dashboard(session):
                  options(AUDIO_SYNCS, i["audio_sync"]), options(RANGES, i["range"])))
         cards.append(
             '<div class="sub"><h3>%s <span class="badge%s">%s</span></h3>'
-            '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>'
+            '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>%s'
             '<form method="post" action="/outgoing">%s<input type="hidden" name="device" value="%s">'
             '<input type="hidden" name="slot" value="%d">'
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input</label>'
@@ -2341,7 +2369,7 @@ def dashboard(session):
             '<button>Save</button> %s</form></div>' %
             (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
              esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
-             esc(state), live, hidden,
+             esc(state), live, watch_line(i), hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
              fields, remove))
     body = "".join(cards) if cards else (
