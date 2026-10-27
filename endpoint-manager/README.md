@@ -11,7 +11,7 @@ A web GUI for many PiNDI devices ([agent/](../agent/)) at once:
 - **Admin:** find Raspberry Pis on the network and install PiNDI on them; select devices, then identify,
   restart video, reboot, shut down (agent 1.4.0 or newer; a Pi that is shut down stays off until its power is
   cycled), install a software update or remove them; trust a device's new certificate; change
-  the manager's password.
+  the manager's password; get agent releases and manager updates from GitHub (or a fork).
 
 Python 3.8 or newer. Everything uses the standard library except installing PiNDI on new Pis over SSH, which
 needs `paramiko` (`python -m pip install -r requirements.txt`). It runs on Windows, macOS, Linux or a spare
@@ -81,6 +81,25 @@ minutes). Agents 1.3.0 and newer take the package through the API, and the **Sof
 **log** link show the progress. Older agents take it through their web interface, using the device login next
 to the button, so you can bring them all to 1.3.0 from here.
 
+## Updates from GitHub
+
+**Admin → Updates from GitHub** gets updates from the repository, with no files to download yourself:
+
+- **Check for updates** shows the newest agent release (an `agent-v*` release with a `pindi-update-*.tar.gz`
+  package), how many devices run an older version, and whether the repository's branch has newer manager code.
+- **Install … on selected** downloads that release's package and installs it on the selected devices, as
+  above. The download is checked against the SHA-256 GitHub gives for it, and each device checks its signature.
+- **Update the manager** updates this manager, and the `agent/` folder it installs new Pis from:
+  `git pull --ff-only` from the repository's branch when the manager runs from a git checkout (which must be on
+  that branch), otherwise it downloads the branch from GitHub over the folder. The manager then restarts with the
+  same options; everyone signed in has to sign in again.
+
+The repository defaults to the checkout's own `origin` on GitHub, else
+`https://github.com/OpenCraft-Solutions/PiNDI`, on the branch `main`. Using a fork, enter its address and
+branch under the same card. Devices only install packages signed with the key they were installed with, so a
+fork's releases suit devices installed from that fork (see `agent/make-update.sh`). GitHub answers 60
+requests an hour from one address without signing in, which is plenty for a check now and then.
+
 ## What is saved
 
 Everything the manager saves is in its data folder, outside the repository so it is never committed:
@@ -90,6 +109,7 @@ Everything the manager saves is in its data folder, outside the repository so it
 | `devices.json` | Device addresses, names, certificate fingerprints, API tokens | Tokens encrypted with your Windows account's key (DPAPI): unreadable to other accounts and on other computers |
 | `auth.json` | The manager's password, as a salted PBKDF2-SHA256 hash (300 000 rounds) | Can't be turned back into the password |
 | `known_hosts` | SSH host keys of the Pis PiNDI was installed on | Not secret; it detects an impostor |
+| `settings.json` | The GitHub repository and branch updates come from, if changed | Not secret |
 
 The folder is restricted to your user account (on Windows also SYSTEM and Administrators, as for Windows
 OpenSSH's keys; on Linux and macOS mode `700`). On Linux and macOS there is no DPAPI, so the folder's
