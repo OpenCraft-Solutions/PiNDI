@@ -3,12 +3,12 @@
 PiNDI turns a Raspberry Pi into an NDI display decoder and encoder:
 
 - **Decoder:** each HDMI output shows an NDI stream full screen, with sound on
-  HDMI or the headphone jack. It can show an [H.264 RTP](#h264-rtp) stream
-  instead.
+  HDMI or the headphone jack. It can show an [H.264 RTP](#h264-rtp) or
+  [SRT](#srt) stream instead.
 - **Encoder:** USB HDMI capture devices (and webcams) are sent out as NDI
   streams, with their audio, and so are HDMI-to-CSI-2 bridges (TC358743) on a
-  camera connector. A Pi 3 or 4 can send them as H.264 RTP instead: free, low
-  delay and low bandwidth, without the NDI Advanced SDK.
+  camera connector. A Pi 3 or 4 can send them as H.264 RTP or SRT instead:
+  free, low delay and low bandwidth, without the NDI Advanced SDK.
 - **Web interface:** everything is set up from a browser, with a token HTTP API
   for control systems.
 
@@ -136,8 +136,8 @@ picture in 6.6 s on Wi-Fi alone.
 | Section | What you can do |
 | --- | --- |
 | Device | Live network traffic, CPU temperature and load, under-voltage and throttling warnings, NDI SDK version, software version, clock |
-| Output *n* | Live preview of the screen, state, latency, format and audio. Settings: stream (NDI, or H.264 RTP), source IP, backup stream, receive quality (full or low-bandwidth preview), display mode, rotation (0/180°), mirroring, display standby, audio output and delay. **Identify** shows "Output n" on that screen for 15 s. |
-| Outgoing streams | Each USB capture device: send on/off, stream name, capture mode, codec (Full NDI, NDI\|HX or H.264 RTP, with its destination and bit rate), audio on/off, audio timing |
+| Output *n* | Live preview of the screen, state, latency, format and audio. Settings: stream (NDI, H.264 RTP or SRT), source IP, backup stream, receive quality (full or low-bandwidth preview), display mode, rotation (0/180°), mirroring, display standby, audio output and delay. **Identify** shows "Output n" on that screen for 15 s. |
+| Outgoing streams | Each USB capture device: send on/off, stream name, capture mode, codec (Full NDI, NDI\|HX, H.264 RTP or SRT, with its address and bit rate), audio on/off, audio timing |
 | Device settings | Device name (NDI name and host name), NDI Discovery Server, NDI groups, NDI receive transport (TCP or UDP), large network buffers, NDI Advanced SDK licence (vendor name and ID), time zone, daily reboot, daily OS updates (off by default), splash options, HTTP API token |
 | Network | DHCP or static IP, NTP servers. A change undoes itself after 2 minutes unless you press **Keep** at the new address. |
 | Wi-Fi | Off by default: the Wi-Fi hardware is switched off in `config.txt`, so the device starts faster. On: one network (name, password, country), address from DHCP, wired stays the preferred route. Switching it on the first time needs a reboot. Nearby networks are offered in the name field. |
@@ -311,6 +311,61 @@ Good to know:
   multicast goes at the slowest rate: send to the receiver's address instead.
 - **Backup streams** are for NDI only.
 
+## SRT
+
+SRT (Secure Reliable Transport) carries the same hardware H.264, with the
+audio, as an MPEG transport stream, and sends lost packets again within a
+latency you choose (120 ms by default). So it also works over Wi-Fi, between
+networks and over the internet, and it can be encrypted (AES, with a
+passphrase). Like RTP it needs no NDI licence. VLC, ffmpeg, OBS, vMix and
+hardware decoders and encoders all speak it. It needs libsrt, which
+`install.sh` installs on every board. (A device updated with an update package
+keeps the packages it has: run `install.sh` once.)
+
+One end listens and the other calls it. Either end can do either.
+
+**Sending** (Configure Outgoing Streams, Codec **H.264 SRT**; a Pi 3 or 4):
+enter the SRT address.
+
+- `srt://:9000`: receivers call this device on port 9000, up to 8 at a time.
+  Another PiNDI shows it with the stream `srt://<this device>:9000`; VLC opens
+  the same address (Media → Open Network Stream). The endpoint manager's
+  matrix lists these inputs.
+- `srt://192.168.1.60:9000`: this device calls that receiver, and calls again
+  whenever the connection drops.
+- Add `?passphrase=<10 to 79 characters>` to encrypt (both ends need the same
+  one), and `&latency=<ms>` for a slow or far network. The larger of the two
+  ends' latencies is used. `streamid=` is passed on when calling.
+- The audio is 48 kHz stereo PCM (SMPTE 302M, about 2 Mbit/s), so it isn't
+  compressed, as over NDI. The bit rate is shared with RTP: automatic, or in
+  kbit/s.
+- The encoder runs only while a receiver is connected, and a receiver that
+  connects gets a keyframe at once.
+
+**Showing it on a PiNDI:** set the output's stream to
+`srt://<sender>:<port>` to call the sender, or to `srt://:<port>` to wait for
+it to call this device. Add `?passphrase=...` and `&latency=...` as above.
+With `srt://:<port>`, **Source IP** accepts that sender only.
+
+- It decodes as RTP does: in hardware on a Pi 3 or 4, with libavcodec on a
+  Pi 5. A PiNDI sender's timestamps give the latency figure.
+- Other senders work too (OBS, ffmpeg, vMix, hardware encoders): H.264 without
+  B-frames. Their audio plays if it is SMPTE 302M, or AAC where libavcodec is
+  installed (a Pi 5, or with the NDI Advanced SDK). HEVC isn't decoded.
+- A picture whose packets didn't all arrive within the latency isn't shown,
+  and the output waits for the next keyframe (from PiNDI: at most a second).
+
+Good to know:
+
+- **Passphrases** are kept in `/etc/default/pindi`. Device status, the API
+  and the logs show `(encrypted)` instead. In an SRT address, write spaces,
+  dollar signs, quotes, backslashes and backticks %-encoded: `%20`, `%24`,
+  `%22` and `%27`, `%5C`, `%60`.
+- **Firewalls:** the listening end needs its UDP port reachable. Behind a NAT
+  router, forward it, or let the device behind the NAT call.
+- As for RTP, there is **no discovery and no tally**, and **backup streams**
+  are for NDI only.
+
 ## HTTP API
 
 The token is under **Device settings → HTTP API**. Send it as
@@ -434,7 +489,9 @@ logs** in the web interface.
   5353 (mDNS) and the NDI ports (5960 and up). An output showing an H.264 RTP
   stream also listens on its UDP port and the next three; anyone who can send
   to them can put a picture on that screen, so use **Source IP** or a multicast
-  group on a network you trust. LLMNR is switched off. SSH
+  group on a network you trust. An SRT output or input that listens (`srt://:port`)
+  listens on that UDP port: use a passphrase, and **Source IP** on an output.
+  LLMNR is switched off. SSH
   accepts the Pi user's password. Use a strong password, or SSH keys with
   `PasswordAuthentication no`, and keep the devices on a network you trust.
 - **Diagnostics** leave out the NDI licence. Settings backups include it, so
@@ -494,5 +551,11 @@ logs** in the web interface.
   sender's address or empty. Multicast doesn't cross routers or VLANs unless
   they are set up for it; try sending to the receiver's address. "cannot
   decode H.264 here" on a Pi 5: libavcodec is missing, run `install.sh` once.
+- **An SRT stream shows nothing:** the output's status says why. "cannot
+  connect: wrong or missing passphrase": the passphrases differ.
+  "cannot connect: ..." with another reason: the sender isn't listening there,
+  or a firewall blocks the UDP port. "cannot receive SRT: libsrt is not
+  installed": run `install.sh` once. "cannot decode HEVC (H.265) here": set
+  the sender to H.264.
 - **Sending a problem report:** **Download diagnostics** collects the version,
   settings, status and logs in one file.
