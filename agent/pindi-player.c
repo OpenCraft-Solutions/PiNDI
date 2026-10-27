@@ -2394,8 +2394,8 @@ static void status_set(struct output *o, const char *state, const char *source, 
         snprintf(msg, sizeof msg, "%s: %s is too big for this device - use the low-bandwidth preview", source,
                  video);
     else if (!strcmp(state, "searching") || !strncmp(state, "playing", 7))
-        snprintf(msg, sizeof msg, "Waiting for %s stream %s%s", strncasecmp(o->target, "rtp://", 6) ? "NDI" : "H.264 RTP",
-                 o->target, from);
+        snprintf(msg, sizeof msg, "Waiting for %s stream %s%s",
+                 strncasecmp(o->target, "rtp://", 6) ? "NDI" : "H.264 RTP", o->target, from);
     else if (!strncmp(state, "cannot", 6))
         snprintf(msg, sizeof msg, "%s: %s", o->target, state);
     else
@@ -2951,8 +2951,8 @@ static int local_play(struct output *o, const char *path, uint64_t *switch_seen,
                 LOCAL_DATA + (size_t)ssz * LOCAL_SLOTS <= len) {
                 const uint8_t *base = map + LOCAL_DATA + (size_t)slot * ssz;
                 size_t ysz = (size_t)w * h, csz = is420 ? ysz / 4 : ysz / 2;
-                bool ok = post_planar(o, base, base + ysz, base + ysz + csz, w, w / 2, w, h, is420, lf->slot_time[slot],
-                                      clock_us(CLOCK_MONOTONIC));
+                bool ok = post_planar(o, base, base + ysz, base + ysz + csz, w, w / 2, w, h, is420,
+                                      lf->slot_time[slot], clock_us(CLOCK_MONOTONIC));
                 if (LOAD(lf->slot_seq[slot]) != s)
                     torn++; /* overwritten while copying (we fell 4 frames behind): a mixed picture */
                 char vid[64];
@@ -3199,7 +3199,10 @@ static bool rtp_header(const uint8_t *p, size_t n, size_t *off, size_t *len)
     return true;
 }
 
-static uint32_t get32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
 
 /* Pictures put together from RTP packets, as Annex B. */
 struct rtp_depack {
@@ -3466,7 +3469,12 @@ static bool sps_size(const uint8_t *nal, size_t len, int *w, int *h)
 
 /* FFmpeg's libavcodec, loaded at run time as the NDI Advanced SDK does (no build dependency): only the
  * calls below, and the first fields of AVFrame and AVPacket, which have kept their places since FFmpeg 1. */
-struct av_frame_head { uint8_t *data[8]; int linesize[8]; uint8_t **extended_data; int width, height, nb_samples, format; };
+struct av_frame_head {
+    uint8_t *data[8];
+    int linesize[8];
+    uint8_t **extended_data;
+    int width, height, nb_samples, format;
+};
 struct av_packet_head { void *buf; int64_t pts, dts; uint8_t *data; int size; };
 enum { AV_CODEC_H264 = 27, AV_YUV420P = 0, AV_YUV422P = 4, AV_YUVJ420P = 12, AV_YUVJ422P = 13 };
 
@@ -3749,12 +3757,14 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             last_open = now;
             r.vfd = rtp_socket(group, port);
             if (r.vfd < 0) {
+                /* No route for the group yet: the network isn't up (boot). Anything else: the port is taken. */
+                bool no_net = errno == ENODEV || errno == ENETUNREACH || errno == EADDRNOTAVAIL;
                 if (!warned)
                     LOG("rtp: output %d: cannot receive on port %d: %s (trying again)", o->n, port, strerror(errno));
                 warned = true;
                 char st[64];
                 snprintf(st, sizeof st, "cannot receive on port %d", port);
-                status_set(o, st, src, "", "");
+                status_set(o, no_net ? "waiting for network" : st, no_net ? "" : src, "", "");
                 usleep(100000);
                 continue;
             }
