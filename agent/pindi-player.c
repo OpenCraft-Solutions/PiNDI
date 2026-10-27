@@ -612,7 +612,9 @@ struct output {
     struct output *leader;  /* following this output's receiver, NULL = none */
     char share_src[256];    /* leader: the source its receiver is connected to, "" = not leading */
     char share_url[128], share_video[64];
+    char share_ip[64];      /* leader: the source IP it accepts (RTP, SRT), "" = any */
     int share_bw;
+    bool share_lost;        /* leader: no picture now (RTP, SRT: it waits on); followers show their splash */
     bool share_flush;       /* the owner reallocates its buffers: get its buffers off screen */
     int vuse[NBUF];
     int ext_ready, ext_ready2, ext_queued, ext_scanout;
@@ -751,27 +753,39 @@ static void share_leave(struct output *o)
     pthread_mutex_unlock(&share_mu);
 }
 
-/* Receiver thread: about to connect to source name: the output already receiving it (then follow
- * it), or NULL after claiming the source for o (then connect). */
-static struct output *share_claim(struct output *o, const char *name, const char *url, int bw)
+/* Receiver thread: about to connect to source name (accepted from ip only, "" = any): the output already
+ * receiving it (then follow it), or NULL after claiming the source for o (then connect). */
+static struct output *share_claim(struct output *o, const char *name, const char *url, const char *ip, int bw)
 {
     struct output *L = NULL;
     pthread_mutex_lock(&share_mu);
     share_drop_followers(o); /* they followed what o received before */
     for (int i = 0; i < nout && !L; i++)
         if (&outs[i] != o && outs[i].share_bw == bw && !strcmp(outs[i].share_src, name) &&
-            outs[i].has_uyvy == o->has_uyvy && outs[i].has_nv16 == o->has_nv16 && outs[i].has_nv12 == o->has_nv12)
+            !strcmp(outs[i].share_ip, ip) && outs[i].has_uyvy == o->has_uyvy && outs[i].has_nv16 == o->has_nv16 &&
+            outs[i].has_nv12 == o->has_nv12)
             L = &outs[i];
     if (L) {
         o->leader = L;
     } else {
         snprintf(o->share_src, sizeof o->share_src, "%s", name);
         snprintf(o->share_url, sizeof o->share_url, "%s", url);
+        snprintf(o->share_ip, sizeof o->share_ip, "%s", ip);
         o->share_video[0] = 0;
         o->share_bw = bw;
+        o->share_lost = false;
     }
     pthread_mutex_unlock(&share_mu);
     return L;
+}
+
+/* Receiver thread, RTP or SRT (it waits on for a stream that stops): o has no picture now. Outputs following
+ * it show their splash until it has again. */
+static void share_set_lost(struct output *o, bool lost)
+{
+    pthread_mutex_lock(&share_mu);
+    o->share_lost = lost;
+    pthread_mutex_unlock(&share_mu);
 }
 
 /* Main thread: o's buffers go away (display off, reallocation): forget them wherever they are shown,
@@ -3735,7 +3749,8 @@ static int64_t rtp_sent(const struct h264_rx *r, uint32_t ts)
 }
 
 /* Audio packets waiting on afd, played as one frame. */
-static void rtp_audio(struct output *o, struct h264_rx *r, float *abuf, size_t cap)
+/* (Received whether or not this output plays it, play: outputs following it may.) */
+static void rtp_audio(struct output *o, struct h264_rx *r, float *abuf, size_t cap, bool play)
 {
     uint8_t pkt[2048];
     size_t got = 0;
@@ -3779,7 +3794,8 @@ static void rtp_audio(struct output *o, struct h264_rx *r, float *abuf, size_t c
         .FourCC = NDIlib_FourCC_audio_type_FLTP, .p_data = (uint8_t *)abuf,
         .channel_stride_in_bytes = (int)(cap * sizeof(float)),
     };
-    audio_play(o, &a);
+    if (play)
+        audio_play(o, &a);
     share_audio(o, &a);
 }
 
@@ -3808,6 +3824,7 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
     int ret = 0;
     LOG("rtp: output %d: receiving %s", o->n, src);
     status_set(o, "searching", "", "", "");
+    share_set_lost(o, true); /* until the first picture */
     while (running && r.dp.buf && abuf && pkt) {
         uint64_t now = now_ms();
         pthread_mutex_lock(&o->lock);
@@ -3855,7 +3872,7 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
             }
             warned = false;
             r.cfd = rtp_socket(group, port + 1);
-            r.afd = audio_on ? rtp_socket(group, port + 2) : -1;
+            r.afd = rtp_socket(group, port + 2); /* also without audio here: outputs following this one may play it */
         }
 
         struct pollfd pf[3] = { { .fd = r.vfd, .events = POLLIN }, { .fd = r.cfd, .events = POLLIN },
@@ -3888,8 +3905,10 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
                                  recv_us, &shown)) {
                     pictures++;
                     fps_pictures++;
-                    if (!got)
+                    if (!got) {
                         LOG("rtp: output %d: first picture after %llu ms", o->n, (unsigned long long)(now - start));
+                        share_set_lost(o, false);
+                    }
                     got = true;
                     splash_at = 0;
                     status_set(o, shown ? "playing" : "cannot display (format)", src, from_s, vid);
@@ -3913,7 +3932,7 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
                     rtp_rtcp(&r, pkt, (size_t)n);
             }
         if (r.afd >= 0 && (pf[2].revents & POLLIN))
-            rtp_audio(o, &r, abuf, ACAP);
+            rtp_audio(o, &r, abuf, ACAP, audio_on);
         if (audio_on && got && o->au.last_frame + 3000 < now && now - start > 3000 && o->au.pcm) {
             audio_close(o);
             audio_info(o, "no audio in this stream");
@@ -3930,6 +3949,7 @@ static int rtp_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
         }
         if (got && now - last_video > RTP_LOST_MS) {
             LOG("rtp: output %d: lost %s", o->n, src);
+            share_set_lost(o, true);
             got = false;
             r.dp.resync = true;
             r.hw.need_key = true;
@@ -4567,7 +4587,7 @@ static void srt_audio(struct srt_rx *x)
         frames = s302m_decode(t->abuf, t->alen, x->abuf, SRT_ACAP, &ch);
     } else if (t->audio_type == TA_AAC && adec_open(&x->aac)) {
         frames = adec_decode(&x->aac, t->abuf, t->alen, x->abuf, SRT_ACAP, &ch, &rate);
-    } else if (!x->audio_said) {
+    } else if (!x->audio_said && x->audio_on) {
         x->audio_said = true;
         LOG("srt: output %d: %s audio cannot be played here%s", o->n,
             t->audio_type == TA_AAC ? "AAC" : *t->audio_name ? t->audio_name : "this",
@@ -4586,7 +4606,8 @@ static void srt_audio(struct srt_rx *x)
         .FourCC = NDIlib_FourCC_audio_type_FLTP, .p_data = (uint8_t *)x->abuf,
         .channel_stride_in_bytes = (int)(SRT_ACAP * sizeof(float)),
     };
-    audio_play(o, &a);
+    if (x->audio_on)
+        audio_play(o, &a);
     share_audio(o, &a);
 }
 
@@ -4597,8 +4618,7 @@ static void srt_ts(struct srt_rx *x, const uint8_t *p, uint64_t recv_us, uint64_
     int res;
     while ((res = ts_packet(&x->t, &x->r.dp, p)) != TS_NONE) {
         if (res == TS_AUDIO || res == TS_AUDIO_AGAIN) {
-            if (x->audio_on)
-                srt_audio(x);
+            srt_audio(x); /* also without audio here: outputs following this one may play it */
         } else {
             x->last_video = now;
             int64_t sent = x->t.pindi && x->t.done_pts >= 0 ? ts_utc(x->t.done_pts) : INT64_MAX;
@@ -4607,9 +4627,11 @@ static void srt_ts(struct srt_rx *x, const uint8_t *p, uint64_t recv_us, uint64_
                              &shown)) {
                 x->pictures++;
                 x->fps_pictures++;
-                if (!x->got)
+                if (!x->got) {
                     LOG("srt: output %d: first picture after %llu ms%s%s", o->n,
                         (unsigned long long)(now - x->start), *x->t.service ? ", from " : "", x->t.service);
+                    share_set_lost(o, false);
+                }
                 x->got = true;
                 x->splash_at = 0;
                 status_set(o, shown ? "playing" : "cannot display (format)", x->src, x->from, x->vid);
@@ -4704,6 +4726,7 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
     struct srt_stats_head prev = { 0 };
     LOG("srt: output %d: %s %s", o->n, u.listen ? "listening at" : "calling", src);
     status_set(o, "searching", "", "", "");
+    share_set_lost(o, true); /* until the first picture */
     while (running && x && msg && x->r.dp.buf && x->t.abuf && x->abuf && eid >= 0) {
         uint64_t now = now_ms();
         pthread_mutex_lock(&o->lock);
@@ -4887,6 +4910,7 @@ static int srt_play(struct output *o, uint64_t *switch_seen, NDIlib_find_instanc
         }
         if (x->got && now - x->last_video > RTP_LOST_MS) {
             LOG("srt: output %d: lost %s", o->n, src);
+            share_set_lost(o, true);
             x->got = false;
             x->r.dp.resync = true;
             x->r.hw.need_key = true;
@@ -5031,6 +5055,7 @@ static void *receiver(void *arg)
     uint64_t drop_check = 0;  /* when the dropped-frame count was last looked at (0: not yet) */
     int64_t drops_seen = 0;   /* the receiver's dropped video frames then */
     bool following = false; /* showing another output's receiver (decode once) */
+    bool follow_lost = false; /* following: the leader has no picture (its share_lost), the splash is up */
     uint64_t codec_copy_at = 0;
     char codec_copied[512] = ""; /* the leader's out<n>.codec as last copied to ours */
     int rtp_probe = -1; /* display in standby, RTP stream: a socket to notice its packets */
@@ -5047,17 +5072,20 @@ static void *receiver(void *arg)
         /* Following another output's receiver: its frames and audio come to this output by themselves.
          * Stop when it stops receiving, this display goes away or this output gets another stream. */
         if (following) {
-            char src[256] = "", url[128] = "", vid[64] = "";
+            char src[256] = "", url[128] = "", vid[64] = "", lead_src[256] = "";
             int lead_n = 0;
+            bool lost = false;
             pthread_mutex_lock(&share_mu);
             struct output *L = o->leader;
             if (L) {
                 lead_n = L->n;
-                snprintf(src, sizeof src, "%s", L->share_src);
+                snprintf(lead_src, sizeof lead_src, "%s", L->share_src);
                 snprintf(url, sizeof url, "%s", L->share_url);
                 snprintf(vid, sizeof vid, "%s", L->share_video);
+                lost = L->share_lost;
             }
             pthread_mutex_unlock(&share_mu);
+            stream_shown(lead_src, src, sizeof src); /* an SRT stream's passphrase isn't shown */
             pthread_mutex_lock(&o->lock);
             bool use = o->usable;
             pthread_mutex_unlock(&o->lock);
@@ -5067,7 +5095,14 @@ static void *receiver(void *arg)
                 sw = switch_poll(o, &switch_seen);
             }
             if (L && use && !sw) {
-                status_set(o, on_backup ? "playing (backup)" : "playing", src, url, vid);
+                /* An RTP or SRT leader waits on when its stream stops: the splash here too until it is back. */
+                if (lost && !follow_lost)
+                    request_splash(o);
+                follow_lost = lost;
+                if (lost)
+                    status_set(o, "searching", "", "", "");
+                else
+                    status_set(o, on_backup ? "playing (backup)" : "playing", src, url, vid);
                 if (now - codec_copy_at >= 1000) { /* the leader checks the codec: show its answer here too */
                     codec_copy_at = now;
                     char path[64], buf[512] = "";
@@ -5126,6 +5161,21 @@ static void *receiver(void *arg)
         pthread_mutex_lock(&o->lock);
         standby = !usable && o->standby;
         pthread_mutex_unlock(&o->lock);
+        /* A switch while the display sleeps: what is looked for from now on is the new stream. */
+        if (standby && now - switch_check >= 300) {
+            switch_check = now;
+            int sw = switch_poll(o, &switch_seen);
+            if (sw && rtp_probe >= 0) {
+                close(rtp_probe);
+                rtp_probe = -1;
+            }
+            if (sw == 2 && find) {
+                snprintf(extra_ips, sizeof extra_ips, "%s%s%s", extra, *o->source_ip && *extra ? "," : "",
+                         o->source_ip);
+                ndi->find_destroy(find);
+                find = NULL;
+            }
+        }
         uint32_t rtp_group;
         int rtp_port;
         bool rtp = rtp_url(o->target, &rtp_group, &rtp_port), srt_ = !strncasecmp(o->target, "srt://", 6);
@@ -5333,13 +5383,15 @@ static void *receiver(void *arg)
         }
 
         if (!recv && (rtp || srt_)) { /* H.264 over RTP or SRT, not NDI */
-            struct output *L = share_claim(o, o->target, "", -1);
+            /* Shared by outputs with the same stream (passphrase included) and source IP. */
+            char shown[sizeof o->target];
+            stream_shown(o->target, shown, sizeof shown);
+            struct output *L = share_claim(o, o->target, "", o->source_ip, -1);
             if (L) {
-                char shown[sizeof o->target];
-                stream_shown(o->target, shown, sizeof shown);
                 LOG("%s: output %d: %s is already received by output %d, showing it from there (decoded once)",
                     rtp ? "rtp" : "srt", o->n, shown, L->n);
                 following = true;
+                follow_lost = false;
                 on_backup = false;
                 search_since = 0;
                 splash_at = 0;
@@ -5428,11 +5480,12 @@ static void *receiver(void *arg)
             if (pick) {
                 /* Another output already receives it: show its frames instead of decoding it again. */
                 struct output *L = share_claim(o, pick->p_ndi_name, pick->p_url_address ? pick->p_url_address : "",
-                                               (int)bandwidth);
+                                               "", (int)bandwidth);
                 if (L) {
                     LOG("ndi: output %d: %s is already received by output %d, showing it from there (decoded once)",
                         o->n, pick->p_ndi_name, L->n);
                     following = true;
+                    follow_lost = false;
                     on_backup = backup;
                     search_since = 0;
                     splash_at = 0;
