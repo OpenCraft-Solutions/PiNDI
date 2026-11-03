@@ -191,9 +191,19 @@ source's timings and sets up the whole pipeline, again whenever the source
 changes mode or is plugged in. With **4 lanes** (both connectors of a Pi 5, CAM1
 of a Compute Module; the board and ribbon cable need all four) that is up to
 1080p60; with **2 lanes** (a Pi 3/4) up to 1080p30 and 720p60. A source that
-insists on more says so in the status. The bridge's sound is not wired to the
-Pi, so these inputs have no audio. Measured on a Pi 5: a 1080p60 PC desktop is
+insists on more says so in the status. Measured on a Pi 5: a 1080p60 PC desktop is
 sent at 60 fps using about one CPU core.
+
+**Bridge audio over I2S**: a bridge's sound reaches the Pi only through its
+audio header, wired to the GPIO header: SCK/BCK to GPIO 18 (pin 12), WS/LRCK to
+GPIO 19 (pin 35), SD/DATA to GPIO 20 (pin 38), and GND. Choose that bridge
+under **HDMI audio (I2S)** in Camera connectors (`PINDI_CSI_AUDIO`), restart,
+then set its input's **Audio** to "From the bridge (I2S)". PiNDI adds
+`dtoverlay=tc358743-audio` to `config.txt` (sound card `tc358743`). One bridge
+at a time: the Pi has one set of I2S pins, and the bridge drives their clock.
+The EDID offers the source 48 kHz stereo only, because the bridge's clock sets the rate;
+a source that sends 44.1 kHz anyway is named in the audio status. While the
+source sends no sound, the status says so.
 
 MJPEG from capture cards is decoded on two CPU cores (three with NDI|HX), so
 1080p60 cards deliver their full frame rate. An output showing one of the

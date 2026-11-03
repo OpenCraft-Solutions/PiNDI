@@ -1696,14 +1696,34 @@ def camera_connectors():
 
 
 def csi_overlays(env):
-    """config.txt lines for the HDMI bridges set up in env (PINDI_CSI_CAM0/1 = lanes). install.sh writes the
-    same lines when it rebuilds PiNDI's block."""
+    """config.txt lines for the HDMI bridges set up in env (PINDI_CSI_CAM0/1 = lanes), and the I2S sound card for
+    the one whose audio is wired to the Pi (PINDI_CSI_AUDIO). install.sh writes the same lines when it rebuilds
+    PiNDI's block."""
     out = []
     for cam in ("CAM0", "CAM1"):
         lanes = env.get("PINDI_CSI_" + cam, "")
         if lanes in ("2", "4"):
             out.append("dtoverlay=tc358743" + (",cam0" if cam == "CAM0" else "") + (",4lane" if lanes == "4" else ""))
+    if csi_audio(env):
+        out.append("dtoverlay=tc358743-audio")
     return out
+
+
+def csi_audio(env):
+    """The connector whose HDMI bridge's sound reaches the Pi over I2S (GPIO 18-20), "" if none. One at most: the
+    header has one set of I2S pins, and the bridge drives their clock."""
+    cam = env.get("PINDI_CSI_AUDIO", "")
+    return cam if cam in ("CAM0", "CAM1") and env.get("PINDI_CSI_" + cam, "") in ("2", "4") else ""
+
+
+def csi_audio_status(want):
+    """What the I2S sound card does now compared with the setting: (text, restart needed)."""
+    have = os.path.exists("/proc/asound/tc358743")
+    if want and have:
+        return ("I2S sound card ready: the bridge's input below has an Audio setting.", False)
+    if want:
+        return ("Restart the device to apply this.", True)
+    return ("The I2S sound card stays until the device restarts.", True) if have else ("", False)
 
 
 def set_csi_overlays(env):
@@ -2376,11 +2396,23 @@ def dashboard(session):
         k = "in%d." % slot
         remove = ('<button class="secondary" name="remove" value="1">Forget this device</button>'
                   if not i["present"] else "")
-        if i.get("csi"):  # the HDMI source sets the mode; the bridge's sound isn't wired to the Pi
+        if i.get("csi") and i["csi"] == csi_audio(read_env()):  # the HDMI source sets the mode; sound over I2S
             fields = ('<div><label>Picture</label><p class="hint">Whatever the HDMI source sends (shown in the '
                       'status). The source is offered only the modes this connector&#39;s CSI-2 lanes can carry: up '
-                      'to 1080p60 with 4 lanes, 1080p30 with 2. No sound: the bridge&#39;s audio is not connected to '
-                      'the Pi.</p><input type="hidden" name="audio" value="off"></div>%s' % codec_field(i))
+                      'to 1080p60 with 4 lanes, 1080p30 with 2.</p></div>%s'
+                      '<div><label>Audio</label><select name="audio">%s</select><span class="hint block">48 kHz '
+                      'stereo (the source is offered nothing else).</span></div>'
+                      '<div><label>Audio timing</label><select name="audio_sync">%s</select><span class="hint block">'
+                      'The bridge&#39;s audio clock is the HDMI source&#39;s, which runs a little fast or slow; '
+                      'receivers eventually catch up on that by dropping audio.</span></div>' %
+                      (codec_field(i), options([("auto", "From the bridge (I2S)"), ("off", "Off")],
+                                               i["audio_setting"]), options(AUDIO_SYNCS, i["audio_sync"])))
+        elif i.get("csi"):  # the bridge's sound isn't wired to the Pi
+            fields = ('<div><label>Picture</label><p class="hint">Whatever the HDMI source sends (shown in the '
+                      'status). The source is offered only the modes this connector&#39;s CSI-2 lanes can carry: up '
+                      'to 1080p60 with 4 lanes, 1080p30 with 2. No sound: wire the bridge&#39;s audio to the Pi and '
+                      'choose it under HDMI audio (I2S) above.</p><input type="hidden" name="audio" value="off">'
+                      '</div>%s' % codec_field(i))
         else:
             fields = (
                 '<div><label>Capture mode</label><select name="mode">%s</select></div>%s'
@@ -2421,6 +2453,15 @@ def dashboard(session):
             restart |= pending
             selects.append('<div><label>%s</label><select name="%s">%s</select>%s</div>' % (
                 esc(label), key.lower(), options([c for c in CSI_LANES if not c[0] or c[0] in lanes], want),
+                '<span class="hint block%s">%s</span>' % (" warn" if pending else "", esc(note)) if note else ""))
+        want = csi_audio(env)
+        note, pending = csi_audio_status(want)
+        restart |= pending
+        selects.append(
+            '<div><label>HDMI audio (I2S)</label><select name="audio">%s</select><span class="hint block">Wire the '
+            'bridge&#39;s audio header to the Pi: SCK/BCK to GPIO 18 (pin 12), WS/LRCK to GPIO 19 (pin 35), SD/DATA '
+            'to GPIO 20 (pin 38), GND to GND. One bridge only: the Pi has one set of I2S pins.</span>%s</div>' % (
+                options([("", "Off")] + [(key, "From the bridge on %s" % label) for key, label, _ in conns], want),
                 '<span class="hint block%s">%s</span>' % (" warn" if pending else "", esc(note)) if note else ""))
         body = (
             '<div class="sub"><h3>Camera connectors</h3><p class="hint">An HDMI-to-CSI-2 bridge on a camera '
@@ -2786,8 +2827,10 @@ def act_outgoing(form):
     else:
         name = form.get("name", "").strip()
         mode = form.get("mode", "")
-        if inp.get("csi"):  # an HDMI bridge: the source sets the mode, and it has no sound for the Pi
-            form = dict(form, audio="off", range="full", audio_sync="on")
+        if inp.get("csi"):  # an HDMI bridge: the source sets the mode; sound only over I2S
+            form = dict(form, range="full")
+            if inp["csi"] != csi_audio(read_env()):
+                form.update(audio="off", audio_sync="on")
             mode = ""
         if not valid_name(name) or len(name) > 100:
             return ("err", "Invalid NDI stream name.")
@@ -2870,11 +2913,19 @@ def act_csi(form):
         updates["PINDI_CSI_" + key] = v
     if not updates:
         return ("err", "This device has no camera connector.")
+    audio = form.get("audio", "")
+    if audio and not updates.get("PINDI_CSI_" + audio):
+        return ("err", "HDMI audio comes from a bridge: set one up on that connector first.")
+    updates["PINDI_CSI_AUDIO"] = audio
+    old = csi_audio(read_env())
     write_env(updates)
     changed = set_csi_overlays(read_env())
-    log("camera connectors: %s" % (", ".join(csi_overlays(read_env())) or "nothing"))
+    log("camera connectors: %s%s" % (", ".join(csi_overlays(read_env())) or "nothing",
+                                     ", audio from %s" % audio if audio else ""))
+    if audio != old:  # the sender takes the sound card for the input on that connector
+        later(0.5, run, "systemctl", "restart", "pindi-sender.service")
     return ("ok", "Camera connectors saved. Restart the device (Reboot now) to apply them." if changed else
-            "Camera connectors saved (nothing changed).")
+            "Camera connectors saved." if audio != old else "Camera connectors saved (nothing changed).")
 
 
 def act_network(form):

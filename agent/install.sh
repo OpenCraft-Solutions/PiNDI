@@ -451,9 +451,11 @@ WIFI="dtoverlay=disable-wifi"
 if [ -L /etc/systemd/system/sys-subsystem-net-devices-wlan0.device.wants/wpa_supplicant@wlan0.service ]; then
     WIFI="#dtoverlay=disable-wifi"
 fi
-# HDMI-to-CSI-2 bridges on the camera connectors (web UI "Camera connectors", which writes the same lines:
-# csi_overlays in pindi-web.py).
+# HDMI-to-CSI-2 bridges on the camera connectors, and the I2S sound card for the one whose audio is wired to the
+# Pi (web UI "Camera connectors", which writes the same lines: csi_overlays in pindi-web.py).
 CSI=""
+CSI_AUDIO=$(sed -n -E 's/^PINDI_CSI_AUDIO="?(CAM[01])"?$/\1/p' /etc/default/pindi 2>/dev/null | tail -n 1)
+AUDIO_LINE=""
 for cam in CAM0 CAM1; do
     lanes=$(sed -n -E "s/^PINDI_CSI_$cam=\"?([24])\"?\$/\1/p" /etc/default/pindi 2>/dev/null | tail -n 1)
     [ -n "$lanes" ] || continue
@@ -461,7 +463,9 @@ for cam in CAM0 CAM1; do
     [ "$cam" = CAM0 ] && line="$line,cam0"
     [ "$lanes" = 4 ] && line="$line,4lane"
     CSI="$CSI$line"$'\n'
+    [ "$cam" = "$CSI_AUDIO" ] && AUDIO_LINE="dtoverlay=tc358743-audio"$'\n'
 done
+CSI="$CSI$AUDIO_LINE"
 # Written next to it, flushed to the card, then renamed over it (as cmdline.txt below): never edited in place, so
 # a power cut leaves the old file or the new one, not a half-written or empty one. Put together on the root file
 # system first: what config.txt must read back as (its new verified copy, below) never comes from the card's copy.

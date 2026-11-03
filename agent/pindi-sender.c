@@ -8,7 +8,8 @@
  *                                              e.g. /dev/v4l/by-path/platform-1f00110000.csi-video-index0)
  *   PINDI_IN<n>_NAME=IN_<serial>               NDI stream name (default IN_<serial>[_n])
  *   PINDI_IN<n>_MODE="MJPG 1920x1080@30"       optional, else the best mode up to 1080p30
- *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default), or off
+ *   PINDI_IN<n>_AUDIO=auto                     the device's own USB audio (default; a CSI-2 bridge: its sound
+ *                                              over I2S when PINDI_CSI_AUDIO names its connector), or off
  *   PINDI_IN<n>_AUDIO_SYNC=off                 send the audio as the device's clock delivers it (default:
  *                                              kept in step with this Pi's clock)
  *   PINDI_IN<n>_CODEC=speedhq                  Full NDI (default), hx (NDI|HX), rtp (H.264 over RTP, no NDI)
@@ -333,7 +334,8 @@ static bool choose_mode(int fd, const char *want, struct mode *out)
  * link from the bridge to the receiver's video node (rp1-cfe on the Pi 5, unicam on the Pi 3/4).
  * Without a media controller (unicam's default) the video node itself takes the bridge's ioctls. */
 
-/* PiNDI's EDIDs (display "PiNDI", checked with edid-decode), with stereo LPCM audio. 4 lanes:
+/* PiNDI's EDIDs (display "PiNDI", checked with edid-decode), with stereo LPCM audio at 48 kHz only: over
+ * I2S the bridge's clock sets the rate, and the audio is captured as 48 kHz (44.1 would play too fast). 4 lanes:
  * 1080p60 (preferred), 1080p50/30/25/24, 720p60/50, SD. 2 lanes: 1080p30 (preferred), 1080p25/24,
  * 720p60/50, SD - nothing over 74.25 MHz, which needs a third lane. */
 static const uint8_t edid_4lane[256] = {
@@ -346,8 +348,8 @@ static const uint8_t edid_4lane[256] = {
     0x69, 0x4e, 0x44, 0x49, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x73,
     0x02, 0x03, 0x20, 0xc1, 0x4a, 0x10, 0x1f, 0x22, 0x21, 0x20, 0x04, 0x13, 0x01, 0x02, 0x11, 0x23,
-    0x09, 0x07, 0x07, 0x83, 0x01, 0x00, 0x00, 0x65, 0x03, 0x0c, 0x00, 0x10, 0x00, 0xe2, 0x00, 0x4a,
-    [255] = 0xa5,
+    0x09, 0x04, 0x07, 0x83, 0x01, 0x00, 0x00, 0x65, 0x03, 0x0c, 0x00, 0x10, 0x00, 0xe2, 0x00, 0x4a,
+    [255] = 0xa8,
 };
 static const uint8_t edid_2lane[256] = {
     0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x41, 0xc4, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -358,9 +360,9 @@ static const uint8_t edid_2lane[256] = {
     0x44, 0x08, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x50,
     0x69, 0x4e, 0x44, 0x49, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x10,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x26,
-    0x02, 0x03, 0x1e, 0xc1, 0x48, 0x22, 0x21, 0x20, 0x04, 0x13, 0x01, 0x02, 0x11, 0x23, 0x09, 0x07,
+    0x02, 0x03, 0x1e, 0xc1, 0x48, 0x22, 0x21, 0x20, 0x04, 0x13, 0x01, 0x02, 0x11, 0x23, 0x09, 0x04,
     0x07, 0x83, 0x01, 0x00, 0x00, 0x65, 0x03, 0x0c, 0x00, 0x10, 0x00, 0xe2, 0x00, 0x4a,
-    [255] = 0xd8,
+    [255] = 0xdb,
 };
 
 #define CSI_ENTS 32
@@ -650,6 +652,18 @@ done:
         close(mfd);
     free(g);
     return why;
+}
+
+#ifndef V4L2_CID_USER_TC358743_BASE
+#define V4L2_CID_USER_TC358743_BASE (V4L2_CID_USER_BASE + 0x1080)
+#endif
+#define TC358743_CID_AUDIO_SAMPLING_RATE (V4L2_CID_USER_TC358743_BASE + 0) /* the driver's (include/media/i2c) */
+
+/* The sample rate of the HDMI source's sound, in Hz (0: none, or unknown). */
+static int csi_audio_rate(const struct csi *c)
+{
+    struct v4l2_control ctl = { .id = TC358743_CID_AUDIO_SAMPLING_RATE };
+    return c->sd >= 0 && !xioctl(c->sd, VIDIOC_G_CTRL, &ctl) ? ctl.value : 0;
 }
 
 /* A source change (other mode, unplugged) was signalled: the bridge must be set up again. */
@@ -1690,6 +1704,7 @@ struct input {
     uint8_t *lf_frames;    /* its frame slots (remapped when the capture mode changes) */
     size_t lf_frames_len;
     char csi_why[192];     /* CSI-2 bridge: why there was no picture at the last try (logged on change) */
+    int hdmi_rate;         /* CSI-2 bridge: its HDMI source's audio sample rate (LOAD/STORE), 0 = unknown */
 };
 
 /* Create in<n>.local, or resize its frame slots for a new capture mode. */
@@ -2712,6 +2727,8 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
             else
                 snprintf(st, sizeof st, "ready (no receivers)");
             status(in, st, mode_desc, frames / secs, cam / secs, damaged);
+            if (csi.sd >= 0) /* for the audio thread's status */
+                STORE(in->hdmi_rate, csi_audio_rate(&csi));
             log_cam += cam;
             log_sent += frames;
             log_ndi += sent;
@@ -2781,15 +2798,33 @@ out:
 
 /* ------------------------------------------------------------------ audio thread */
 
-/* The ALSA card on the same USB device as the video device, -1 if it has none, -2 if the device is gone. */
-static int audio_card_for(const char *video_dev)
+/* The ALSA card of the video device: the one on the same USB device, or for a camera connector's receiver the
+ * HDMI bridge's I2S sound card ("tc358743", from the tc358743-audio overlay) when PINDI_CSI_AUDIO names that
+ * connector. -1 if it has none, -2 if the device is gone, -3 for the I2S connector without its sound card. */
+static int audio_card_for(const char *video_dev, bool *i2s)
 {
     char real[PATH_MAX], sys[PATH_MAX + 64], usb[PATH_MAX];
+    *i2s = false;
     if (!realpath(video_dev, real) || strncmp(real, "/dev/", 5))
         return -2;
     snprintf(sys, sizeof sys, "/sys/class/video4linux/%s/device", real + 5);
-    if (!realpath(sys, usb) || !strstr(usb, "/usb"))
-        return -1; /* not on USB (a CSI-2 bridge): a sound card next to it would be some other device */
+    if (!realpath(sys, usb))
+        return -1;
+    if (!strstr(usb, "/usb")) {
+        /* A sound card next to it would be some other device. A receiver is <address>.csi; CAM0 is CSI-2 0 (Pi 5:
+         * 1f00110000, Pi 3/4: 3f800000 / fe800000), as csi_connector in pindi-web.py. */
+        const char *base = strrchr(usb, '/') + 1, *want = getenv("PINDI_CSI_AUDIO");
+        size_t n = strlen(base);
+        if (!want || n < 4 || strcmp(base + n - 4, ".csi"))
+            return -1;
+        bool cam0 = !strncmp(base, "1f00110000.", 11) || !strncmp(base, "3f800000.", 9) ||
+                    !strncmp(base, "fe800000.", 9);
+        if (strcasecmp(want, cam0 ? "CAM0" : "CAM1"))
+            return -1;
+        *i2s = true;
+        int card = snd_card_get_index("tc358743");
+        return card >= 0 ? card : -3;
+    }
     char *slash = strrchr(usb, '/'); /* .../1-1.4/1-1.4:1.0 -> .../1-1.4 (the USB device) */
     if (!slash)
         return -1;
@@ -2918,9 +2953,9 @@ static void *audio_thread(void *arg)
     struct sched_param sp = { .sched_priority = 10 };
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp))
         LOG("input %d: audio runs without real-time priority", in->n);
-    bool logged_none = false;
+    bool logged_none = false, i2s, i2s_idle = false; /* i2s_idle: the bridge's I2S clock stopped */
     while (running && buf) {
-        int card = audio_card_for(in->device);
+        int card = audio_card_for(in->device, &i2s);
         if (card == -2) {
             set_audio_status(in, "waiting for the device");
             for (int i = 0; i < 20 && running; i++)
@@ -2929,9 +2964,13 @@ static void *audio_thread(void *arg)
         }
         if (card < 0) {
             if (!logged_none)
-                LOG("input %d: no USB audio on this device, sending video only", in->n);
+                LOG("input %d: %s, sending video only", in->n,
+                    card == -3 ? "no I2S sound card (tc358743-audio overlay)" : "no USB audio on this device");
             logged_none = true;
-            set_audio_status(in, "none (the device has no audio input)");
+            set_audio_status(in, card == -3 ? "none (no I2S sound card yet: restart the device)" :
+                                 strstr(in->device, ".csi-video-") ?
+                                 "none (HDMI audio over I2S is not set up for this camera connector)" :
+                                 "none (the device has no audio input)");
             for (int i = 0; i < 50 && running; i++)
                 usleep(100000);
             continue;
@@ -2956,12 +2995,14 @@ static void *audio_thread(void *arg)
                 usleep(100000);
             continue;
         }
-        LOG("input %d: audio from %s (%s), 48 kHz stereo", in->n, name ? name : "?", dev);
         char src[64];
         snprintf(src, sizeof src, "%s", name ? name : dev);
         char st[256];
-        snprintf(st, sizeof st, "48 kHz stereo from %s", src);
-        set_audio_status(in, st);
+        if (!i2s_idle) { /* else said when its sound comes back */
+            LOG("input %d: audio from %s (%s), 48 kHz stereo", in->n, name ? name : "?", dev);
+            snprintf(st, sizeof st, "48 kHz stereo from %s", src);
+            set_audio_status(in, st);
+        }
         free(name);
 
         /* NDI's synthesized timecodes count samples, but the card's audio clock is not the Pi's: a
@@ -2987,9 +3028,21 @@ static void *audio_thread(void *arg)
                     break;
                 continue;
             }
+            if (r < 0 && i2s && r == -EIO) {
+                /* ALSA gave up waiting: the bridge sends no I2S clock while its HDMI source sends no sound. */
+                if (!i2s_idle)
+                    LOG("input %d: audio: no sound from the HDMI bridge (no I2S clock)", in->n);
+                i2s_idle = true;
+                set_audio_status(in, "no sound from the HDMI source (no I2S clock from the bridge)");
+                break;
+            }
             if (r < 0) {
                 LOG("input %d: audio read: %s", in->n, snd_strerror((int)r));
                 break; /* device gone: look for it again */
+            }
+            if (i2s_idle) {
+                LOG("input %d: audio: sound from the HDMI bridge again, 48 kHz stereo", in->n);
+                i2s_idle = false;
             }
             /* The card itself going silent (its HDMI audio dropping) looks like a network dropout at the
              * receivers, so say when it happens (under -60 dBFS for half a second), and keep each second's
@@ -3058,8 +3111,11 @@ static void *audio_thread(void *arg)
             uint64_t ms = now_ms();
             double secs = warm < 50 ? 0 : (now - t_start) / 1e6;
             double ppm = secs > 10 ? -(double)adjusted / (secs * AUDIO_RATE) * 1e6 : 0;
+            int hz = i2s ? LOAD(in->hdmi_rate) : 0;
             if (ms - t_stat >= 2000) {
-                if (in->audio_sync)
+                if (hz > 0 && hz != AUDIO_RATE) /* the bridge's clock: it would play too fast or slow */
+                    snprintf(st, sizeof st, "the HDMI source sends %d Hz audio: set it to 48 kHz", hz);
+                else if (in->audio_sync)
                     snprintf(st, sizeof st, "48 kHz stereo from %s (clock %+d ppm, %d overrun%s)", src,
                              (int)lrint(ppm), xruns, xruns == 1 ? "" : "s");
                 else
@@ -3081,8 +3137,10 @@ static void *audio_thread(void *arg)
         }
         snd_pcm_close(pcm);
         if (running) {
-            LOG("input %d: audio device lost", in->n);
-            set_audio_status(in, "device lost, retrying");
+            if (!i2s_idle) {
+                LOG("input %d: audio device lost", in->n);
+                set_audio_status(in, "device lost, retrying");
+            }
             usleep(1000000);
         }
     }
