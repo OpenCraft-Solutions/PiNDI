@@ -11,7 +11,7 @@ Small standard-library HTTPS server (port 443, self-signed or uploaded certifica
   - login with the Pi's own user accounts (PAM, members of the sudo group)
   - per display output (detected by the player): enable/disable, NDI stream
     (default OUT_<serial>[_n]), source IP (default any), rotation, mirror, status
-  - "Configure Outgoing Streams": detected USB capture devices and HDMI bridges on the camera connectors
+  - Inputs tab: detected USB capture devices and HDMI bridges on the camera connectors
     (set up there too, in config.txt), off until enabled
   - network: DHCP or static IP, with automatic rollback unless confirmed
   - Wi-Fi: off by default (hardware switched off in config.txt for a faster boot); on: one network, DHCP
@@ -1696,14 +1696,34 @@ def camera_connectors():
 
 
 def csi_overlays(env):
-    """config.txt lines for the HDMI bridges set up in env (PINDI_CSI_CAM0/1 = lanes). install.sh writes the
-    same lines when it rebuilds PiNDI's block."""
+    """config.txt lines for the HDMI bridges set up in env (PINDI_CSI_CAM0/1 = lanes), and the I2S sound card for
+    the one whose audio is wired to the Pi (PINDI_CSI_AUDIO). install.sh writes the same lines when it rebuilds
+    PiNDI's block."""
     out = []
     for cam in ("CAM0", "CAM1"):
         lanes = env.get("PINDI_CSI_" + cam, "")
         if lanes in ("2", "4"):
             out.append("dtoverlay=tc358743" + (",cam0" if cam == "CAM0" else "") + (",4lane" if lanes == "4" else ""))
+    if csi_audio(env):
+        out.append("dtoverlay=tc358743-audio")
     return out
+
+
+def csi_audio(env):
+    """The connector whose HDMI bridge's sound reaches the Pi over I2S (GPIO 18-20), "" if none. One at most: the
+    header has one set of I2S pins, and the bridge drives their clock."""
+    cam = env.get("PINDI_CSI_AUDIO", "")
+    return cam if cam in ("CAM0", "CAM1") and env.get("PINDI_CSI_" + cam, "") in ("2", "4") else ""
+
+
+def csi_audio_status(want):
+    """What the I2S sound card does now compared with the setting: (text, restart needed)."""
+    have = os.path.exists("/proc/asound/tc358743")
+    if want and have:
+        return ("I2S sound card ready: the bridge's input below has an Audio setting.", False)
+    if want:
+        return ("Restart the device to apply this.", True)
+    return ("The I2S sound card stays until the device restarts.", True) if have else ("", False)
 
 
 def set_csi_overlays(env):
@@ -1996,8 +2016,19 @@ max-height:70vh;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wr
 nav.top a{color:var(--accent);margin-right:14px}
 code{font:13px ui-monospace,Consolas,monospace;background:#0d1319;padding:1px 5px;border-radius:4px;
 word-break:break-all}
-nav.sections{display:flex;flex-wrap:wrap;gap:6px 16px;margin:0 0 14px;font-size:14px}
-nav.sections a{color:var(--accent);text-decoration:none}nav.sections a:hover{text-decoration:underline}
+nav.tabs{display:flex;gap:2px;margin:0 0 16px;border-bottom:1px solid var(--line);overflow-x:auto}
+nav.tabs a{padding:8px 14px;margin-bottom:-1px;color:var(--muted);text-decoration:none;white-space:nowrap;
+border-bottom:2px solid transparent}nav.tabs a:hover{color:var(--text)}
+nav.tabs a.on{color:var(--text);border-bottom-color:var(--accent)}
+details.cfg{border-top:1px solid var(--line);margin-top:12px;padding-top:10px}
+details.cfg>summary,details.more>summary{cursor:pointer;list-style:none}
+details.cfg>summary::-webkit-details-marker,details.more>summary::-webkit-details-marker{display:none}
+details.cfg>summary{color:var(--accent);font-size:14px}
+details.cfg>summary:before,details.more>summary:before{content:"\\25B8  "}
+details.cfg[open]>summary:before,details.more[open]>summary:before{content:"\\25BE  "}
+details.more{margin:6px 0 0}details.more>summary{display:inline-block;color:var(--muted);font-size:13px}
+details.more[open]>summary{margin-bottom:2px}
+.status{margin:4px 0}.status .hint{margin:0}
 h3.group{margin:18px 0 0;font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent)}
 details.card>summary{cursor:pointer;list-style:none}details.card>summary::-webkit-details-marker{display:none}
 details.card>summary h2{display:inline;margin:0}details.card>summary:before{content:"\\25B8  ";color:var(--muted)}
@@ -2019,6 +2050,19 @@ FAVICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect wi
            '<path d="M14 12l5 3-5 3z" fill="#2bb3a3"/></svg>')
 
 JS = """
+function store(k,v){try{if(v==null)sessionStorage.removeItem(k);else sessionStorage.setItem(k,v);}catch(e){}}
+function stored(k){try{return sessionStorage.getItem(k);}catch(e){return null;}}
+function showTab(t){var el=t&&!document.querySelector('nav.tabs a[data-tab="'+t+'"]')&&document.getElementById(t);
+if(el&&el.closest('[data-pane]')){t=el.closest('[data-pane]').dataset.pane;setTimeout(function(){el.scrollIntoView();});}
+if(!document.querySelector('nav.tabs a[data-tab="'+t+'"]'))t='overview';
+document.querySelectorAll('nav.tabs a').forEach(function(a){a.classList.toggle('on',a.dataset.tab===t);});
+document.querySelectorAll('[data-pane]').forEach(function(s){s.hidden=s.dataset.pane!==t;});store('tab',t);}
+if(document.querySelector('nav.tabs')){showTab(location.hash.slice(1)||stored('tab')||'overview');
+document.querySelector('nav.tabs').addEventListener('click',function(e){var a=e.target.closest('a[data-tab]');
+if(!a)return;e.preventDefault();showTab(a.dataset.tab);history.replaceState(null,'','#'+a.dataset.tab);});}
+/* Settings sections stay open across a save (the page comes back from the redirect). */
+document.querySelectorAll('details[id]').forEach(function(d){if(stored('open:'+d.id))d.open=true;
+d.addEventListener('toggle',function(){store('open:'+d.id,d.open?'1':null);});});
 function sync(){var s=document.getElementById('mode-static');if(!s)return;
 document.getElementById('static-fields').style.display=s.checked?'block':'none';}
 function codecs(){document.querySelectorAll('select[name=codec]').forEach(function(s){
@@ -2037,9 +2081,18 @@ if(/state$/.test(k))el.className='state'+(/ON AIR/.test(v||'')?' onair':/^(playi
 if(k==='power')el.className=v==='OK'?'':'warn';});
 var c=document.getElementById('countdown');if(c&&d.rollback!=null)c.textContent=d.rollback;}).catch(function(){});}
 sync();codecs();if(document.querySelector('[data-k]'))setInterval(poll,3000);
-setInterval(function(){document.querySelectorAll('img[data-thumb]').forEach(function(i){
-if(document.hidden)return;var n=new Image();n.onload=function(){i.src=n.src;i.classList.remove('none');};
-n.onerror=function(){i.classList.add('none');};n.src='/thumb/'+i.dataset.thumb+'.jpg?'+Date.now();});},2000);
+/* Previews on view only (not on another tab, not an input's that is switched off). */
+function thumbs(){document.querySelectorAll('img[data-thumb]').forEach(function(i){
+if(document.hidden||!i.offsetParent)return;var n=new Image();n.onload=function(){i.src=n.src;i.classList.remove('none');};
+n.onerror=function(){i.classList.add('none');};n.src='/thumb/'+i.dataset.thumb+'.jpg?'+Date.now();});}
+setInterval(thumbs,2000);
+/* An input's preview: per browser, off until switched on. */
+function kept(k){try{return localStorage.getItem(k);}catch(e){return null;}}
+function keep(k,v){try{if(v)localStorage.setItem(k,'1');else localStorage.removeItem(k);}catch(e){}}
+document.querySelectorAll('input[data-preview]').forEach(function(c){var p=document.getElementById('pv-'+c.dataset.preview);
+c.checked=!!kept('preview:'+c.dataset.preview);p.hidden=!c.checked;c.addEventListener('change',function(){
+p.hidden=!c.checked;keep('preview:'+c.dataset.preview,c.checked);if(c.checked)thumbs();});});
+document.querySelector('nav.tabs')&&document.querySelector('nav.tabs').addEventListener('click',function(){setTimeout(thumbs);});
 document.addEventListener('submit',function(e){var m=e.target.dataset.confirm;if(m&&!confirm(m))e.preventDefault();});
 var uf=document.getElementById('update-file');if(uf)uf.addEventListener('change',function(){
 var f=uf.files[0],b=document.getElementById('update-button');b.disabled=true;if(!f)return;
@@ -2099,18 +2152,21 @@ def certificate_html(hidden):
             'certificate?">%s<button class="secondary">Use the device\'s own certificate</button></form>' % hidden
             if not c["self"] else "")
     return (
-        '<h3 class="group">HTTPS certificate</h3><dl><dt>Certificate</dt><dd>%s</dd><dt>For</dt><dd>%s</dd>'
+        '<h2>HTTPS certificate</h2><dl><dt>Certificate</dt><dd>%s</dd><dt>For</dt><dd>%s</dd>'
         '<dt>Valid until</dt><dd>%s</dd><dt>SHA-256 fingerprint</dt><dd><code>%s</code></dd>'
         '<dt>Public-key pin</dt><dd><code>sha256//%s</code></dd></dl>'
-        '<p class="hint">%s To make sure a client talks to this device and not an impostor, compare the '
-        'fingerprint with what the browser shows, or pin the key: <code>curl --pinnedpubkey sha256//%s -k '
-        'https://...</code> (the connection is refused if the key differs, even with <code>-k</code>).</p>'
+        '<details class="more"><summary>More info</summary><p class="hint">%s To make sure a client talks to '
+        'this device and not an impostor, compare the fingerprint with what the browser shows, or pin the key: '
+        '<code>curl --pinnedpubkey sha256//%s -k https://...</code> (the connection is refused if the key differs, '
+        'even with <code>-k</code>).</p></details>'
+        '<details class="cfg" id="tls-own"><summary>Install your own certificate</summary>'
         '<form method="post" action="/tls">%s<div class="row"><div><label>Your own certificate (PEM, with any '
         'intermediate certificates)</label><textarea name="cert" rows="4" placeholder="-----BEGIN CERTIFICATE-----"'
         '></textarea></div><div><label>Its private key (PEM, not password-protected)</label><textarea name="key" '
         'rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div></div><p class="hint">From your '
         'organisation\'s certificate authority, for this device\'s name or address: browsers that trust that '
-        'authority then show no warning.</p><button class="secondary">Install certificate</button> %s</form>' %
+        'authority then show no warning.</p><button class="secondary">Install certificate</button></form></details>'
+        '%s' %
         ("Uploaded" if not c["self"] else "This device's own (self-signed); made again when its name or address "
          "changes", esc(", ".join(c["names"]) or "-"), esc(c["until"]), esc(c["fingerprint"]), esc(c["pin"]),
          "Browsers warn about a self-signed certificate until it is accepted." if c["self"] else "",
@@ -2142,11 +2198,15 @@ def dashboard(session):
         return "".join('<option value="%s"%s>%s</option>' % (esc(v), " selected" if v == current else "", label)
                        for v, label in choices)
 
-    # Section menu
-    links = [("#out%d" % o["n"], "Output %d" % o["n"]) for o in outs] + [
-        ("#sources", "Sources"), ("#outgoing", "Outgoing"), ("#settings", "Settings"), ("#network", "Network"),
-        ("#wifi", "Wi-Fi"), ("#system", "System")]
-    parts.append('<nav class="sections">%s</nav>' % "".join('<a href="%s">%s</a>' % l for l in links))
+    def more(text):
+        """Longer help, folded away until asked for."""
+        return '<details class="more"><summary>More info</summary><p class="hint">%s</p></details>' % text
+
+    # Tabs: each card says which one it is on (data-pane); without JavaScript they are all shown.
+    tabs = [("overview", "Overview"), ("outputs", "Outputs"), ("inputs", "Inputs"), ("settings", "Settings"),
+            ("system", "System")]
+    parts.append('<nav class="tabs">%s</nav>' % "".join(
+        '<a href="#%s" data-tab="%s">%s</a>' % (t, t, label) for t, label in tabs))
 
     # Device
     hl, hw = health()
@@ -2161,31 +2221,49 @@ def dashboard(session):
                      'only send HX will not show a picture.</span>')
     rows = [
         ("IP address", '<span data-k="ip">%s</span>' % esc(net["address"] or "-")),
-    ] + ([("Wi-Fi", wifi_state_text())] if wifi_enabled() else []) + [
-        ("Network traffic", '<span data-k="net">%s</span><span class="hint block">Everything this device '
-                            'receives and sends on the network (wired and Wi-Fi). A Full NDI 1080p60 stream takes up to about '
-                            '130 Mbit/s, depending on the picture (still images far less).</span>' %
-                            esc(TRAFFIC.text())),
+        ("Network traffic", '<span data-k="net">%s</span>' % esc(TRAFFIC.text()) + more(
+            'Everything this device receives and sends on the network (wired and Wi-Fi). A Full NDI 1080p60 stream '
+            'takes up to about 130 Mbit/s, depending on the picture (still images far less).')),
         ("Health", '<span data-k="health">%s</span>' % esc(hl)),
         ("Power / cooling", '<span data-k="power" class="%s">%s</span>' % ("" if hw == "OK" else "warn", esc(hw))),
+        ("Software", "PiNDI %s" % esc(version())),
+    ]
+    details = ([("Wi-Fi", wifi_state_text())] if wifi_enabled() else []) + [
         ("NDI", ndi_text),
         ("Device name", "%s <span class=\"hint\">(NDI sources from this device: %s (&hellip;))</span>" %
          (esc(device_name()), esc(ndi_host_name()))),
         ("Serial", esc(SERIAL)),
         ("Model", esc(MODEL)),
-        ("Software", "PiNDI %s" % esc(version())),
         ("OS updates", os_update_text()),
         ("Clock", clock_text()),
         ("Outputs", "%d display output%s" % (len(outs), "" if len(outs) == 1 else "s")),
         ("Inputs", "%d capture device%s" % (len(ins), "" if len(ins) == 1 else "s")),
     ]
-    parts.append('<section class="card"><h2>Device</h2><dl>%s</dl></section>' %
-                 "".join("<dt>%s</dt><dd>%s</dd>" % r for r in rows))
+    parts.append('<section class="card" data-pane="overview"><h2>Device</h2><dl>%s</dl>'
+                 '<details class="cfg" id="device-more"><summary>More details</summary><dl>%s</dl></details>'
+                 '</section>' % ("".join("<dt>%s</dt><dd>%s</dd>" % r for r in rows),
+                                 "".join("<dt>%s</dt><dd>%s</dd>" % r for r in details)))
+
+    # At a glance: what each output shows and each input sends (their cards are on their own tabs)
+    glance = ['<tr><td>Output %d &middot; %s</td><td data-k="out%d.source">%s</td><td><span data-k="out%d.state" '
+              'class="state%s">%s</span></td></tr>' %
+              (o["n"], esc(o["connector"]), o["n"], esc(o["source"] or "-"), o["n"],
+               " playing" if o["state"].startswith("playing") else "", esc(o["state"]))
+              if o["enabled"] else '<tr><td>Output %d &middot; %s</td><td>-</td><td>disabled</td></tr>' %
+              (o["n"], esc(o["connector"])) for o in outs]
+    glance += ['<tr><td>%s</td><td>%s</td><td><span data-k="in%d.state" class="state%s">%s</span></td></tr>' %
+               (esc(i["label"]), esc(i["name"] or default_in_stream(i["slot"])) if i["slot"] else "-", i["slot"] or 0,
+                " onair" if "ON AIR" in i["state"] else " playing" if i["state"].startswith("sending") else "",
+                esc(i["state"] or ("starting" if i["enabled"] else "off")))
+               for i in ins]
+    if glance:
+        parts.append('<section class="card" data-pane="overview"><h2>Outputs and inputs</h2><table>%s</table>'
+                     '</section>' % "".join(glance))
 
     # One card per display output
     if not outs:
-        parts.append('<section class="card"><h2>Outputs</h2><p class="hint">No display outputs reported - '
-                     'is the player running?</p></section>')
+        parts.append('<section class="card" data-pane="outputs"><h2>Outputs</h2><p class="hint">No display outputs '
+                     'reported - is the player running?</p></section>')
     for o in outs:
         n = o["n"]
         link = "disabled" if not o["enabled"] else (o["link"] + (" " + o["mode"] if o["mode"] else ""))
@@ -2202,17 +2280,17 @@ def dashboard(session):
             '<dt>Output</dt><dd data-k="%sshown">%s</dd>'
             '<dt>Format</dt><dd data-k="%sformat">%s</dd>'
             '<dt>Audio</dt><dd data-k="%saudio">%s</dd>'
-            '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>'
-            '<span class="hint block">Measured per frame: from the moment the sender handed '
-            'it to NDI until it was on screen. Not included: the camera/capture before the sender and the '
-            'monitor&#39;s own processing.</span></dd></dl>' %
+            '<dt>Latency</dt><dd><span data-k="%slatency">%s</span>%s</dd></dl>' %
             (k, " playing" if o["state"].startswith("playing") else "", esc(o["state"]), k, esc(o["target"]),
              k, esc(o["source"] or "-"), k, esc(o["video"] or "-"), k, esc(o["shown"] or "-"),
              k, esc(o["format"] or "-"),
              k, esc(o["audio"] or "-"),
-             k, esc(o["latency"] or "-")))
+             k, esc(o["latency"] or "-"),
+             more('Measured per frame: from the moment the sender handed it to NDI until it was on screen. Not '
+                  'included: the camera/capture before the sender and the monitor&#39;s own processing.')))
         parts.append(
-            '<section class="card" id="out%d"><h2>Output %d &middot; %s %s</h2>%s'
+            '<section class="card" id="out%d" data-pane="outputs"><h2>Output %d &middot; %s %s</h2>%s'
+            '<details class="cfg" id="out%d-cfg"><summary>Settings</summary>'
             '<form method="post" action="/output">%s<input type="hidden" name="n" value="%d">'
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Enabled '
             '<span class="hint">(off: no NDI is received and this HDMI port is switched off)</span></label>'
@@ -2223,15 +2301,7 @@ def dashboard(session):
             '</div><div><label>Backup stream (optional)</label><input type="text" name="backup" value="%s" '
             'placeholder="None" maxlength="200"></div>'
             '<div><label>Receive quality</label><select name="bandwidth">%s</select></div></div>'
-            '<p class="hint">Empty stream name = %s, empty IP = any host (a source IP is also searched '
-            'directly, so senders on other subnets work). The backup plays while the main stream is '
-            'unavailable. The low-bandwidth preview is a small (typically 640&times;360) stream every sender '
-            'provides, for slow networks. An H.264 RTP stream instead of NDI: '
-            '<code>rtp://&lt;multicast group&gt;:&lt;port&gt;</code>, or <code>rtp://:&lt;port&gt;</code> for one '
-            'sent to this device. An SRT stream: <code>srt://&lt;sender&gt;:&lt;port&gt;</code> calls the sender '
-            '(another PiNDI, OBS, ffmpeg, an encoder), <code>srt://:&lt;port&gt;</code> waits for it to call; add '
-            '<code>?passphrase=...</code> if it is encrypted, <code>&amp;latency=&lt;ms&gt;</code> for a slow '
-            'network. Backup and receive quality are for NDI only.</p>'
+            '<p class="hint">Empty stream name = %s, empty IP = any host.</p>%s'
             '<h3 class="group">Picture</h3><div class="row">'
             '<div><label>Display mode</label><select name="display_mode">%s</select></div>'
             '<div><label>Rotation</label><select name="rotate">%s</select></div>'
@@ -2240,29 +2310,39 @@ def dashboard(session):
             '<div><label>Frame pacing</label><select name="pacing">%s</select></div>'
             '<div><label>Display off without video</label><select name="standby">%s</select>'
             '<label class="check"><input type="checkbox" name="cec" value="1"%s> Also switch the TV off '
-            'and on (HDMI-CEC)</label></div></div>'
-            '<p class="hint">180&deg; is for ceiling mounting, mirror for rear projection. With the display '
-            'switched off the monitor goes to sleep; it comes back on as soon as the stream appears. Brightness '
-            'lightens or darkens the mid-tones; black and white stay as they are. Smooth frame pacing shows '
-            'every frame for the same number of refreshes, timed by when the sender captured it, so motion '
-            'does not judder (experimental: it can drop frames on a Pi 3).</p>'
+            'and on (HDMI-CEC)</label></div></div>%s'
             '<h3 class="group">Sound</h3><div class="row">'
             '<div><label>Audio output</label><select name="audio">%s</select></div>'
             '<div><label>Audio delay (ms)</label><input type="number" name="audio_delay" min="20" max="1000" '
-            'step="10" value="%s"></div></div>'
-            '<p class="hint">The delay is the least used; it is raised automatically when a sender&#39;s audio '
-            'arrives unevenly. The picture appears about 25 ms after it arrives.</p>'
+            'step="10" value="%s"></div></div>%s'
             '<button>Save output %d</button> '
             '<button class="secondary" formaction="/identify" name="identify" value="1">Identify</button> '
-            '<button class="secondary" name="reset" value="1">Reset to default</button></form></section>' %
-            (n, n, esc(o["connector"]), badge, status_rows, hidden, n, " checked" if o["enabled"] else "",
+            '<button class="secondary" name="reset" value="1">Reset to default</button></form></details></section>' %
+            (n, n, esc(o["connector"]), badge, status_rows, n, hidden, n,
+             " checked" if o["enabled"] else "",
              n, esc(o["stream"]), esc(default_out_stream(n)), n, esc(o["source_ip"]), esc(o["backup"]),
              options(BANDWIDTHS, o["bandwidth"]), esc(default_out_stream(n)),
+             more('A source IP is also searched directly, so senders on other subnets work. The backup plays '
+                  'while the main stream is unavailable. The low-bandwidth preview is a small (typically '
+                  '640&times;360) stream every sender provides, for slow networks. An H.264 RTP stream instead of '
+                  'NDI: <code>rtp://&lt;multicast group&gt;:&lt;port&gt;</code>, or <code>rtp://:&lt;port&gt;</code> '
+                  'for one sent to this device. An SRT stream: <code>srt://&lt;sender&gt;:&lt;port&gt;</code> calls '
+                  'the sender (another PiNDI, OBS, ffmpeg, an encoder), <code>srt://:&lt;port&gt;</code> waits for '
+                  'it to call; add <code>?passphrase=...</code> if it is encrypted, '
+                  '<code>&amp;latency=&lt;ms&gt;</code> for a slow network. Backup and receive quality are for '
+                  'NDI only.'),
              options(mode_choices(o), o["mode_setting"]),
              options(ROTATIONS, o["rotate"]), options(MIRRORS, o["mirror"]),
              options(BRIGHTNESSES, o["brightness"]), options(PACINGS, o["pacing"]),
              options(STANDBYS, o["standby"]), " checked" if o["cec"] else "",
-             options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]), n))
+             more('180&deg; is for ceiling mounting, mirror for rear projection. With the display switched off '
+                  'the monitor goes to sleep; it comes back on as soon as the stream appears. Brightness lightens '
+                  'or darkens the mid-tones; black and white stay as they are. Smooth frame pacing shows every '
+                  'frame for the same number of refreshes, timed by when the sender captured it, so motion does '
+                  'not judder (experimental: it can drop frames on a Pi 3).'),
+             options(audio_choices(), o["audio_out"]), esc(o["audio_delay"]),
+             more('The delay is the least used; it is raised automatically when a sender&#39;s audio arrives '
+                  'unevenly. The picture appears about 25 ms after it arrives.'), n))
 
     # NDI sources on the network
     srcs = visible_sources()
@@ -2273,7 +2353,7 @@ def dashboard(session):
                 '<button type="button" class="small secondary" data-out="%d" data-stream="%s" data-ip="%s">'
                 'Use%s</button>' % (n, esc(s["stream"]), esc(s["ip"]), " for %d" % n if len(outs) > 1 else "")
                 for n in enabled_outs)
-        parts.append('<details class="card" id="sources"><summary><h2>NDI sources on the network '
+        parts.append('<details class="card" id="sources" data-pane="outputs"><summary><h2>NDI sources on the network '
                      '<span class="badge">%d</span></h2></summary><table>%s</table></details>' %
                      (len(srcs), "".join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' %
                                          (esc(s["name"]), esc(s["ip"]), use_buttons(s)) for s in srcs)))
@@ -2291,37 +2371,42 @@ def dashboard(session):
         codec = i.get("codec", "speedhq")
         choices = [c for c in CODECS if (c[0] != "hx" or hx_ok or codec == "hx") and
                    (c[0] != "srt" or srt_ok or codec == "srt")]
-        hint = ""
+        hint, warn = "", ""
         if hx_ok:
             hint = ('NDI|HX: H.264 from the Pi&#39;s hardware encoder &ndash; far less CPU and bandwidth; receivers '
-                    'need NDI|HX support (NDI Tools, vMix, OBS...).')
+                    'need NDI|HX support (NDI Tools, vMix, OBS...). ')
             if ndi_evaluation():
-                hint += (' <strong>Without an NDI Advanced SDK licence (Device settings) the video of an NDI|HX '
-                         'stream stops after 30 minutes; the sound goes on.</strong>')
-            hint += ' '
+                warn = ('Without an NDI Advanced SDK licence (Settings) the video of an NDI|HX stream stops after '
+                        '30 minutes; the sound goes on.')
         hint += ('H.264 RTP: the same hardware H.264, as a standard RTP stream instead of NDI &ndash; no licence, '
                  'low delay, a few Mbit/s, for a wired local network. H.264 SRT: the same over SRT, which sends '
                  'lost packets again &ndash; for Wi-Fi, other networks and the internet, optionally encrypted. '
                  'Neither is found by NDI discovery: see the address below.')
         if not srt_ok:
-            hint += (' <strong>SRT needs libsrt: run install.sh on this device with internet access.</strong>')
-        return ('<div><label>Codec</label><select name="codec">%s</select><span class="hint block">%s</span></div>'
+            warn += (' SRT needs libsrt: run install.sh on this device with internet access.')
+        return ('<div><label>Codec</label><select name="codec">%s</select>%s%s</div>'
                 '<div class="rtp-only"><label>RTP destination</label><input type="text" name="rtp_dest" value="%s" '
-                'placeholder="e.g. 239.255.0.1:5004" maxlength="21"><span class="hint block">A multicast group '
-                '(239.x.x.x:port) that any number of receivers join, or one receiver&#39;s address. Another PiNDI '
-                'shows it with the stream <code>rtp://239.255.0.1:5004</code> (<code>rtp://:5004</code> when sent '
-                'to its own address). Audio goes to port + 2.</span></div>'
+                'placeholder="e.g. 239.255.0.1:5004" maxlength="21"><span class="hint block">A multicast group or '
+                'one receiver&#39;s address.</span>%s</div>'
                 '<div class="srt-only"><label>SRT address</label><input type="text" name="srt_url" value="%s" '
-                'placeholder="srt://:9000" maxlength="255"><span class="hint block"><code>srt://:9000</code>: '
-                'receivers call this device on port 9000 (up to 8; another PiNDI shows it with the stream '
-                '<code>srt://%s:9000</code>, VLC opens the same address). <code>srt://&lt;receiver&gt;:9000</code>: '
-                'this device calls that receiver. Add <code>?passphrase=&lt;10-79 characters&gt;</code> to encrypt, '
-                '<code>&amp;latency=&lt;ms&gt;</code> for a slow or far network (default 120).</span></div>'
+                'placeholder="srt://:9000" maxlength="255"><span class="hint block"><code>srt://:9000</code> to '
+                'wait for receivers, <code>srt://&lt;receiver&gt;:9000</code> to call one.</span>%s</div>'
                 '<div class="h264-only"><label>Bit rate (kbit/s)</label><input type="number" name="kbps" '
                 'min="500" max="25000" step="100" value="%s" placeholder="Automatic"><span class="hint block">'
                 'Automatic: about 6 Mbit/s at 1080p30.</span></div>' %
-                (options(choices, codec), hint, esc(i.get("rtp_dest", "")), esc(i.get("srt_url", "")),
-                 esc(my_ip) if my_ip else "&lt;this device&gt;", esc(i.get("kbps", ""))))
+                (options(choices, codec), '<span class="hint block warn">%s</span>' % warn.strip() if warn else "",
+                 more(hint), esc(i.get("rtp_dest", "")),
+                 more('A multicast group (239.x.x.x:port) that any number of receivers join, or one receiver&#39;s '
+                      'address. Another PiNDI shows it with the stream <code>rtp://239.255.0.1:5004</code> '
+                      '(<code>rtp://:5004</code> when sent to its own address). Audio goes to port + 2.'),
+                 esc(i.get("srt_url", "")),
+                 more('<code>srt://:9000</code>: receivers call this device on port 9000 (up to 8; another PiNDI '
+                      'shows it with the stream <code>srt://%s:9000</code>, VLC opens the same address). '
+                      '<code>srt://&lt;receiver&gt;:9000</code>: this device calls that receiver. Add '
+                      '<code>?passphrase=&lt;10-79 characters&gt;</code> to encrypt, <code>&amp;latency=&lt;ms&gt;'
+                      '</code> for a slow or far network (default 120).' %
+                      (esc(my_ip) if my_ip else "&lt;this device&gt;")),
+                 esc(i.get("kbps", ""))))
 
     def watch_line(i):
         """Where receivers find an RTP or SRT input (NDI ones are found by name): the address to open."""
@@ -2376,39 +2461,59 @@ def dashboard(session):
         k = "in%d." % slot
         remove = ('<button class="secondary" name="remove" value="1">Forget this device</button>'
                   if not i["present"] else "")
-        if i.get("csi"):  # the HDMI source sets the mode; the bridge's sound isn't wired to the Pi
-            fields = ('<div><label>Picture</label><p class="hint">Whatever the HDMI source sends (shown in the '
-                      'status). The source is offered only the modes this connector&#39;s CSI-2 lanes can carry: up '
-                      'to 1080p60 with 4 lanes, 1080p30 with 2. No sound: the bridge&#39;s audio is not connected to '
-                      'the Pi.</p><input type="hidden" name="audio" value="off"></div>%s' % codec_field(i))
+        picture = ('<div><label>Picture</label><p class="hint">Whatever the HDMI source sends (shown in the '
+                   'status).</p>%s</div>' % more('The source is offered only the modes this connector&#39;s CSI-2 '
+                                                 'lanes can carry: up to 1080p60 with 4 lanes, 1080p30 with 2.'))
+        timing = more('%s audio clock runs a little fast or slow, which receivers eventually catch up on by '
+                      'dropping audio. In step with this Pi&#39;s clock avoids that.' %
+                      ("The bridge&#39;s (the HDMI source&#39;s)" if i.get("csi") else "A capture card&#39;s"))
+        if i.get("csi") and i["csi"] == csi_audio(read_env()):  # the HDMI source sets the mode; sound over I2S
+            fields = ('%s%s<div><label>Audio</label><select name="audio">%s</select><span class="hint block">48 kHz '
+                      'stereo (the source is offered nothing else).</span></div>'
+                      '<div><label>Audio timing</label><select name="audio_sync">%s</select>%s</div>' %
+                      (picture, codec_field(i), options([("auto", "From the bridge (I2S)"), ("off", "Off")],
+                                                        i["audio_setting"]),
+                       options(AUDIO_SYNCS, i["audio_sync"]), timing))
+        elif i.get("csi"):  # the bridge's sound isn't wired to the Pi
+            fields = ('%s%s<div><label>Audio</label><p class="hint">None: wire the bridge&#39;s audio to the Pi and '
+                      'choose it under Camera connectors, HDMI audio (I2S).</p>'
+                      '<input type="hidden" name="audio" value="off"></div>' % (picture, codec_field(i)))
         else:
             fields = (
                 '<div><label>Capture mode</label><select name="mode">%s</select></div>%s'
                 '<div><label>Audio</label><select name="audio">%s</select></div>'
-                '<div><label>Audio timing</label><select name="audio_sync">%s</select><span class="hint block">'
-                'Capture cards\' audio clocks run a little fast or slow, which receivers eventually catch up on '
-                'by dropping audio.</span></div>'
+                '<div><label>Audio timing</label><select name="audio_sync">%s</select>%s</div>'
                 '<div><label>Picture levels</label><select name="range">%s</select><span class="hint block">Change '
                 'only if shadows look grey and washed out.</span></div>' %
                 (options(cap_choices, i["mode"]), codec_field(i),
                  options([("auto", "From the device (USB audio)"), ("off", "Off")], i["audio_setting"]),
-                 options(AUDIO_SYNCS, i["audio_sync"]), options(RANGES, i["range"])))
+                 options(AUDIO_SYNCS, i["audio_sync"]), timing, options(RANGES, i["range"])))
+        preview = ""
+        if i["slot"] and i["enabled"] and i["present"]:  # made by the sender, which runs the enabled inputs only
+            preview = ('<div class="preview" id="pv-in%d" hidden><img class="thumb none" data-thumb="in%d" '
+                       'alt="What input %d captures now"></div>' % (slot, slot, slot))
         cards.append(
-            '<div class="sub"><h3>%s <span class="badge%s">%s</span></h3>'
-            '<p class="hint">%s</p><p>Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>%s'
+            '<section class="card" data-pane="inputs">%s<h2>%s <span class="badge%s">%s</span></h2>'
+            '<p class="status">Status: <span data-k="%sstate" class="state%s">%s</span>%s</p>%s%s'
+            '<details class="cfg" id="in-%s"><summary>Settings</summary>'
+            '<p class="hint">Device: <code>%s</code></p>'
             '<form method="post" action="/outgoing">%s<input type="hidden" name="device" value="%s">'
             '<input type="hidden" name="slot" value="%d">'
             '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Send this input</label>'
             '<div class="row"><div><label>Stream name</label><input type="text" name="name" value="%s" '
             'placeholder="%s" maxlength="100"></div>%s</div>'
-            '<button>Save</button> %s</form></div>' %
-            (esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
-             esc(i["id"]), k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
-             esc(state), live, watch_line(i), hidden,
+            '<button>Save</button> %s</form></details></section>' %
+            (preview, esc(i["label"]), " on" if i["present"] else "", "connected" if i["present"] else "not connected",
+             k, " onair" if "ON AIR" in state else " playing" if state.startswith("sending") else "",
+             esc(state), live, watch_line(i),
+             '<label class="check"><input type="checkbox" data-preview="in%d"> Preview <span class="hint">(a still '
+             'every 2 s while this page is open)</span></label>' % slot if preview else "",
+             esc(re.sub(r"\W+", "-", i["id"]).strip("-")), esc(i["id"]), hidden,
              esc(i["id"]), slot, " checked" if i["enabled"] else "", esc(i["name"]), esc(default_in_stream(slot)),
              fields, remove))
-    body = "".join(cards) if cards else (
-        '<p class="hint">No capture devices detected. Plug in a USB HDMI capture card and reload this page.</p>')
+    if not cards:
+        cards.append('<section class="card" data-pane="inputs"><h2>Inputs</h2><p class="hint">No capture devices '
+                     'detected. Plug in a USB HDMI capture card and reload this page.</p></section>')
 
     # Camera connectors: HDMI-to-CSI-2 bridges (set up in config.txt, so at the next boot)
     conns = camera_connectors()
@@ -2422,18 +2527,32 @@ def dashboard(session):
             selects.append('<div><label>%s</label><select name="%s">%s</select>%s</div>' % (
                 esc(label), key.lower(), options([c for c in CSI_LANES if not c[0] or c[0] in lanes], want),
                 '<span class="hint block%s">%s</span>' % (" warn" if pending else "", esc(note)) if note else ""))
-        body = (
-            '<div class="sub"><h3>Camera connectors</h3><p class="hint">An HDMI-to-CSI-2 bridge on a camera '
-            'connector (Toshiba TC358743 boards, e.g. C779 or C790) works as an input like a USB capture card, '
-            'listed below once it is set up here and the device has restarted. 4 lanes need a board and ribbon '
-            'cable with all four.</p><form method="post" action="/csi">%s<div class="row">%s</div>'
-            '<button>Save</button></form>%s</div>' % (
-                hidden, "".join(selects),
+        want = csi_audio(env)
+        note, pending = csi_audio_status(want)
+        restart |= pending
+        selects.append(
+            '<div><label>HDMI audio (I2S)</label><select name="audio">%s</select>%s%s</div>' % (
+                options([("", "Off")] + [(key, "From the bridge on %s" % label) for key, label, _ in conns], want),
+                '<span class="hint block%s">%s</span>' % (" warn" if pending else "", esc(note)) if note else "",
+                more('Wire the bridge&#39;s audio header to the Pi: SCK/BCK to GPIO 18 (pin 12), WS/LRCK to GPIO 19 '
+                     '(pin 35), SD/DATA to GPIO 20 (pin 38), GND to GND. One bridge only: the Pi has one set of I2S '
+                     'pins.')))
+        connectors = (
+            '<details class="cfg" id="csi"%s><summary>Camera connectors%s</summary><p class="hint">An '
+            'HDMI-to-CSI-2 bridge (Toshiba TC358743 boards, e.g. C779 or C790) on a camera connector works as an '
+            'input like a USB capture card, once it is set up here and the device has restarted.</p>%s'
+            '<form method="post" action="/csi">%s<div class="row">%s</div>'
+            '<button>Save</button></form>%s</details>' % (
+                " open" if restart else "", " &middot; restart needed" if restart else "",
+                more('4 lanes need a board and ribbon cable with all four.'), hidden, "".join(selects),
                 '<form method="post" action="/reboot" data-confirm="Reboot the device now?">%s<button '
-                'class="secondary">Reboot now</button></form>' % hidden if restart else "")) + body
-    parts.append('<section class="card" id="outgoing"><h2>Configure Outgoing Streams</h2>'
-                 '<p class="hint">Nothing is sent until you enable it here. An NDI stream appears on the network '
-                 'as "%s (name)".</p>%s</section>' % (esc(ndi_host_name()), body))
+                'class="secondary">Reboot now</button></form>' % hidden if restart else ""))
+    else:
+        connectors = ""
+    parts.append('<section class="card" id="outgoing" data-pane="inputs"><h2>Outgoing streams</h2>'
+                 '<p class="hint">Nothing is sent until you enable it on its input. An NDI stream appears on the '
+                 'network as "%s (name)".</p>%s</section>' % (esc(ndi_host_name()), connectors))
+    parts.extend(cards)
 
     # Device settings
     env = read_env()
@@ -2448,56 +2567,67 @@ def dashboard(session):
              "From NDI (licensing@ndi.video). Without it the Advanced SDK is the evaluation: NDI|HX video stops "
              "after 30 minutes." if not ns["vendor_id"] else "Licensed: NDI|HX runs without a time limit."))
     parts.append(
-        '<section class="card" id="settings"><h2>Device settings</h2><form method="post" action="/device">%s'
+        '<section class="card" id="settings" data-pane="settings"><h2>Device settings</h2>'
+        '<form method="post" action="/device">%s'
         '<div class="row"><div><label>Device name</label><input type="text" name="name" value="%s" maxlength="63" '
-        'required><span class="hint block">Shown in NDI source names and used as the network host name '
-        '(%s.local).</span></div>'
-        '<div><label>NDI Discovery Server (optional)</label><input type="text" name="discovery" value="%s" '
-        'placeholder="e.g. 192.168.1.10" maxlength="200"><span class="hint block">Find and announce sources '
-        'through a Discovery Server instead of mDNS. Several: comma separated.</span></div>'
-        '<div><label>NDI groups to receive from</label><input type="text" name="recv_groups" value="%s" '
+        'required><span class="hint block">In NDI source names, and the host name %s.local.</span></div>'
+        '<div><label>Time zone</label><select name="timezone">%s</select></div></div>'
+        '<h3 class="group">NDI</h3><div class="row">'
+        '<div><label>Discovery Server (optional)</label><input type="text" name="discovery" value="%s" '
+        'placeholder="e.g. 192.168.1.10" maxlength="200"><span class="hint block">Instead of mDNS. Several: comma '
+        'separated.</span></div>'
+        '<div><label>Receive transport</label><select name="transport">%s</select>%s</div>'
+        '<div><label>Groups to receive from</label><input type="text" name="recv_groups" value="%s" '
         'placeholder="Public" maxlength="200"></div>'
-        '<div><label>NDI groups to send to</label><input type="text" name="send_groups" value="%s" '
+        '<div><label>Groups to send to</label><input type="text" name="send_groups" value="%s" '
         'placeholder="Public" maxlength="200"></div></div>'
-        '<div class="row"><div><label>NDI receive transport</label><select name="transport">%s</select>'
-        '<span class="hint block">TCP rides out lost packets; with UDP a busy network can stall the '
-        'audio for a second or more.</span></div></div>'
         '%s'
         '<label class="check"><input type="checkbox" name="net_buffers" value="1"%s> Large network buffers '
-        '<span class="hint">(off: the system\'s own 208 KB, which drops video and audio packets when sending '
-        '1080p to more than one receiver)</span></label>'
-        '<div class="row"><div><label>Time zone</label><select name="timezone">%s</select></div>'
+        '<span class="hint">(recommended)</span></label>%s'
+        '<h3 class="group">Schedule</h3><div class="row">'
         '<div><label>Reboot every day at (optional)</label><input type="time" name="reboot_at" value="%s">'
-        '<span class="hint block">Empty = never. A daily reboot clears any slow build-up on '
-        'installations that run for months.</span></div>'
+        '<span class="hint block">Empty = never.</span>%s</div>'
         '<div><label>Install OS updates every day at (optional)</label><input type="time" name="os_update_at" '
-        'value="%s"><span class="hint block">Empty = never (the default). Security fixes for Raspberry Pi OS, '
-        'from the internet; set it before the daily reboot, outside show times. Needs internet access.</span>'
+        'value="%s"><span class="hint block">Empty = never (the default). Needs internet access.</span>%s'
         '</div></div>'
+        '<h3 class="group">Splash screen</h3>'
         '<label class="check"><input type="checkbox" name="splash_info" value="1"%s> Show IP address, serial '
-        'and status on the splash screen</label>'
-        '<label class="check"><input type="checkbox" name="frame_timeout" value="1"%s> Show the splash when a '
-        'connected source stops sending video for 10 s <span class="hint">(off: keep the last picture, '
-        'e.g. for screen captures that only send on change)</span></label>'
-        '<button>Save device settings</button></form>'
-        '<h3 class="group">HTTP API</h3><p class="hint">For control systems (e.g. Bitfocus Companion, Crestron) '
-        'and scripts. Send the token as <code>Authorization: Bearer &lt;token&gt;</code>.</p>'
-        '<dl><dt>Token</dt><dd><code>%s</code>%s</dd><dt>Status</dt><dd><code>GET /api/v1/status</code></dd>'
-        '<dt>Switch</dt><dd><code>POST /api/v1/outputs/1/source</code> with <code>{"stream": "CAM 2", '
+        'and status on it</label>'
+        '<label class="check"><input type="checkbox" name="frame_timeout" value="1"%s> Show it when a '
+        'connected source stops sending video for 10 s</label>%s'
+        '<button>Save device settings</button></form></section>' %
+        (hidden, esc(device_name()), esc(socket.gethostname()),
+         options([(z, esc(z)) for z in timezones()], current_timezone()),
+         esc(ns["discovery"]), options(TRANSPORTS, ns["transport"]),
+         more('TCP rides out lost packets; with UDP a busy network can stall the audio for a second or more.'),
+         esc(ns["recv_groups"]), esc(ns["send_groups"]), licence_fields,
+         "" if env.get("PINDI_NET_BUFFERS") == "0" else " checked",
+         more('Off: the system&#39;s own 208 KB, which drops video and audio packets when sending 1080p to more '
+              'than one receiver.'),
+         esc(reboot_time()), more('A daily reboot clears any slow build-up on installations that run for months.'),
+         esc(os_update_time()), more('Security fixes for Raspberry Pi OS, from the internet; set it before the '
+                                     'daily reboot, outside show times.'),
+         "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
+         " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
+         more('Off: keep the last picture, e.g. for screen captures that only send on change.')))
+    api = (
+        '<section class="card" id="api" data-pane="system"><h2>HTTP API</h2><p class="hint">For control systems '
+        '(e.g. Bitfocus Companion, Crestron) and scripts. Send the token as <code>Authorization: Bearer '
+        '&lt;token&gt;</code>.</p>'
+        '<dl><dt>Token</dt><dd><code>%s</code>%s</dd></dl>'
+        '<details class="more"><summary>Commands</summary><dl><dt>Status</dt><dd><code>GET /api/v1/status</code>'
+        '</dd><dt>Switch</dt><dd><code>POST /api/v1/outputs/1/source</code> with <code>{"stream": "CAM 2", '
         '"source_ip": ""}</code></dd><dt>Identify</dt><dd><code>POST /api/v1/identify</code> with '
         '<code>{"output": 1}</code> (0 = all)</dd><dt>Restart</dt><dd><code>POST /api/v1/restart</code></dd>'
         '<dt>Shut down</dt><dd><code>POST /api/v1/shutdown</code> (it stays off until its power is cycled)</dd>'
-        '</dl><form method="post" action="/api-token" data-confirm="Generate a new API token? The current one '
-        'stops working.">%s<button class="secondary">New token</button></form>%s</section>' %
-        (hidden, esc(device_name()), esc(socket.gethostname()), esc(ns["discovery"]), esc(ns["recv_groups"]),
-         esc(ns["send_groups"]), options(TRANSPORTS, ns["transport"]), licence_fields,
-         "" if env.get("PINDI_NET_BUFFERS") == "0" else " checked",
-         options([(z, esc(z)) for z in timezones()], current_timezone()),
-         esc(reboot_time()), esc(os_update_time()), "" if env.get("PINDI_SPLASH_INFO") == "0" else " checked",
-         " checked" if (env.get("PINDI_FRAME_TIMEOUT_MS") or "0") not in ("", "0") else "",
-         esc(session["secrets"]["api_token"]),
+        '</dl></details><form method="post" action="/api-token" data-confirm="Generate a new API token? The current '
+        'one stops working.">%s<button class="secondary">New token</button></form></section>' %
+        (esc(session["secrets"]["api_token"]),
          '<span class="hint block warn">%s</span>' % esc(session["secrets"]["token_note"])
-         if session["secrets"]["token_note"] else "", hidden, certificate_html(hidden)))
+         if session["secrets"]["token_note"] else "", hidden))
+    cert = certificate_html(hidden)
+    if cert:
+        api += '<section class="card" id="tls" data-pane="system">%s</section>' % cert
 
     # Network
     cfg = read_network_config()
@@ -2511,7 +2641,7 @@ def dashboard(session):
         except ValueError:
             pass
     parts.append(
-        '<section class="card" id="network"><h2>Network</h2><form method="post" action="/network">%s'
+        '<section class="card" id="network" data-pane="settings"><h2>Network</h2><form method="post" action="/network">%s'
         '<div class="radio"><label><input type="radio" name="mode" value="dhcp" %s> Automatic (DHCP)</label>'
         '<label><input type="radio" name="mode" value="static" id="mode-static" %s> Static IP</label></div>'
         '<div id="static-fields"><div class="row"><div><label>IP address</label>'
@@ -2522,14 +2652,15 @@ def dashboard(session):
         '</div></div></div>'
         '<label>NTP time servers (optional)</label><input type="text" name="ntp" value="%s" '
         'placeholder="e.g. 192.168.1.1 or time.example.com">'
-        '<p class="hint">The public pool.ntp.org servers are always tried as well; add a local server for sites '
-        'without internet access. An accurate clock is needed for the sender &rarr; screen latency figure.</p>'
         '<p class="hint">After applying, open the device at its new address within %d seconds and press '
-        '<b>Keep</b>, otherwise the previous settings come back automatically. The current IP is always '
-        'shown on the splash screen.</p><button>Apply network settings</button></form></section>' %
+        '<b>Keep</b>, otherwise the previous settings come back.</p>%s'
+        '<button>Apply network settings</button></form></section>' %
         (hidden, "checked" if cfg["dhcp"] else "", "" if cfg["dhcp"] else "checked",
          esc(fill["address"]), esc(mask), esc(fill["gateway"]), esc(", ".join(fill["dns"])),
-         esc(", ".join(cfg["ntp"])), ROLLBACK_SECONDS))
+         esc(", ".join(cfg["ntp"])), ROLLBACK_SECONDS,
+         more('The current IP is always shown on the splash screen. For time, the public pool.ntp.org servers '
+              'are always tried as well; add a local server for sites without internet access. An accurate clock '
+              'is needed for the sender &rarr; screen latency figure.')))
 
     # Wi-Fi
     wifi = session["secrets"]["wifi"]  # the configuration file is root's
@@ -2541,7 +2672,7 @@ def dashboard(session):
         reboot = ('<form method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
                   '<button class="secondary">Reboot now</button></form>' % hidden)
     parts.append(
-        '<section class="card" id="wifi"><h2>Wi-Fi</h2><dl><dt>Status</dt><dd>%s</dd></dl>'
+        '<section class="card" id="wifi" data-pane="settings"><h2>Wi-Fi</h2><dl><dt>Status</dt><dd>%s</dd></dl>'
         '<form method="post" action="/wifi">%s'
         '<label class="check"><input type="checkbox" name="enabled" value="1"%s> Wi-Fi on <span class="hint">'
         '(off: the Wi-Fi hardware is switched off, so the device starts faster)</span></label>'
@@ -2551,19 +2682,21 @@ def dashboard(session):
         'maxlength="64" placeholder="%s"></div>'
         '<div><label>Country</label><select name="country">%s</select></div></div>'
         '<label class="check"><input type="checkbox" name="open" value="1"%s> Open network (no password)</label>'
-        '<p class="hint">The address comes from DHCP. When both are connected the wired network is preferred. '
-        'NDI video over Wi-Fi is unreliable: use it for this page, or where no cable reaches. Switching Wi-Fi on '
-        'for the first time needs a reboot.%s</p><button>Save Wi-Fi settings</button></form>%s</section>' %
+        '%s<button>Save Wi-Fi settings</button></form>%s</section>' %
         (wifi_state_text(), hidden, " checked" if wifi_on else "", esc(wifi["ssid"]),
          "".join('<option value="%s">' % esc(s) for s in ssids),
          "Saved &ndash; leave empty to keep it" if wifi["psk"] else "",
          options(([] if country else [("", "Choose...")]) + [(c, esc(n)) for c, n in countries()], country),
          " checked" if wifi_on and wifi["ssid"] and not wifi["psk"] else "",
-         " Networks nearby are offered in the name field." if ssids else "", reboot))
+         more('The address comes from DHCP. When both are connected the wired network is preferred. NDI video '
+              'over Wi-Fi is unreliable: use it for this page, or where no cable reaches. Switching Wi-Fi on for '
+              'the first time needs a reboot.%s' % (" Networks nearby are offered in the name field." if ssids
+                                                    else "")), reboot))
 
     # Password
     parts.append(
-        '<section class="card"><h2>Password</h2><form method="post" action="/password">%s'
+        '<section class="card" id="password" data-pane="settings"><h2>Password</h2>'
+        '<form method="post" action="/password">%s'
         '<label>Current password</label><input type="password" name="current" autocomplete="current-password" required>'
         '<div class="row"><div><label>New password</label><input type="password" name="new" '
         'autocomplete="new-password" required></div><div><label>Repeat new password</label>'
@@ -2588,40 +2721,44 @@ def dashboard(session):
                                                          t, "" if r == "restored" else " - putting it back failed"))
                                   for t, p, w, r in restores[:5]))
     parts.append(
-        '<section class="card" id="system"><h2>System</h2>%s'
-        '<div class="buttons"><a class="button secondary" href="/logs">View logs</a>'
-        '<a class="button secondary" href="/diagnostics">Download diagnostics</a>'
-        '<a class="button secondary" href="/backup">Download settings backup</a></div>'
-        '<form method="post" action="/restore" id="restore-form">%s<label>Restore settings from a backup file'
-        '</label><input type="file" id="restore-file" accept=".json,application/json">'
-        '<input type="hidden" name="backup" id="restore-data"><p class="hint">Restores outputs, outgoing '
-        'streams, device and NDI settings. Network settings are restored too, with the usual automatic '
-        'rollback. A backup from another device is used as a template: this device keeps its own name and '
-        'network settings. A backup contains the NDI licence (vendor ID) if one is set: keep it private. '
-        'Wi-Fi passwords and the API token are not in it.</p><button class="secondary" id="restore-button" disabled>Restore</button></form>'
-        '<form method="post" action="/update" id="update-form" data-confirm="Install this update? Video '
-        'stops and the device reboots when it is done.">%s<label>Software update (PiNDI %s)</label>'
-        '<input type="file" id="update-file" accept=".tar.gz,.tgz,application/gzip">'
-        '<input type="hidden" name="package" id="update-data"><label class="check"><input type="checkbox" '
-        'name="downgrade" value="1"> Allow an older version</label><p class="hint">An update package is made '
-        'and signed with <code>make-update.sh</code>; packages without a valid signature are refused. Settings '
-        'are kept.</p>'
-        '<button class="secondary" id="update-button" disabled>Install update</button> '
-        '<a href="/update">Last update log</a></form>'
+        '<section class="card" id="system" data-pane="system"><h2>System</h2>%s'
         '<div class="buttons"><form class="inline" method="post" action="/identify">%s'
         '<input type="hidden" name="n" value="0"><button class="secondary">Identify all screens</button></form>'
         '<form class="inline" method="post" action="/restart">%s'
         '<button class="secondary">Restart video</button></form>'
-        '<form class="inline" method="post" action="/os-update" data-confirm="Download and install operating-'
-        'system updates now? Video keeps running; it needs internet access.">%s'
-        '<button class="secondary">Install OS updates now</button></form>'
-        '<a class="button secondary" href="/os-update">OS update log</a>'
-        '<form class="inline" method="post" action="/reset" data-confirm="Reset all PiNDI settings (outputs, '
-        'outgoing streams, device and NDI settings) to the defaults? Network settings and passwords are kept.">'
-        '%s<button class="danger">Reset settings</button></form>'
         '<form class="inline" method="post" action="/reboot" data-confirm="Reboot the device now?">%s'
-        '<button class="danger">Reboot</button></form></div></section>' %
-        (guard_note, hidden, hidden, esc(version()), hidden, hidden, hidden, hidden, hidden))
+        '<button class="danger">Reboot</button></form></div>'
+        '<div class="buttons"><a class="button secondary" href="/logs">View logs</a>'
+        '<a class="button secondary" href="/diagnostics">Download diagnostics</a>'
+        '<a class="button secondary" href="/backup">Download settings backup</a></div>'
+        '<details class="cfg" id="sys-update"><summary>Software update (PiNDI %s)</summary>'
+        '<form method="post" action="/update" id="update-form" data-confirm="Install this update? Video '
+        'stops and the device reboots when it is done.">%s'
+        '<input type="file" id="update-file" accept=".tar.gz,.tgz,application/gzip">'
+        '<input type="hidden" name="package" id="update-data"><label class="check"><input type="checkbox" '
+        'name="downgrade" value="1"> Allow an older version</label><p class="hint">Settings are kept.</p>%s'
+        '<button class="secondary" id="update-button" disabled>Install update</button> '
+        '<a href="/update">Last update log</a></form>'
+        '<div class="buttons"><form class="inline" method="post" action="/os-update" data-confirm="Download and '
+        'install operating-system updates now? Video keeps running; it needs internet access.">%s'
+        '<button class="secondary">Install OS updates now</button></form>'
+        '<a class="button secondary" href="/os-update">OS update log</a></div></details>'
+        '<details class="cfg" id="sys-restore"><summary>Restore or reset settings</summary>'
+        '<form method="post" action="/restore" id="restore-form">%s<label>Restore settings from a backup file'
+        '</label><input type="file" id="restore-file" accept=".json,application/json">'
+        '<input type="hidden" name="backup" id="restore-data">%s'
+        '<button class="secondary" id="restore-button" disabled>Restore</button></form>'
+        '<form method="post" action="/reset" data-confirm="Reset all PiNDI settings (outputs, '
+        'outgoing streams, device and NDI settings) to the defaults? Network settings and passwords are kept.">'
+        '%s<button class="danger">Reset settings to the defaults</button></form></details></section>' %
+        (guard_note, hidden, hidden, hidden, esc(version()), hidden,
+         more('An update package is made and signed with <code>make-update.sh</code>; packages without a valid '
+              'signature are refused.'), hidden, hidden,
+         more('Restores outputs, outgoing streams, device and NDI settings. Network settings are restored too, with '
+              'the usual automatic rollback. A backup from another device is used as a template: this device keeps '
+              'its own name and network settings. A backup contains the NDI licence (vendor ID) if one is set: keep '
+              'it private. Wi-Fi passwords and the API token are not in it.'), hidden))
+    parts.append(api)
 
     return page("PiNDI", "".join(parts), session["user"], csrf)
 
@@ -2786,8 +2923,10 @@ def act_outgoing(form):
     else:
         name = form.get("name", "").strip()
         mode = form.get("mode", "")
-        if inp.get("csi"):  # an HDMI bridge: the source sets the mode, and it has no sound for the Pi
-            form = dict(form, audio="off", range="full", audio_sync="on")
+        if inp.get("csi"):  # an HDMI bridge: the source sets the mode; sound only over I2S
+            form = dict(form, range="full")
+            if inp["csi"] != csi_audio(read_env()):
+                form.update(audio="off", audio_sync="on")
             mode = ""
         if not valid_name(name) or len(name) > 100:
             return ("err", "Invalid NDI stream name.")
@@ -2870,11 +3009,19 @@ def act_csi(form):
         updates["PINDI_CSI_" + key] = v
     if not updates:
         return ("err", "This device has no camera connector.")
+    audio = form.get("audio", "")
+    if audio and not updates.get("PINDI_CSI_" + audio):
+        return ("err", "HDMI audio comes from a bridge: set one up on that connector first.")
+    updates["PINDI_CSI_AUDIO"] = audio
+    old = csi_audio(read_env())
     write_env(updates)
     changed = set_csi_overlays(read_env())
-    log("camera connectors: %s" % (", ".join(csi_overlays(read_env())) or "nothing"))
+    log("camera connectors: %s%s" % (", ".join(csi_overlays(read_env())) or "nothing",
+                                     ", audio from %s" % audio if audio else ""))
+    if audio != old:  # the sender takes the sound card for the input on that connector
+        later(0.5, run, "systemctl", "restart", "pindi-sender.service")
     return ("ok", "Camera connectors saved. Restart the device (Reboot now) to apply them." if changed else
-            "Camera connectors saved (nothing changed).")
+            "Camera connectors saved." if audio != old else "Camera connectors saved (nothing changed).")
 
 
 def act_network(form):
@@ -3819,7 +3966,7 @@ def op_login(user="", password="", ip=""):
     token = SESSIONS.create(user)
     notes = []
     if password in WELL_KNOWN_PASSWORDS:
-        notes.append("You signed in with a well-known default password. Please change it below.")
+        notes.append("You signed in with a well-known default password. Please change it under Settings, Password.")
     if os_update_overdue():
         notes.append("No operating-system updates have been installed for over %d days: install them "
                      "(System) or set a daily time (Device settings)." % OS_UPDATE_OVERDUE_DAYS)
@@ -4098,14 +4245,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return None
 
-    def thumb(self, n):
-        """Output n's picture. Asking for it keeps the player rendering it (for 15 s); the first request may
-        find none yet."""
-        req = "%s/out%d.thumbreq" % (WEB_RUN, n)
+    def thumb(self, name):
+        """An output's picture (name out<n>, from the player) or an input's (in<n>, from the sender). Asking for it
+        keeps it being made (for 15 s); the first request may find none yet."""
+        req = "%s/%s.thumbreq" % (WEB_RUN, name)
         try:
             with open(req, "a"):
                 os.utime(req)
-            with open("%s/out%d.jpg" % (RUN_DIR, n), "rb") as f:
+            with open("%s/%s.jpg" % (RUN_DIR, name), "rb") as f:
                 return self.send(200, f.read(), "image/jpeg")
         except OSError:
             return self.send(404, "", "text/plain")
@@ -4156,7 +4303,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "application/json")
             m = re.match(r"^/api/v1/outputs/(\d)/thumb\.jpg$", path)
             if m:
-                return self.thumb(int(m.group(1)))
+                return self.thumb("out" + m.group(1))
             m = re.match(r"^/api/v1/inputs/(\d)/stream\.sdp$", path)
             if m:
                 return self.sdp(int(m.group(1)))
@@ -4177,9 +4324,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/update/log":
             return self.send(200, json.dumps({"state": update_state(), "log": read_text(UPDATE_LOG)[-20000:]}),
                              "application/json")
-        m = re.match(r"^/thumb/(\d)\.jpg$", path)
+        m = re.match(r"^/thumb/(\d|in\d)\.jpg$", path)
         if m:
-            return self.thumb(int(m.group(1)))
+            return self.thumb(m.group(1) if m.group(1).startswith("in") else "out" + m.group(1))
         m = re.match(r"^/in(\d)\.sdp$", path)
         if m:
             return self.sdp(int(m.group(1)))

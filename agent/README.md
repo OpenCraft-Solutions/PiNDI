@@ -92,7 +92,7 @@ The device makes its own certificate, so the browser warns the first time. It
 keeps that certificate across restarts; it makes a new one (with the same key,
 so key pins keep working) only when it gets a new host name or address. To
 be sure it's this device, compare the browser's certificate fingerprint with the
-one under **Device settings → HTTPS certificate**, then accept it. To avoid the warning altogether, upload a
+one under **System → HTTPS certificate**, then accept it. To avoid the warning altogether, upload a
 certificate from your organisation's certificate authority there. `http://`
 page addresses are redirected to `https://`.
 
@@ -133,15 +133,17 @@ picture in 6.6 s on Wi-Fi alone.
 
 ## Web interface
 
-| Section | What you can do |
+The page has five tabs (the one you were on comes back after saving). Each output
+and input card shows its live status; its settings are folded under **Settings**,
+and longer explanations under **More info**.
+
+| Tab | What you can do |
 | --- | --- |
-| Device | Live network traffic, CPU temperature and load, under-voltage and throttling warnings, NDI SDK version, software version, clock |
-| Output *n* | Live preview of the screen, state, latency, format and audio. Settings: stream (NDI, H.264 RTP or SRT), source IP, backup stream, receive quality (full or low-bandwidth preview), display mode, rotation (0/180°), mirroring, display standby, audio output and delay. **Identify** shows "Output n" on that screen for 15 s. |
-| Outgoing streams | Each USB capture device: send on/off, stream name, capture mode, codec (Full NDI, NDI\|HX, H.264 RTP or SRT, with its address and bit rate), audio on/off, audio timing |
-| Device settings | Device name (NDI name and host name), NDI Discovery Server, NDI groups, NDI receive transport (TCP or UDP), large network buffers, NDI Advanced SDK licence (vendor name and ID), time zone, daily reboot, daily OS updates (off by default), splash options, HTTP API token |
-| Network | DHCP or static IP, NTP servers. A change undoes itself after 2 minutes unless you press **Keep** at the new address. |
-| Wi-Fi | Off by default: the Wi-Fi hardware is switched off in `config.txt`, so the device starts faster. On: one network (name, password, country), address from DHCP, wired stays the preferred route. Switching it on the first time needs a reboot. Nearby networks are offered in the name field. |
-| System | Log viewer, diagnostics download, settings backup and restore, reset to defaults, restart video, identify all screens, reboot |
+| Overview | Device: IP address, live network traffic, CPU temperature and load, under-voltage and throttling warnings, software version (**More details**: NDI SDK, serial, model, clock, OS updates). What each output shows and each input sends. |
+| Outputs | Per output: live preview of the screen, state, latency, format and audio. Settings: stream (NDI, H.264 RTP or SRT), source IP, backup stream, receive quality (full or low-bandwidth preview), display mode, rotation (0/180°), mirroring, display standby, audio output and delay. **Identify** shows "Output n" on that screen for 15 s. The NDI sources on the network, each with a **Use** button. |
+| Inputs | Camera connectors (HDMI bridges and their I2S audio). Per capture device or bridge: an optional **Preview** (a still every 2 s while the page is open, also with no receivers; remembered per browser), send on/off, stream name, capture mode, codec (Full NDI, NDI\|HX, H.264 RTP or SRT, with its address and bit rate), audio on/off, audio timing |
+| Settings | **Device settings**: device name (NDI name and host name), time zone, NDI Discovery Server, groups and receive transport (TCP or UDP), NDI Advanced SDK licence (vendor name and ID), large network buffers, daily reboot, daily OS updates (off by default), splash options. **Network**: DHCP or static IP, NTP servers; a change undoes itself after 2 minutes unless you press **Keep** at the new address. **Wi-Fi**: off by default (the hardware is switched off in `config.txt`, so the device starts faster); on: one network (name, password, country), address from DHCP, wired stays the preferred route, the first time needs a reboot. **Password**. |
+| System | Identify all screens, restart video, reboot, log viewer, diagnostics download, settings backup; software and OS updates; restore from a backup, reset to defaults. **HTTP API** token and commands. **HTTPS certificate**. |
 
 ### How outputs behave
 
@@ -180,8 +182,8 @@ Inputs are USB (UVC) capture devices (MJPEG, YUYV or UYVY) and HDMI-to-CSI-2
 bridges on a camera connector.
 
 **HDMI-to-CSI-2 bridges** (Toshiba TC358743 boards, e.g. C779 or C790): choose
-what is on each connector under **Camera connectors** in Configure Outgoing
-Streams, then restart. PiNDI writes the overlay into `config.txt`
+what is on each connector under **Camera connectors** on the Inputs
+tab, then restart. PiNDI writes the overlay into `config.txt`
 (`PINDI_CSI_CAM0` / `PINDI_CSI_CAM1` in `/etc/default/pindi`, kept when
 `install.sh` runs again) and the bridge appears as an input. There is no
 capture mode to choose: the bridge takes whatever the HDMI source sends, raw
@@ -191,9 +193,19 @@ source's timings and sets up the whole pipeline, again whenever the source
 changes mode or is plugged in. With **4 lanes** (both connectors of a Pi 5, CAM1
 of a Compute Module; the board and ribbon cable need all four) that is up to
 1080p60; with **2 lanes** (a Pi 3/4) up to 1080p30 and 720p60. A source that
-insists on more says so in the status. The bridge's sound is not wired to the
-Pi, so these inputs have no audio. Measured on a Pi 5: a 1080p60 PC desktop is
+insists on more says so in the status. Measured on a Pi 5: a 1080p60 PC desktop is
 sent at 60 fps using about one CPU core.
+
+**Bridge audio over I2S**: a bridge's sound reaches the Pi only through its
+audio header, wired to the GPIO header: SCK/BCK to GPIO 18 (pin 12), WS/LRCK to
+GPIO 19 (pin 35), SD/DATA to GPIO 20 (pin 38), and GND. Choose that bridge
+under **HDMI audio (I2S)** in Camera connectors (`PINDI_CSI_AUDIO`), restart,
+then set its input's **Audio** to "From the bridge (I2S)". PiNDI adds
+`dtoverlay=tc358743-audio` to `config.txt` (sound card `tc358743`). One bridge
+at a time: the Pi has one set of I2S pins, and the bridge drives their clock.
+The EDID offers the source 48 kHz stereo only, because the bridge's clock sets the rate;
+a source that sends 44.1 kHz anyway is named in the audio status. While the
+source sends no sound, the status says so.
 
 MJPEG from capture cards is decoded on two CPU cores (three with NDI|HX), so
 1080p60 cards deliver their full frame rate. An output showing one of the
@@ -269,7 +281,7 @@ and a few Mbit/s. The Pi's hardware encoder makes the same H.264 as for NDI|HX,
 and it is sent as RTP (RFC 6184) to one address: a multicast group that any
 number of receivers join, or a single receiver.
 
-**Sending** (Configure Outgoing Streams, Codec **H.264 RTP**; a Pi 3 or 4, as
+**Sending** (Inputs tab, Codec **H.264 RTP**; a Pi 3 or 4, as
 a Pi 5 has no H.264 encoder): enter the destination, e.g. `239.255.0.1:5004`.
 
 - The video goes to that port, the audio (48 kHz stereo, uncompressed L16,
@@ -324,7 +336,7 @@ keeps the packages it has: run `install.sh` once.)
 
 One end listens and the other calls it. Either end can do either.
 
-**Sending** (Configure Outgoing Streams, Codec **H.264 SRT**; a Pi 3 or 4):
+**Sending** (Inputs tab, Codec **H.264 SRT**; a Pi 3 or 4):
 enter the SRT address.
 
 - `srt://:9000`: receivers call this device on port 9000, up to 8 at a time.
