@@ -2,7 +2,7 @@
  * pindi-sender - PiNDI outgoing NDI (or H.264 RTP, SRT) streams from USB (UVC) HDMI capture devices and
  * CSI-2 HDMI bridges (TC358743 on a camera connector).
  *
- * Nothing is sent unless configured (web UI "Configure Outgoing Streams"):
+ * Nothing is sent unless configured (web UI, Inputs tab):
  *   PINDI_IN<n>_ENABLED=1
  *   PINDI_IN<n>_DEVICE=/dev/v4l/by-id/...      stable device path (a CSI-2 bridge: its receiver's video node,
  *                                              e.g. /dev/v4l/by-path/platform-1f00110000.csi-video-index0)
@@ -22,7 +22,7 @@
  *
  * One thread per input: V4L2 capture -> decode workers (MJPEG decode straight to YUV, two threads
  * at HD) -> NDI send, and one for its audio: ALSA capture (48 kHz stereo) -> NDI send.
- * Status for the web UI in /run/pindi/in<n>.status.
+ * Status for the web UI in /run/pindi/in<n>.status; a preview in in<n>.jpg while the web UI asks for one.
  *
  * The decoded pictures and the audio are also published in shared memory (/run/pindi/in<n>.local,
  * struct local_feed). pindi-player shows an input of this device from there instead of receiving it
@@ -77,6 +77,8 @@
 #define MAX_IN 8
 #define NCAP 4
 #define RUN_DIR "/run/pindi"
+#define WEB_RUN "/run/pindi-web" /* preview requests from the web front end */
+#define THUMB_W 384              /* preview width, as pindi-player's */
 #define AUDIO_RATE 48000
 
 static const NDIlib_v6 *ndi;
@@ -1705,6 +1707,7 @@ struct input {
     size_t lf_frames_len;
     char csi_why[192];     /* CSI-2 bridge: why there was no picture at the last try (logged on change) */
     int hdmi_rate;         /* CSI-2 bridge: its HDMI source's audio sample rate (LOAD/STORE), 0 = unknown */
+    uint64_t thumb_ms;     /* when the last preview was made (the decode workers share it) */
 };
 
 /* Create in<n>.local, or resize its frame slots for a new capture mode. */
@@ -2249,6 +2252,98 @@ static void ndi_wait_idle(struct pipeline *pl)
     pthread_mutex_unlock(&pl->mu);
 }
 
+/* ------------------------------------------------------------------ preview */
+
+/* While the web UI asks for it (touches in<n>.thumbreq), in<n>.jpg is made every 2 s from a captured frame: by
+ * a decode worker, or by the capture loop while nothing is decoded (no receivers). */
+static bool thumb_due(struct input *in)
+{
+    uint64_t now = now_ms(), last = LOAD(in->thumb_ms);
+    if (now - last < 2000 ||
+        !__atomic_compare_exchange_n(&in->thumb_ms, &last, now, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return false; /* not yet, or another worker has it */
+    char path[64];
+    struct stat st;
+    snprintf(path, sizeof path, WEB_RUN "/in%d.thumbreq", in->n);
+    return !stat(path, &st) && time(NULL) - st.st_mtime <= 15;
+}
+
+static void thumb_unlink(int n)
+{
+    char path[64];
+    snprintf(path, sizeof path, RUN_DIR "/in%d.jpg", n);
+    unlink(path);
+}
+
+/* MJPEG: decoded at the largest of libjpeg-turbo's n/8 sizes up to THUMB_W wide (its own decompressor: the
+ * workers' may be busy). Packed 4:2:2: sampled, as BT.709 video range. */
+static void thumb_frame(struct input *in, const struct mode *m, const uint8_t *src, size_t len)
+{
+    int tw = THUMB_W, th = (int)((long)THUMB_W * m->h / m->w);
+    if (m->fourcc == V4L2_PIX_FMT_MJPEG) {
+        int nsf = 0;
+        tjscalingfactor *sf = tjGetScalingFactors(&nsf), best = { 0, 0 };
+        for (int i = 0; sf && i < nsf; i++)
+            if (TJSCALED(m->w, sf[i]) <= THUMB_W && (!best.denom || TJSCALED(m->w, sf[i]) > TJSCALED(m->w, best)))
+                best = sf[i];
+        if (!best.denom)
+            return;
+        tw = TJSCALED(m->w, best);
+        th = TJSCALED(m->h, best);
+    }
+    if (th < 16 || th > THUMB_W * 2)
+        return;
+    uint8_t *rgb = malloc((size_t)tw * th * 3);
+    if (!rgb)
+        return;
+    bool ok;
+    if (m->fourcc == V4L2_PIX_FMT_MJPEG) {
+        tjhandle dec = tjInitDecompress();
+        ok = dec && (!tjDecompress2(dec, src, (unsigned long)len, rgb, tw, tw * 3, th, TJPF_RGB, TJFLAG_FASTDCT) ||
+                     tjGetErrorCode(dec) == TJERR_WARNING); /* a damaged frame is still a preview */
+        if (dec)
+            tjDestroy(dec);
+    } else {
+        bool uyvy = m->fourcc == V4L2_PIX_FMT_UYVY;
+        ok = len >= (size_t)m->bpl * (m->h - 1) + (size_t)m->w * 2;
+        for (int y = 0; ok && y < th; y++) {
+            const uint8_t *row = src + (size_t)((y * m->h + m->h / 2) / th) * m->bpl;
+            for (int x = 0; x < tw; x++) {
+                int sx = (x * m->w + m->w / 2) / tw;
+                const uint8_t *p = row + (size_t)(sx & ~1) * 2; /* the pair: U Y0 V Y1 or Y0 U Y1 V */
+                int Y = uyvy ? p[sx & 1 ? 3 : 1] : p[sx & 1 ? 2 : 0], U = uyvy ? p[0] : p[1], V = uyvy ? p[2] : p[3];
+                int c = Y - 16, d = U - 128, e = V - 128;
+                int r = (298 * c + 459 * e + 128) >> 8, g = (298 * c - 55 * d - 136 * e + 128) >> 8,
+                    b = (298 * c + 541 * d + 128) >> 8;
+                uint8_t *o = rgb + ((size_t)y * tw + x) * 3;
+                o[0] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+                o[1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+                o[2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+            }
+        }
+    }
+    tjhandle enc = ok ? tjInitCompress() : NULL;
+    unsigned char *jpg = NULL;
+    unsigned long jlen = 0;
+    if (enc && !tjCompress2(enc, rgb, tw, tw * 3, th, TJPF_RGB, &jpg, &jlen, TJSAMP_420, 75, TJFLAG_FASTDCT)) {
+        char path[64], tmp[72];
+        snprintf(path, sizeof path, RUN_DIR "/in%d.jpg", in->n);
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        FILE *f = fopen(tmp, "wb");
+        if (f) {
+            bool written = fwrite(jpg, 1, jlen, f) == jlen;
+            if (!fclose(f) && written)
+                rename(tmp, path);
+            else
+                unlink(tmp);
+        }
+    }
+    tjFree(jpg);
+    if (enc)
+        tjDestroy(enc);
+    free(rgb);
+}
+
 static void worker_frame(struct worker *wk)
 {
     struct pipeline *pl = wk->pl;
@@ -2256,6 +2351,8 @@ static void worker_frame(struct worker *wk)
     const struct mode *m = &pl->m;
     struct local_feed *lf = in->lf;
     uint64_t s = wk->seq;
+    if (wk->len && thumb_due(in))
+        thumb_frame(in, m, wk->src, wk->len);
     int slot = (int)(s % LOCAL_SLOTS);
     size_t ysz = (size_t)m->w * m->h;
     bool local = wk->local && lf && in->lf_frames;
@@ -2489,6 +2586,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         }
         if (why) {
             status(in, why, NULL, 0, 0, 0);
+            thumb_unlink(in->n);
             goto out;
         }
         snprintf(mode_desc, sizeof mode_desc, "HDMI %dx%dp%.4g", m.w, m.h, (double)m.den / m.num);
@@ -2630,6 +2728,7 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         }
         if (r == 0) {
             status(in, "no signal", mode_desc, 0, 0, 0);
+            thumb_unlink(in->n);
             pipeline_drain(&pl, seq);
             ndi_wait_idle(&pl); /* send_black sends directly */
             send_black(in, send);
@@ -2662,6 +2761,8 @@ static void run_device(struct input *in, NDIlib_send_instance_t send)
         /* RTP is sent whether or not anyone receives it; SRT knows its receivers. */
         bool sending = conns > 0 || pl.rtp || (pl.srt && srt_peers(&in->s));
         if (!sending && !local) {
+            if (thumb_due(in)) /* nothing decodes it: the preview straight from the device's buffer */
+                thumb_frame(in, &m, cap[b.index].start, b.bytesused);
             xioctl(fd, VIDIOC_QBUF, &b);
             idle = true;
         } else {
@@ -3247,6 +3348,7 @@ int main(void)
         unlink(path);
         snprintf(path, sizeof path, RUN_DIR "/in%d.sdp", n);
         unlink(path);
+        thumb_unlink(n);
         if (strcmp(icfg(n, "ENABLED", "0"), "1") || !*icfg(n, "DEVICE", ""))
             continue;
         struct input *in = &ins[nin++];
